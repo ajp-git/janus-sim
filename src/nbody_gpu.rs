@@ -668,7 +668,17 @@ impl GpuNBodySimulation {
         })
     }
 
+    /// Step sans expansion cosmologique (a=1, H=0)
     pub fn step(&mut self, dt: f64) -> Result<(), Box<dyn std::error::Error>> {
+        self.step_with_expansion(dt, 1.0, 0.0)
+    }
+
+    /// Step avec expansion cosmologique
+    /// scale_factor: a(t) facteur d'echelle
+    /// hubble: H(t) = adot/a parametre de Hubble
+    pub fn step_with_expansion(&mut self, dt: f64, scale_factor: f64, hubble: f64)
+        -> Result<(), Box<dyn std::error::Error>>
+    {
         let half_dt = dt * 0.5;
         let box_half = self.box_size / 2.0;
 
@@ -712,13 +722,13 @@ impl GpuNBodySimulation {
             ))?;
         }
 
-        // Kick + Drift (10 args) - a=1.0, H=0.0 par defaut (pas d'expansion)
+        // Kick + Drift avec parametres cosmologiques
         unsafe {
             leapfrog.clone().launch(cfg, (
                 &mut self.pos, &mut self.vel, &self.acc,
                 half_dt, dt, box_half,
                 self.n_particles as i32, 1i32, // do_drift = 1
-                1.0f64, 0.0f64, // scale_factor=1, hubble=0 (no expansion)
+                scale_factor, hubble,
             ))?;
         }
 
@@ -748,13 +758,13 @@ impl GpuNBodySimulation {
             ))?;
         }
 
-        // Kick only (no drift) - a=1.0, H=0.0 par defaut
+        // Kick only (no drift) avec parametres cosmologiques
         unsafe {
             leapfrog.launch(cfg, (
                 &mut self.pos, &mut self.vel, &self.acc,
                 half_dt, 0.0f64, box_half,
                 self.n_particles as i32, 0i32, // do_drift = 0
-                1.0f64, 0.0f64, // scale_factor=1, hubble=0 (no expansion)
+                scale_factor, hubble,
             ))?;
         }
 

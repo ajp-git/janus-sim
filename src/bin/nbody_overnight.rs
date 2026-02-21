@@ -1,8 +1,11 @@
 /// Janus N-body GPU Overnight Production Run
 /// Saves NPZ snapshots and generates PNG frames at every step
+/// Now with cosmological expansion (Hubble friction)
 
 #[cfg(feature = "cuda")]
 use janus::nbody_gpu::GpuNBodySimulation;
+#[cfg(feature = "cuda")]
+use janus::friedmann::{JanusParams, CosmoInterpolator};
 use std::fs::{self, File};
 use std::io::{Write, BufWriter};
 use std::time::Instant;
@@ -104,6 +107,15 @@ fn main() {
                 println!("  KE₀ = {:.4e}", ke0);
                 println!("  Seg₀ = {:.4}", seg0);
 
+                // Initialize cosmological interpolator (z_init=5 for stability)
+                println!("\n--- Cosmological Expansion Setup ---");
+                let janus_params = JanusParams::from_eta(eta);
+                let cosmo = CosmoInterpolator::new(&janus_params, 5.0);
+                let dtau_cosmo = (cosmo.tau_end - cosmo.tau_start) / (steps as f64);
+                println!("  tau_start = {:.6} (z=5)", cosmo.tau_start);
+                println!("  tau_end   = {:.6} (z=0)", cosmo.tau_end);
+                println!("  dtau/step = {:.6}", dtau_cosmo);
+
                 // Time series file
                 let mut ts_file = BufWriter::new(
                     File::create(format!("{}/time_series.csv", output_dir)).unwrap()
@@ -122,6 +134,10 @@ fn main() {
                     return;
                 }
 
+                // Log step 0 cosmological params
+                let (a0, h0) = cosmo.get_params_at_tau(cosmo.tau_start);
+                println!("[COSMO] step=0 tau={:.4} a={:.6} H={:.6}", cosmo.tau_start, a0, h0);
+
                 // Header for progress
                 println!("\n{:>6}  {:>10}  {:>10}  {:>12}  {:>10}",
                          "Step", "KE/KE0", "Seg", "Seg Δ%", "Time");
@@ -138,7 +154,13 @@ fn main() {
                 for step in 1..=steps {
                     let step_start = Instant::now();
 
-                    if let Err(e) = gpu_sim.step(dt) {
+                    // Get cosmological parameters at current step
+                    let current_tau = cosmo.tau_start + (step as f64) * dtau_cosmo;
+                    let (a, h) = cosmo.get_params_at_tau(current_tau);
+
+                    // Log cosmological params at key steps (moved after KE/Seg calculation below)
+
+                    if let Err(e) = gpu_sim.step_with_expansion(dt, a, h) {
                         eprintln!("ERROR at step {}: {}", step, e);
                         stop_reason = Some(format!("Error: {}", e));
                         break;
@@ -161,9 +183,15 @@ fn main() {
                                   eta, box_size, sim_time, seg, ke_ratio);
                     render_frame(step, &output_dir, eta, n_particles, sim_time, seg, ke_ratio);
 
+                    // Log cosmological params every 10 steps
+                    if step % 10 == 0 {
+                        println!("[COSMO] step={:4} a={:.4} H={:.4} KE/KE0={:.4} Seg={:.4}",
+                                 step, a, h, ke_ratio, seg);
+                    }
+
                     // Progress at key steps
                     if step == 500 || step == 2000 || step == 5000 || step == 10000
-                       || step % 1000 == 0 || step <= 100 && step % 10 == 0 {
+                       || step % 1000 == 0 {
                         println!("{:>6}  {:>10.4}  {:>10.4}  {:>+11.2}%  {:>10.1?}",
                                  step, ke_ratio, seg, seg_pct, step_time);
                         ts_file.flush().unwrap();

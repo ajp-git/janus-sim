@@ -124,14 +124,18 @@ impl CosmoInterpolator {
     /// Retourne (a, H) pour un temps cosmologique tau donne
     /// Interpolation lineaire entre les points de l'histoire
     pub fn get_params_at_tau(&self, tau_target: f64) -> (f64, f64) {
+        let state = self.get_state_at_tau(tau_target);
+        (state.a, state.hubble())
+    }
+
+    /// Retourne l'état complet (a, ā, ȧ, ā̇) pour un temps tau donné
+    pub fn get_state_at_tau(&self, tau_target: f64) -> JanusState {
         // Securites aux bornes
         if tau_target <= self.tau_start {
-            let s = self.history.first().unwrap();
-            return (s.a, s.hubble());
+            return self.history.first().unwrap().clone();
         }
         if tau_target >= self.tau_end {
-            let s = self.history.last().unwrap();
-            return (s.a, s.hubble());
+            return self.history.last().unwrap().clone();
         }
 
         // Recherche dichotomique de l'intervalle
@@ -139,12 +143,15 @@ impl CosmoInterpolator {
         let s0 = &self.history[idx - 1];
         let s1 = &self.history[idx];
 
-        // Interpolation lineaire
+        // Interpolation lineaire de tous les champs
         let fraction = (tau_target - s0.tau) / (s1.tau - s0.tau);
-        let a_interp = s0.a + fraction * (s1.a - s0.a);
-        let h_interp = s0.hubble() + fraction * (s1.hubble() - s0.hubble());
-
-        (a_interp, h_interp)
+        JanusState {
+            a: s0.a + fraction * (s1.a - s0.a),
+            a_bar: s0.a_bar + fraction * (s1.a_bar - s0.a_bar),
+            a_dot: s0.a_dot + fraction * (s1.a_dot - s0.a_dot),
+            a_bar_dot: s0.a_bar_dot + fraction * (s1.a_bar_dot - s0.a_bar_dot),
+            tau: tau_target,
+        }
     }
 }
 

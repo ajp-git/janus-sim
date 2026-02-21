@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-Janus N-body visualization — Overnight run frame renderer
-Renders a single frame from binary snapshot with specified visual parameters.
+Janus N-body visualization — 3-panel layout renderer
+Layout:
+  ┌─────────────────────────┬───────────┐
+  │                         │  Masses+  │
+  │   Vue combinée 2D XY    │  (bleu)   │
+  │   density (imshow)      ├───────────┤
+  │   rouge + bleu          │  Masses−  │
+  │                         │  (rouge)  │
+  └─────────────────────────┴───────────┘
 """
 import sys
 import struct
@@ -9,12 +16,11 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+from scipy.ndimage import gaussian_filter
 
 def read_snapshot(path):
     """Read binary snapshot file"""
     with open(path, 'rb') as f:
-        # Read header
         n_particles = struct.unpack('<Q', f.read(8))[0]
         n_positive = struct.unpack('<Q', f.read(8))[0]
         eta = struct.unpack('<d', f.read(8))[0]
@@ -23,8 +29,6 @@ def read_snapshot(path):
         sim_time = struct.unpack('<d', f.read(8))[0]
         seg = struct.unpack('<d', f.read(8))[0]
         ke_ratio = struct.unpack('<d', f.read(8))[0]
-
-        # Read positions
         positions = np.frombuffer(f.read(), dtype=np.float64).reshape(-1, 3)
 
     return {
@@ -40,83 +44,159 @@ def read_snapshot(path):
         'positions': positions
     }
 
-def render_frame(snapshot_path, output_path, eta, n_particles, step, sim_time, seg, ke_ratio):
-    """Render a single 4K frame"""
+def auto_zoom(positions, percentile_low=2, percentile_high=98, margin=0.1):
+    """Compute auto-zoom bounds using percentile + margin"""
+    if len(positions) == 0:
+        return -1, 1, -1, 1
 
-    # Read snapshot
+    x_lo = np.percentile(positions[:, 0], percentile_low)
+    x_hi = np.percentile(positions[:, 0], percentile_high)
+    y_lo = np.percentile(positions[:, 1], percentile_low)
+    y_hi = np.percentile(positions[:, 1], percentile_high)
+
+    x_range = x_hi - x_lo
+    y_range = y_hi - y_lo
+
+    x_lo -= x_range * margin
+    x_hi += x_range * margin
+    y_lo -= y_range * margin
+    y_hi += y_range * margin
+
+    return x_lo, x_hi, y_lo, y_hi
+
+def render_frame(snapshot_path, output_path, eta, n_particles, step, sim_time, seg, ke_ratio):
+    """Render a single 1080p frame with 3-panel layout"""
+
     data = read_snapshot(snapshot_path)
     positions = data['positions']
     n_positive = data['n_positive']
-    box_size = data['box_size']
+    n_total = data['n_particles']
+    n_negative = n_total - n_positive
 
     # Split by sign
     pos_plus = positions[:n_positive]
     pos_minus = positions[n_positive:]
 
-    # Subsample for visualization (max 100K total)
-    sample_size = 50000
-    if len(pos_plus) > sample_size:
-        idx = np.random.choice(len(pos_plus), sample_size, replace=False)
-        pos_plus = pos_plus[idx]
-    if len(pos_minus) > sample_size:
-        idx = np.random.choice(len(pos_minus), sample_size, replace=False)
-        pos_minus = pos_minus[idx]
+    print(f"[DEBUG] N+ = {len(pos_plus):,}, N- = {len(pos_minus):,}, Total = {n_total:,}")
 
-    # Create figure with 4K resolution
-    fig = plt.figure(figsize=(3840/100, 2160/100), dpi=100, facecolor='black')
-    # Center the 3D axes in the figure
-    ax = fig.add_axes([0.15, 0.1, 0.7, 0.8], projection='3d', facecolor='black')
+    # Colors
+    color_plus = '#00aaff'   # Bright blue
+    color_minus = '#ff4444'  # Bright red
 
-    # Visual parameters as specified
+    # Create figure 1920x1080
+    fig = plt.figure(figsize=(19.2, 10.8), dpi=100, facecolor='black')
+
+    # Layout: left panel 2/3, right panels 1/3 (tight spacing)
+    ax_combined = fig.add_axes([0.01, 0.08, 0.64, 0.84], facecolor='black')
+    ax_plus = fig.add_axes([0.66, 0.50, 0.33, 0.42], facecolor='black')
+    ax_minus = fig.add_axes([0.66, 0.08, 0.33, 0.42], facecolor='black')
+
+    # === LEFT PANEL: Density map with imshow ===
+    x_lo, x_hi, y_lo, y_hi = auto_zoom(positions)
+    print(f"[DEBUG] Combined panel: x=[{x_lo:.2f}, {x_hi:.2f}], y=[{y_lo:.2f}, {y_hi:.2f}]")
+
+    grid_size = 512
+    sigma = 0.8
+
+    # Histogram for positive masses (blue)
+    H_plus, xedges, yedges = np.histogram2d(
+        pos_plus[:, 0], pos_plus[:, 1],
+        bins=grid_size,
+        range=[[x_lo, x_hi], [y_lo, y_hi]]
+    )
+    H_plus = gaussian_filter(H_plus.astype(float), sigma=sigma)
+    H_plus = np.log1p(H_plus)
+    # Normalize by percentile 99 to avoid saturation from outliers
+    p99_plus = np.percentile(H_plus, 99)
+    if p99_plus > 0:
+        H_plus = np.clip(H_plus / p99_plus, 0, 1)
+
+    # Histogram for negative masses (red)
+    H_minus, _, _ = np.histogram2d(
+        pos_minus[:, 0], pos_minus[:, 1],
+        bins=grid_size,
+        range=[[x_lo, x_hi], [y_lo, y_hi]]
+    )
+    H_minus = gaussian_filter(H_minus.astype(float), sigma=sigma)
+    H_minus = np.log1p(H_minus)
+    # Normalize by percentile 99
+    p99_minus = np.percentile(H_minus, 99)
+    if p99_minus > 0:
+        H_minus = np.clip(H_minus / p99_minus, 0, 1)
+
+    # Compose RGB: R=minus, G=min*0.3, B=plus
+    rgb = np.zeros((grid_size, grid_size, 3))
+    rgb[:, :, 0] = H_minus          # Red = masses-
+    rgb[:, :, 2] = H_plus           # Blue = masses+
+    rgb[:, :, 1] = np.minimum(H_plus, H_minus) * 0.3  # Green = overlap
+    rgb = np.clip(rgb, 0, 1)
+
+    # imshow expects (rows, cols, 3) - transpose first two axes only
+    ax_combined.imshow(
+        np.transpose(rgb, (1, 0, 2)),
+        origin='lower',
+        extent=[x_lo, x_hi, y_lo, y_hi],
+        aspect='equal',
+        interpolation='bilinear'
+    )
+    ax_combined.axis('off')
+    ax_combined.set_title('Combined (XY density)', color='white', fontsize=14, pad=5)
+
+    # === RIGHT PANELS: Scatter plots ===
+    N_max_display = 50000
     point_size = 1.5
     alpha = 0.6
-    color_plus = '#4488FF'   # Blue for positive masses
-    color_minus = '#FF4444'  # Red for negative masses
 
-    # Plot particles
-    ax.scatter(pos_plus[:, 0], pos_plus[:, 1], pos_plus[:, 2],
-               c=color_plus, alpha=alpha, s=point_size, marker='.')
-    ax.scatter(pos_minus[:, 0], pos_minus[:, 1], pos_minus[:, 2],
-               c=color_minus, alpha=alpha, s=point_size, marker='.')
+    # Subsample for right panels
+    if len(pos_plus) > N_max_display:
+        idx = np.random.choice(len(pos_plus), N_max_display, replace=False)
+        pos_plus_disp = pos_plus[idx]
+    else:
+        pos_plus_disp = pos_plus
 
-    # Set axis limits
-    half_box = box_size / 2
-    ax.set_xlim(-half_box, half_box)
-    ax.set_ylim(-half_box, half_box)
-    ax.set_zlim(-half_box, half_box)
+    if len(pos_minus) > N_max_display:
+        idx = np.random.choice(len(pos_minus), N_max_display, replace=False)
+        pos_minus_disp = pos_minus[idx]
+    else:
+        pos_minus_disp = pos_minus
 
-    # Center the view
-    ax.set_box_aspect([1, 1, 1])
-    ax.view_init(elev=20, azim=45)
-    ax.set_axis_off()
+    print(f"[DEBUG] Right panels display: N+={len(pos_plus_disp):,}, N-={len(pos_minus_disp):,}")
 
-    # Remove grid and panes
-    ax.grid(False)
-    ax.xaxis.pane.fill = False
-    ax.yaxis.pane.fill = False
-    ax.zaxis.pane.fill = False
-    ax.xaxis.pane.set_edgecolor('none')
-    ax.yaxis.pane.set_edgecolor('none')
-    ax.zaxis.pane.set_edgecolor('none')
+    # === RIGHT TOP: Masses+ ===
+    x_lo_p, x_hi_p, y_lo_p, y_hi_p = auto_zoom(pos_plus)
 
-    # Title
-    title = f"Janus Cosmological Model — {n_particles/1e3:.0f}K particles | η={eta:.3f}"
-    fig.text(0.5, 0.95, title, ha='center', va='top', fontsize=28,
+    ax_plus.scatter(pos_plus_disp[:, 0], pos_plus_disp[:, 1],
+                    c=color_plus, alpha=alpha, s=point_size, marker='.', linewidths=0)
+    ax_plus.set_xlim(x_lo_p, x_hi_p)
+    ax_plus.set_ylim(y_lo_p, y_hi_p)
+    ax_plus.set_aspect('equal', adjustable='box')
+    ax_plus.axis('off')
+    ax_plus.set_title(f'Masses+ ({n_positive:,})', color=color_plus, fontsize=12, pad=5)
+
+    # === RIGHT BOTTOM: Masses- ===
+    x_lo_m, x_hi_m, y_lo_m, y_hi_m = auto_zoom(pos_minus)
+
+    ax_minus.scatter(pos_minus_disp[:, 0], pos_minus_disp[:, 1],
+                     c=color_minus, alpha=alpha, s=point_size, marker='.', linewidths=0)
+    ax_minus.set_xlim(x_lo_m, x_hi_m)
+    ax_minus.set_ylim(y_lo_m, y_hi_m)
+    ax_minus.set_aspect('equal', adjustable='box')
+    ax_minus.axis('off')
+    ax_minus.set_title(f'Masses− ({n_negative:,})', color=color_minus, fontsize=12, pad=5)
+
+    # === Title ===
+    title = f"Janus Cosmological Model — {n_total/1e3:.0f}K particles | η={eta:.3f}"
+    fig.text(0.5, 0.97, title, ha='center', va='top', fontsize=20,
              color='white', fontweight='bold')
 
-    # Stats overlay
+    # === Stats bar ===
     stats = f"Step {step:05d} | Time: {sim_time:.3f} | Seg: {seg:.4f} | KE/KE₀: {ke_ratio:.2f}"
-    fig.text(0.5, 0.05, stats, ha='center', va='bottom', fontsize=20,
+    fig.text(0.5, 0.02, stats, ha='center', va='bottom', fontsize=14,
              color='white', family='monospace')
 
-    # Legend
-    fig.text(0.02, 0.95, "● Positive masses", ha='left', va='top',
-             fontsize=16, color=color_plus)
-    fig.text(0.02, 0.91, "● Negative masses", ha='left', va='top',
-             fontsize=16, color=color_minus)
-
-    plt.savefig(output_path, facecolor='black', edgecolor='none')
+    plt.savefig(output_path, facecolor='black', edgecolor='none', dpi=100)
     plt.close()
+    print(f"[DEBUG] Saved: {output_path}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 9:

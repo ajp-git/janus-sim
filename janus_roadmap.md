@@ -15,14 +15,19 @@
 - Seg₀ = 0.0024 (vs 0.49 avant correction) ✅
 - KE/KE₀ = 1.0003 stable (vs 115 avant virialization) ✅
 
-### Runs actifs (2026-02-21)
-| Run | N | Steps | Status |
-|-----|---|-------|--------|
-| 2026-02-21_run_lo | 100K | 10 000 | En cours (~5h) |
-| 2026-02-21_run_mid | 500K | 10 000 | En cours (~5h) |
-| 2026-02-21_run_hi | 2M | 10 000 | En cours (~22h) |
+### Run production terminé — Hubble friction (2026-02-21)
+| Paramètre | Valeur |
+|-----------|--------|
+| Run | 2026-02-21_run_hubble_mid |
+| N | 500,000 |
+| η | 1.045 |
+| Steps | 3,600 |
+| Runtime | 4h |
+| KE/KE₀ final | **6.01** ✅ |
+| Seg initiale | 0.24% |
+| Seg finale | **14.5%** ✅ |
 
-Step ~100 : KE/KE₀=1.0003, Seg croissante (+30 à +307%)
+Vidéo générée : `janus_hubble_500k.mp4` (24 sec, 721 frames)
 
 ### Runs terminés / arrêtés
 - Run A (η=1.045, IC non virialisées) : ARRÊTÉ — données non interprétables
@@ -229,8 +234,7 @@ Lire VALIDATION_RULES.md avant toute implémentation.
 
 ---
 
-### PARALLÈLE A — VISUALISATION EN DENSITÉ + VIDÉO
-### Priorité : LANCER MAINTENANT en parallèle des runs actifs
+### PARALLÈLE A — VISUALISATION EN DENSITÉ + VIDÉO ✅ COMPLÈTE
 
 ### Pourquoi maintenant
 Les snapshots HDF5 s'accumulent en temps réel.
@@ -434,8 +438,33 @@ Rapporter 3 frames exemples de run_hi sans demander confirmation.
 
 ---
 
-## TÂCHE 2 — HUBBLE FRICTION (EXPANSION COSMOLOGIQUE)
-### Priorité : HAUTE — Après validation de la Tâche 1
+## TÂCHE 2 — HUBBLE FRICTION (EXPANSION COSMOLOGIQUE) ✅ COMPLÈTE
+### Résultats finaux
+
+| Test | Résultat | Valeur |
+|------|----------|--------|
+| CosmoInterpolator | ✅ | a(τ), H(τ) interpolés z=5→z=0 |
+| Friction calibrée | ✅ | dtau_per_dt = 0.013205 |
+| KE/KE₀ dans plage | ✅ | 6.01 (limite: 0.1-20) |
+| Ségrégation croissante | ✅ | 0.24% → 14.5% |
+| Vidéo 3-panel | ✅ | 721 frames, 24 sec |
+
+### Corrections critiques appliquées
+
+**Bug 1 — Division par a³ inutile**
+Barnes-Hut calcule en coordonnées physiques (pas comobiles).
+La division par a³ dans le kernel amplifiait les forces ×216 quand a=0.167.
+Solution : supprimer la division, garder les forces physiques directement.
+
+**Bug 2 — Friction -2H·v au lieu de -H·v**
+L'équation correcte en coordonnées physiques est (Peebles 1980, eq. 5.111) :
+  dv/dt = g_physical - H·v
+Le facteur 2 n'apparaît qu'en coordonnées comobiles.
+
+**Bug 3 — Mélange dt (N-body) et dτ (cosmologique)**
+Le kernel utilisait H en unités cosmologiques mais dt en unités N-body.
+Solution : dtau_per_dt = τ_total / (10000 × dt) = 0.013205 (constant)
+Friction corrigée : -H·v·dtau_per_dt
 
 ### Pourquoi c'est important
 Sans expansion cosmologique, KE/KE₀ explose (115 dans Run A).
@@ -1030,31 +1059,24 @@ Si η=1.0 donne ségrégation nulle ou décroissante →
 
 ---
 
-## ORDRE D'EXÉCUTION RECOMMANDÉ
+## ORDRE D'EXÉCUTION — ÉTAT ACTUEL
 
 ```
-SEMAINE 1 :
-  □ Tâche 1 : Virialization (2 jours)
-  □ Tâche 5 : Test η=1.0 (en parallèle, 1 jour)
+COMPLÉTÉ ✅ :
+  ✅ Tâche 1 : Virialization (PE_binding, Seg₀=0.24%)
+  ✅ Tâche 2 : Hubble friction (dtau_per_dt=0.013205, KE/KE₀=6.01)
+  ✅ Parallèle A : Vidéo 3-panel (721 frames, 24 sec)
 
-SEMAINE 2 :
-  □ Tâche 2 : Hubble friction (3 jours)
-  □ Test de cohérence expansion vs statique
-
-SEMAINE 3 :
-  □ Tâche 3 : Convergence en N (3-4 jours)
-  □ Décision : simulations défendables ou non ?
-
-SEMAINE 4 :
-  □ Tâche 4 : ξ(r) en post-processing (2 jours)
-  □ Rédaction email à Jean-Pierre Petit
+À FAIRE :
+  □ Tâche 3 : Convergence en N (100K → 2M)
+  □ Tâche 4 : ξ(r) en post-processing
+  □ Tâche 5 : Test η=1.0 (cas limite)
 
 CONTACT PETIT :
-  □ Fit Pantheon+ (déjà prêt)
-  □ 3-4 images Run A avec IC virialisées
+  ✅ Fit Pantheon+ (η=1.045, χ²/dof=0.914)
+  ✅ Vidéo simulation avec expansion cosmologique
   □ Courbe ξ(r) qualitative
-  □ Question ouverte : "Est-ce que la redispersion à η=1.045
-    est physique ou numérique ?"
+  □ Comparaison convergence en N
 ```
 
 ---

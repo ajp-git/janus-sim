@@ -177,26 +177,22 @@ extern "C" __global__ void leapfrog_kick_drift(
     int n,
     int do_drift,
     double scale_factor,    // a(t) - facteur d'echelle cosmologique
-    double hubble_param     // H(t) = adot/a - parametre de Hubble
+    double hubble_param,    // H(t) = adot/a - parametre de Hubble
+    double dtau_per_dt      // facteur de conversion dtau_cosmo / dt_nbody
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n) return;
 
     int base = tid * 3;
 
-    // Kick avec Hubble friction (coordonnees comobiles)
-    // dv/dt = g_Janus / a^3 - 2*H*v
-    double a3 = scale_factor * scale_factor * scale_factor;
-
+    // Kick avec Hubble friction (coordonnees physiques)
+    // Tout en unites dt N-corps, H scale par dtau_per_dt
     for (int d = 0; d < 3; d++) {
-        // 1. Acceleration Janus en coordonnees comobiles
-        double accel_comoving = acc[base + d] / a3;
+        // 1. Friction de Hubble avec conversion d'unites
+        double friction = -hubble_param * vel[base + d] * dtau_per_dt;
 
-        // 2. Terme de Hubble friction: -2*H*v
-        double friction = -2.0 * hubble_param * vel[base + d];
-
-        // 3. Mise a jour de la vitesse (Kick)
-        vel[base + d] += (accel_comoving + friction) * half_dt;
+        // 2. Mise a jour de la vitesse (Kick) - tout en half_dt
+        vel[base + d] += (acc[base + d] + friction) * half_dt;
     }
 
     // Drift (only if do_drift)
@@ -670,16 +666,18 @@ impl GpuNBodySimulation {
 
     /// Step sans expansion cosmologique (a=1, H=0)
     pub fn step(&mut self, dt: f64) -> Result<(), Box<dyn std::error::Error>> {
-        self.step_with_expansion(dt, 1.0, 0.0)
+        self.step_with_expansion(dt, 1.0, 0.0, 0.0)
     }
 
     /// Step avec expansion cosmologique
     /// scale_factor: a(t) facteur d'echelle
     /// hubble: H(t) = adot/a parametre de Hubble
-    pub fn step_with_expansion(&mut self, dt: f64, scale_factor: f64, hubble: f64)
+    /// dtau_per_dt: facteur de conversion temps cosmo/temps N-corps (constant)
+    pub fn step_with_expansion(&mut self, dt: f64, scale_factor: f64, hubble: f64, dtau_per_dt: f64)
         -> Result<(), Box<dyn std::error::Error>>
     {
         let half_dt = dt * 0.5;
+        // dtau_per_dt passe directement (constant = 0.013205)
         let box_half = self.box_size / 2.0;
 
         // Download positions for tree rebuild
@@ -728,7 +726,7 @@ impl GpuNBodySimulation {
                 &mut self.pos, &mut self.vel, &self.acc,
                 half_dt, dt, box_half,
                 self.n_particles as i32, 1i32, // do_drift = 1
-                scale_factor, hubble,
+                scale_factor, hubble, dtau_per_dt,
             ))?;
         }
 
@@ -764,7 +762,7 @@ impl GpuNBodySimulation {
                 &mut self.pos, &mut self.vel, &self.acc,
                 half_dt, 0.0f64, box_half,
                 self.n_particles as i32, 0i32, // do_drift = 0
-                scale_factor, hubble,
+                scale_factor, hubble, dtau_per_dt,
             ))?;
         }
 

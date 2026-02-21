@@ -136,15 +136,27 @@ PE_binding < 0 always (attractive interactions only), giving α ≈ 4.57 for our
 | Segregation trend | −1.85% | +265% ✅ |
 | Virial error | N/A | 0.0000% ✅ |
 
-### Current Runs (2026-02-21)
+### Completed Run — Hubble Friction (2026-02-21)
 
-Three simultaneous runs with virialized IC and corrected COM metric:
+**Production run with cosmological expansion (z=5 → z=0):**
 
-| Run | N | Steps | Est. duration | Status |
-|-----|---|-------|--------------|--------|
-| run_lo | 100K | 10 000 | ~5h | Running |
-| run_mid | 500K | 10 000 | ~5h | Running |
-| run_hi | 2M | 10 000 | ~22h | Running |
+| Parameter | Value |
+|-----------|-------|
+| N particles | 500,000 |
+| η | 1.045 |
+| Steps | 3,600 |
+| Runtime | 4h |
+| Initial KE | 3.44e8 |
+| Final KE | 2.07e9 |
+| **KE/KE₀** | **6.01** ✅ |
+| Initial Seg | 0.24% |
+| Final Seg | **14.5%** ✅ |
+
+**Key observations:**
+- KE increases due to gravitational collapse (structure formation)
+- Segregation grows from 0.24% to 14.5% — positive/negative mass separation
+- Hubble friction prevents runaway (KE/KE₀ stayed in range 0.1–20)
+- Oscillations observed: virialization dynamics as clusters form
 
 ---
 
@@ -187,13 +199,17 @@ Simulations stop automatically if:
 - Bug fixes: rsqrt, COM periodic, acceleration equations
 - Virialized initial conditions (PE_binding method)
 - Corrected COM reference (common origin for both populations)
+- **Tâche 2: Hubble friction** — cosmological expansion z=5→z=0
+  - CosmoInterpolator for a(t) and H(t)
+  - Friction term: -H·v (Peebles 1980, physical coordinates)
+  - dtau_per_dt conversion factor calibrated
+  - Production run: 500K, 3600 steps, KE/KE₀=6.01, Seg=14.5%
+- **Video pipeline** — 3-panel visualization (1920×1080)
 
 ### In Progress 🔄
-- Convergence study: 100K / 500K / 2M (current overnight runs)
-- Understanding Run A behavior (segregation peak then decline)
+- Convergence study: 100K / 500K / 2M
 
 ### Planned
-- **Tâche 2**: Hubble friction — couple expansion factor a(t) from friedmann.rs into leapfrog kernel
 - **Tâche 3**: Full convergence study 100K → 2M, criterion < 10% between N and 2N
 - **Tâche 4**: Two-point correlation function ξ(r) via Corrfunc, qualitative comparison with SDSS DR7
 - **Tâche 5**: Test at η=1.0 (theoretical limit) to characterize the quasi-symmetric regime
@@ -208,20 +224,23 @@ janus-sim/
 │   ├── lib.rs              # Constants and Janus interaction rules
 │   ├── friedmann.rs        # Coupled FLRW integration (RK4) + CosmoInterpolator
 │   ├── nbody.rs            # CPU N-body (Barnes-Hut, Rayon parallel)
-│   ├── nbody_gpu.rs        # GPU N-body (CUDA, f64, virialization)
+│   ├── nbody_gpu.rs        # GPU N-body (CUDA, f64, virialization, Hubble friction)
 │   ├── analysis.rs         # χ² fitting on Pantheon+ data
 │   └── bin/
 │       ├── friedmann.rs    # Friedmann solver + SNIa fit binary
 │       ├── nbody.rs        # CPU N-body binary
-│       └── nbody_overnight.rs  # GPU production binary
+│       └── nbody_overnight.rs  # GPU production binary with expansion
+├── scripts/
+│   ├── render_overnight.py # 3-panel frame renderer (density + scatter)
+│   └── batch_render.py     # Parallel batch rendering
 ├── data/
 │   └── Pantheon+SH0ES.dat  # SNIa data (not included, see Scolnic 2022)
 ├── output/                 # Results (not tracked by git)
 │   └── YYYY-MM-DD_run_*/
-│       ├── snapshots/      # HDF5 particle data
-│       ├── frames/         # 4K PNG visualization
-│       ├── time_series.csv # Step metrics
-│       └── summary.json    # Final results
+│       ├── snapshots/      # Binary particle data (.bin)
+│       ├── frames/         # 1080p PNG visualization
+│       ├── summary.json    # Final results
+│       └── *.mp4           # Rendered video
 ├── VALIDATION_RULES.md     # Mandatory test rules for all physics functions
 ├── janus_roadmap.md        # Detailed roadmap with code (Tâches 1–5)
 ├── Cargo.toml
@@ -282,13 +301,25 @@ docker compose run --rm dev cargo run --release --features cuda \
 | `--steps` | Number of integration steps | 1000 |
 | `--output` | Output directory | output/ |
 
-### Video Assembly
+### Video Generation
 
 ```bash
-ffmpeg -framerate 24 -i output/run/frames/frame_%05d.png \
+# 1. Render frames (3-panel layout: density + scatter)
+python3 scripts/batch_render.py \
+  output/2026-02-21_run_hubble_mid/snapshots \
+  output/2026-02-21_run_hubble_mid/frames \
+  5  # render every 5th snapshot
+
+# 2. Assemble video
+ffmpeg -framerate 30 -i output/run/frames/frame_%05d.png \
   -c:v libx264 -crf 18 -pix_fmt yuv420p \
   output/run/janus_simulation.mp4
 ```
+
+**3-Panel Layout:**
+- Left (2/3): Density map (histogram2d + gaussian blur)
+- Right top: Positive masses (blue scatter)
+- Right bottom: Negative masses (red scatter)
 
 ---
 

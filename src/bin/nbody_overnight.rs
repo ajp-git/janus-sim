@@ -112,9 +112,12 @@ fn main() {
                 let janus_params = JanusParams::from_eta(eta);
                 let cosmo = CosmoInterpolator::new(&janus_params, 5.0);
                 let dtau_cosmo = (cosmo.tau_end - cosmo.tau_start) / (steps as f64);
+                // dtau_per_dt constant: convention 10000 steps couvrent z=5→0
+                let dtau_per_dt = (cosmo.tau_end - cosmo.tau_start).abs() / (10000.0 * dt);
                 println!("  tau_start = {:.6} (z=5)", cosmo.tau_start);
                 println!("  tau_end   = {:.6} (z=0)", cosmo.tau_end);
                 println!("  dtau/step = {:.6}", dtau_cosmo);
+                println!("  dtau_per_dt = {:.6} (constant)", dtau_per_dt);
 
                 // Time series file
                 let mut ts_file = BufWriter::new(
@@ -160,7 +163,7 @@ fn main() {
 
                     // Log cosmological params at key steps (moved after KE/Seg calculation below)
 
-                    if let Err(e) = gpu_sim.step_with_expansion(dt, a, h) {
+                    if let Err(e) = gpu_sim.step_with_expansion(dt, a, h, dtau_per_dt) {
                         eprintln!("ERROR at step {}: {}", step, e);
                         stop_reason = Some(format!("Error: {}", e));
                         break;

@@ -175,17 +175,29 @@ extern "C" __global__ void leapfrog_kick_drift(
     double dt,
     double box_half,
     int n,
-    int do_drift
+    int do_drift,
+    double scale_factor,    // a(t) - facteur d'echelle cosmologique
+    double hubble_param     // H(t) = adot/a - parametre de Hubble
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n) return;
 
     int base = tid * 3;
 
-    // Kick
-    vel[base]     += acc[base]     * half_dt;
-    vel[base + 1] += acc[base + 1] * half_dt;
-    vel[base + 2] += acc[base + 2] * half_dt;
+    // Kick avec Hubble friction (coordonnees comobiles)
+    // dv/dt = g_Janus / a^3 - 2*H*v
+    double a3 = scale_factor * scale_factor * scale_factor;
+
+    for (int d = 0; d < 3; d++) {
+        // 1. Acceleration Janus en coordonnees comobiles
+        double accel_comoving = acc[base + d] / a3;
+
+        // 2. Terme de Hubble friction: -2*H*v
+        double friction = -2.0 * hubble_param * vel[base + d];
+
+        // 3. Mise a jour de la vitesse (Kick)
+        vel[base + d] += (accel_comoving + friction) * half_dt;
+    }
 
     // Drift (only if do_drift)
     if (do_drift) {
@@ -700,12 +712,13 @@ impl GpuNBodySimulation {
             ))?;
         }
 
-        // Kick + Drift (8 args)
+        // Kick + Drift (10 args) - a=1.0, H=0.0 par defaut (pas d'expansion)
         unsafe {
             leapfrog.clone().launch(cfg, (
                 &mut self.pos, &mut self.vel, &self.acc,
                 half_dt, dt, box_half,
                 self.n_particles as i32, 1i32, // do_drift = 1
+                1.0f64, 0.0f64, // scale_factor=1, hubble=0 (no expansion)
             ))?;
         }
 
@@ -735,12 +748,13 @@ impl GpuNBodySimulation {
             ))?;
         }
 
-        // Kick only (no drift)
+        // Kick only (no drift) - a=1.0, H=0.0 par defaut
         unsafe {
             leapfrog.launch(cfg, (
                 &mut self.pos, &mut self.vel, &self.acc,
                 half_dt, 0.0f64, box_half,
                 self.n_particles as i32, 0i32, // do_drift = 0
+                1.0f64, 0.0f64, // scale_factor=1, hubble=0 (no expansion)
             ))?;
         }
 

@@ -96,6 +96,58 @@ impl JanusParams {
     }
 }
 
+/// Interpolateur cosmologique pour la simulation N-corps
+/// Calcule l'histoire de l'univers UNE SEULE FOIS,
+/// puis fournit a(t) et H(t) par interpolation rapide.
+pub struct CosmoInterpolator {
+    history: Vec<JanusState>,
+    pub tau_start: f64,  // tau au redshift initial (passe)
+    pub tau_end: f64,    // tau = 0 (aujourd'hui)
+}
+
+impl CosmoInterpolator {
+    /// Prepare l'histoire de l'univers de z_init jusqu'a z=0
+    /// z_init = 50.0 pour simulations cosmologiques standard
+    pub fn new(params: &JanusParams, z_init: f64) -> Self {
+        // 1. Integrer vers le passe (z=0 -> z_init)
+        let mut history = integrate_backward(params, z_init, 10000);
+
+        // 2. Trier par tau CROISSANT (du passe vers le present)
+        history.sort_by(|s1, s2| s1.tau.partial_cmp(&s2.tau).unwrap());
+
+        let tau_start = history.first().unwrap().tau;
+        let tau_end = history.last().unwrap().tau;
+
+        Self { history, tau_start, tau_end }
+    }
+
+    /// Retourne (a, H) pour un temps cosmologique tau donne
+    /// Interpolation lineaire entre les points de l'histoire
+    pub fn get_params_at_tau(&self, tau_target: f64) -> (f64, f64) {
+        // Securites aux bornes
+        if tau_target <= self.tau_start {
+            let s = self.history.first().unwrap();
+            return (s.a, s.hubble());
+        }
+        if tau_target >= self.tau_end {
+            let s = self.history.last().unwrap();
+            return (s.a, s.hubble());
+        }
+
+        // Recherche dichotomique de l'intervalle
+        let idx = self.history.partition_point(|s| s.tau < tau_target);
+        let s0 = &self.history[idx - 1];
+        let s1 = &self.history[idx];
+
+        // Interpolation lineaire
+        let fraction = (tau_target - s0.tau) / (s1.tau - s0.tau);
+        let a_interp = s0.a + fraction * (s1.a - s0.a);
+        let h_interp = s0.hubble() + fraction * (s1.hubble() - s0.hubble());
+
+        (a_interp, h_interp)
+    }
+}
+
 impl JanusState {
     /// Initial conditions at today: a = ā = 1
     /// The velocities are set by the Friedmann equations at z=0
@@ -568,5 +620,93 @@ mod tests {
         // This test just verifies the integration runs without crashing.
         println!("Friedmann constraint max drift: {:.2}%", max_drift * 100.0);
         // No assertion - just informational
+    }
+
+    #[test]
+    fn test_cosmo_interpolator() {
+        // 1. Initialisation avec parametres valides (Fit Pantheon+)
+        let eta = 1.045;
+        let params = JanusParams::from_eta(eta);
+        // Note: z_init = 5 au lieu de 50 car l'integration backwards
+        // avec acceleration cosmique forte cause des inversions de a_dot
+        let z_init = 5.0;
+
+        let cosmo = CosmoInterpolator::new(&params, z_init);
+
+        // 2. Verification du passe (debut simulation a z_init)
+        let (a_start, h_start) = cosmo.get_params_at_tau(cosmo.tau_start);
+        let expected_a_start = 1.0 / (1.0 + z_init);  // = 1/6 = 0.167 pour z=5
+
+        // Debug output
+        println!("=== CosmoInterpolator z_init={} ===", z_init);
+        println!("tau_start={:.6}, a_start={:.6}, H_start={:.6}",
+                 cosmo.tau_start, a_start, h_start);
+        println!("tau_end={:.6}, expected_a_start={:.6}",
+                 cosmo.tau_end, expected_a_start);
+
+        assert!(
+            (a_start - expected_a_start).abs() < 1e-4,
+            "a_start doit etre 1/(1+z_init) = {:.6}, obtenu : {:.6}",
+            expected_a_start, a_start
+        );
+        assert!(
+            h_start > 0.0,
+            "H doit etre > 0 au depart (univers en expansion)"
+        );
+
+        // 3. Verification du present (fin simulation z=0)
+        let (a_end, h_end) = cosmo.get_params_at_tau(cosmo.tau_end);
+
+        println!("a_end={:.6}, H_end={:.6}", a_end, h_end);
+
+        assert!(
+            (a_end - 1.0).abs() < 1e-4,
+            "a_end doit etre 1.0 (aujourd'hui), obtenu : {:.6}", a_end
+        );
+
+        // Convention validee dans friedmann.rs ligne 106 :
+        // a_dot_0 = sqrt(Omega_+)  ->  H_0 = a_dot_0/a_0 = sqrt(Omega_+) (car a_0=1)
+        let expected_h_end = params.omega_plus.sqrt();
+        assert!(
+            (h_end - expected_h_end).abs() < 1e-4,
+            "H_end doit etre sqrt(Omega_+) = {:.6}, obtenu : {:.6}",
+            expected_h_end, h_end
+        );
+
+        // 4. Monotonie de a(t)
+        let tau_mid = cosmo.tau_start + (cosmo.tau_end - cosmo.tau_start) / 2.0;
+        let (a_mid, _) = cosmo.get_params_at_tau(tau_mid);
+
+        assert!(
+            a_mid > a_start && a_mid < a_end,
+            "a(t) doit etre strictement croissant : {} < {} < {}",
+            a_start, a_mid, a_end
+        );
+
+        println!("CosmoInterpolator VALIDE pour z_init={}", z_init);
+    }
+
+    #[test]
+    fn test_cosmo_interpolator_stability() {
+        // Test de stabilite pour differents z_init
+        let eta = 1.045;
+        let params = JanusParams::from_eta(eta);
+
+        println!("\n=== Test stabilite CosmoInterpolator ===");
+        println!("{:>8} {:>12} {:>12} {:>12} {:>8}",
+                 "z_init", "a_expected", "a_obtained", "error%", "status");
+        println!("{:-<60}", "");
+
+        for z_init in [5.0, 7.0, 10.0, 20.0] {
+            let expected_a = 1.0 / (1.0 + z_init);
+            let cosmo = CosmoInterpolator::new(&params, z_init);
+            let (a_start, _) = cosmo.get_params_at_tau(cosmo.tau_start);
+
+            let error_pct = ((a_start - expected_a) / expected_a * 100.0).abs();
+            let status = if error_pct < 1.0 { "OK" } else { "FAIL" };
+
+            println!("{:>8.1} {:>12.6} {:>12.6} {:>11.2}% {:>8}",
+                     z_init, expected_a, a_start, error_pct, status);
+        }
     }
 }

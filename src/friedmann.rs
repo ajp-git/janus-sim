@@ -50,6 +50,9 @@ pub struct JanusParams {
     /// From Petit & D'Agostini 2014 eq.(9): ρc²a³ + ρ̄c̄²ā³ = E = const
     /// Note: E < 0 when negative sector dominates → cosmic acceleration
     pub e_conserved: f64,
+    /// Radiation density parameter today: Ω_r ≈ 9.2e-5 (CMB + neutrinos)
+    /// Only affects positive sector: ρ_r ∝ a⁻⁴
+    pub omega_radiation: f64,
 }
 
 impl JanusParams {
@@ -58,7 +61,13 @@ impl JanusParams {
     ///
     /// We normalize so that Ω₊ + Ω₋ = 1 (flat universe)
     pub fn from_eta(eta: f64) -> Self {
-        // For a flat universe: Ω₊ + Ω₋ = 1
+        Self::from_eta_with_radiation(eta, 0.0)
+    }
+
+    /// Create parameters with radiation (for CMB/high-z calculations)
+    /// omega_r ≈ 9.2e-5 for CMB + neutrinos (Planck 2018)
+    pub fn from_eta_with_radiation(eta: f64, omega_r: f64) -> Self {
+        // For a flat universe: Ω₊ + Ω₋ = 1 (ignoring radiation for normalization)
         // With η = Ω₋/Ω₊, we get:
         //   Ω₊ = 1/(1+η)
         //   Ω₋ = η/(1+η)
@@ -77,6 +86,7 @@ impl JanusParams {
             eta,
             c_ratio: 1.0, // Equal speeds of light (first approximation)
             e_conserved,
+            omega_radiation: omega_r,
         }
     }
 
@@ -92,6 +102,7 @@ impl JanusParams {
             eta,
             c_ratio: 1.0,
             e_conserved,
+            omega_radiation: 0.0,
         }
     }
 }
@@ -100,7 +111,7 @@ impl JanusParams {
 /// Calcule l'histoire de l'univers UNE SEULE FOIS,
 /// puis fournit a(t) et H(t) par interpolation rapide.
 pub struct CosmoInterpolator {
-    history: Vec<JanusState>,
+    pub history: Vec<JanusState>,
     pub tau_start: f64,  // tau au redshift initial (passe)
     pub tau_end: f64,    // tau = 0 (aujourd'hui)
 }
@@ -113,6 +124,25 @@ impl CosmoInterpolator {
         let mut history = integrate_backward(params, z_init, 10000);
 
         // 2. Trier par tau CROISSANT (du passe vers le present)
+        history.sort_by(|s1, s2| s1.tau.partial_cmp(&s2.tau).unwrap());
+
+        let tau_start = history.first().unwrap().tau;
+        let tau_end = history.last().unwrap().tau;
+
+        Self { history, tau_start, tau_end }
+    }
+
+    /// Create interpolator extending deep into radiation era (z >> 1100)
+    /// Uses radiation-included equations and more integration steps
+    /// Goes to z=100000 to capture most of the sound horizon integral
+    pub fn new_to_cmb(params: &JanusParams) -> Self {
+        // Need to go much further than z=1100 to capture early universe
+        // Radiation-matter equality is at z_eq ~ 3400
+        // Sound horizon integral converges by z ~ 10000-100000
+        let z_deep = 100000.0;
+        // Need many more steps for high z
+        let mut history = integrate_backward_highz(params, z_deep, 500000);
+
         history.sort_by(|s1, s2| s1.tau.partial_cmp(&s2.tau).unwrap());
 
         let tau_start = history.first().unwrap().tau;
@@ -160,9 +190,9 @@ impl JanusState {
     /// The velocities are set by the Friedmann equations at z=0
     pub fn today(params: &JanusParams) -> Self {
         // At z=0 (today), a = ā = 1
-        // From Friedmann: (ȧ/a)² = Ω₊/a³ → ȧ₀ = √Ω₊
-        // Similarly: ā̇₀ = √Ω₋ (but negative sector contracts)
-        let a_dot = params.omega_plus.sqrt();
+        // From Friedmann: (ȧ/a)² = Ω₊/a³ + Ω_r/a⁴ → ȧ₀ = √(Ω₊ + Ω_r)
+        // Similarly: ā̇₀ = √Ω₋ (but negative sector contracts, no radiation)
+        let a_dot = (params.omega_plus + params.omega_radiation).sqrt();
         let a_bar_dot = -params.omega_minus.sqrt(); // Contracting
 
         Self {
@@ -207,6 +237,7 @@ fn derivatives(state: &JanusState, params: &JanusParams) -> (f64, f64, f64, f64)
     let a = state.a;
     let a_bar = state.a_bar;
     let e = params.e_conserved;
+    let omega_r = params.omega_radiation;
 
     // CORRECT Janus acceleration equations
     // From Petit & D'Agostini 2014 eq.(13a-13b):
@@ -215,7 +246,11 @@ fn derivatives(state: &JanusState, params: &JanusParams) -> (f64, f64, f64, f64)
     //
     // When E < 0: ä > 0 (positive sector accelerates)
     //             ā̈ < 0 (negative sector decelerates)
-    let a_ddot = -1.5 * e / (a * a);
+    //
+    // Radiation contribution (only positive sector):
+    //   ä_rad = -Ω_r / a³ (always decelerates)
+    // From: ä/a = -(4πG/3)(ρ + 3p) with p = ρ/3 for radiation
+    let a_ddot = -1.5 * e / (a * a) - omega_r / (a * a * a);
     let a_bar_ddot = 1.5 * e / (a_bar * a_bar);
 
     (state.a_dot, state.a_bar_dot, a_ddot, a_bar_ddot)
@@ -289,6 +324,49 @@ pub fn integrate_backward(params: &JanusParams, z_max: f64, n_steps: usize) -> V
         }
 
         history.push(state.clone());
+    }
+
+    // Sort by increasing redshift (decreasing a)
+    history.sort_by(|s1, s2| s1.a.partial_cmp(&s2.a).unwrap().reverse());
+    history
+}
+
+/// Integrate backwards to very high z (CMB epoch)
+/// Uses adaptive-like step sizing for better accuracy at high z
+pub fn integrate_backward_highz(params: &JanusParams, z_max: f64, n_steps: usize) -> Vec<JanusState> {
+    let mut state = JanusState::today(params);
+    let mut history = Vec::with_capacity(n_steps + 1);
+    history.push(state.clone());
+
+    let a_target = 1.0 / (1.0 + z_max);
+
+    // For high z integration, we need smaller steps when a is small
+    // Use logarithmic stepping: step size proportional to a
+    // This gives uniform coverage in log(a) space
+    let ln_a_range = (1.0_f64).ln() - a_target.ln(); // = -ln(a_target) = ln(1+z_max)
+
+    // Base time step (will be scaled by a)
+    let dtau_base = -ln_a_range * 3.0 / n_steps as f64;
+
+    for i in 0..n_steps {
+        // Adaptive step: smaller when a is small
+        let dtau = dtau_base * state.a.max(a_target);
+        state = rk4_step(&state, params, dtau);
+
+        // Safety checks
+        if state.a <= a_target * 0.5 || state.a.is_nan() || state.a_bar.is_nan() {
+            history.push(state.clone());
+            break;
+        }
+
+        // Save every 10th step or when close to target
+        if i % 10 == 0 || state.a <= a_target * 1.1 {
+            history.push(state.clone());
+        }
+
+        if state.a <= a_target {
+            break;
+        }
     }
 
     // Sort by increasing redshift (decreasing a)
@@ -468,6 +546,60 @@ pub fn mu_janus_approx(z: f64, eta: f64) -> f64 {
 
     let d_l = (1.0 + z) * integral * C / H0;
     distance_modulus(d_l)
+}
+
+/// Compute the comoving sound horizon at decoupling
+/// r_d = ∫₀^{a_dec} c_s da / (a² H(a))
+/// where c_s = c/√3 (relativistic sound speed in photon-baryon fluid)
+/// a_dec = scale factor at decoupling (z=1100 → a_dec ≈ 1/1101)
+/// Returns r_d in units of c/H₀
+pub fn sound_horizon_comoving(history: &[JanusState]) -> f64 {
+    sound_horizon_to_z(history, 1100.0)
+}
+
+/// Compute sound horizon from Big Bang to given redshift z_dec
+/// r_d = ∫_{a_min}^{a_dec} c_s da / (a² H(a))
+pub fn sound_horizon_to_z(history: &[JanusState], z_dec: f64) -> f64 {
+    // c_s = c/√3 → in dimensionless units c_s = 1/√3
+    let c_s = 1.0 / 3.0_f64.sqrt();
+    let a_dec = 1.0 / (1.0 + z_dec);
+
+    let mut integral = 0.0;
+
+    // History is sorted by increasing z (decreasing a)
+    // First element = highest z (smallest a, earliest time)
+    // We integrate from earliest time (smallest a) up to a_dec
+    for i in 1..history.len() {
+        let s0 = &history[i - 1];
+        let s1 = &history[i];
+
+        // Stop when we reach decoupling
+        if s0.a > a_dec {
+            break;
+        }
+
+        // Get a and H at midpoint
+        let a_mid = 0.5 * (s0.a + s1.a);
+        let h_mid = 0.5 * (s0.hubble().abs() + s1.hubble().abs());
+
+        if h_mid <= 0.0 || a_mid <= 0.0 {
+            continue;
+        }
+
+        // da (note: history is sorted by decreasing a, so s0.a < s1.a)
+        // Actually: history sorted by INCREASING z means DECREASING a
+        // So s0 has higher z, smaller a than s1
+        // da = s1.a - s0.a > 0
+        let da = (s1.a.min(a_dec) - s0.a).max(0.0);
+        if da <= 0.0 {
+            continue;
+        }
+
+        // r_d += c_s * da / (a² * H)
+        integral += c_s * da / (a_mid * a_mid * h_mid);
+    }
+
+    integral
 }
 
 /// Compute conserved energy E(t) = Ω₊/a³ · a³ - Ω₋/ā³ · ā³ = Ω₊ - Ω₋

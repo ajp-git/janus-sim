@@ -1,0 +1,39 @@
+# Output - frames PNG et snapshots (trop volumineux)
+output/
+
+# Build - binaires Rust compilés
+target/
+
+# Data files volumineux
+*.h5
+*.png
+*.mp4
+*.bin
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+*.tmp
+*.log
+*.pid
+nohup.out
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Data observationnelles (télécharger séparément)
+data/*.csv
+data/*.dat

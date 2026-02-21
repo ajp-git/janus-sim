@@ -1,0 +1,13 @@
+{
+  "implementation": "Barnes-Hut GPU (Rust + CUDA)",
+  "crate": "cudarc",
+  "reference": "Bedorf 2012 - GPU Barnes-Hut with linear tree array",
+  "validation": {
+    "n_particles": 100000,
+    "steps": 50,
+    "target_segregation_diff": "<5% vs CPU",
+    "target_ke_ratio": "<50 at step 50"
+  },
+  "status": "in_progress",
+  "started": "2026-02-20"
+}

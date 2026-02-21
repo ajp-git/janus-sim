@@ -1,0 +1,67 @@
+[package]
+name = "janus-sim"
+version = "0.1.0"
+edition = "2021"
+description = "Janus Cosmological Model — numerical validation"
+authors = ["AJP"]
+
+[[bin]]
+name = "friedmann"
+path = "src/bin/friedmann.rs"
+
+[[bin]]
+name = "nbody"
+path = "src/bin/nbody.rs"
+
+[[bin]]
+name = "nbody_gpu_test"
+path = "src/bin/nbody_gpu_test.rs"
+
+[[bin]]
+name = "nbody_gpu_10m"
+path = "src/bin/nbody_gpu_10m.rs"
+
+[[bin]]
+name = "nbody_gpu_prod"
+path = "src/bin/nbody_gpu_prod.rs"
+
+[lib]
+name = "janus"
+path = "src/lib.rs"
+
+[features]
+default = []
+cuda = ["cudarc"]
+
+[dependencies]
+# Algèbre linéaire SIMD
+nalgebra = "0.33"
+
+# Parallélisme CPU
+rayon = "1.10"
+
+# CUDA GPU (optional)
+cudarc = { version = "0.12", features = ["cuda-12030", "nvrtc"], optional = true }
+
+# Random number generation
+rand = "0.9"
+
+# Sérialisation CSV
+csv = "1.3"
+serde = { version = "1.0", features = ["derive"] }
+
+# Statistiques / optimisation
+argmin = "0.10"
+argmin-math = "0.4"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+approx = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

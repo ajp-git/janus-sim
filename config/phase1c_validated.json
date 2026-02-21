@@ -1,0 +1,35 @@
+{
+  "name": "Phase 1c - 10M particles",
+  "validated": "2026-02-20",
+  "stability_test": {
+    "n_particles": 100000,
+    "steps": 50,
+    "dt": 0.0005,
+    "softening_formula": "(BOX / GRID) * 2",
+    "softening_value": 3.12,
+    "grid": 64,
+    "result_ke_ratio": 1.18,
+    "result_segregation_change": 0.0,
+    "verdict": "STABLE - KE/KE0 < 10"
+  },
+  "production_params": {
+    "n_particles": 10000000,
+    "eta": 1.045,
+    "n_positive": 4889976,
+    "n_negative": 5110024,
+    "steps": 300,
+    "dt": 0.0005,
+    "box_size": 100.0,
+    "grid": 128,
+    "softening_formula": "(BOX / GRID) * 2",
+    "softening_value": 9.38,
+    "total_time": 0.15
+  },
+  "notes": [
+    "dt=0.0005 validated (reduced 6x from 0.003)",
+    "softening = 2x cell size (standard PM formula)",
+    "Grid 128 for 10M (scaled from 64 for 100K)",
+    "Segregation requires ~500+ steps to be visible",
+    "KE/KE0 < 2 expected with these params"
+  ]
+}

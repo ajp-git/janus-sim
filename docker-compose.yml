@@ -1,0 +1,58 @@
+services:
+
+  # Simulation Friedmann (CPU — étape 1)
+  friedmann:
+    build: .
+    image: janus-sim:latest
+    container_name: janus-friedmann
+    command: cargo run --release --bin friedmann
+    volumes:
+      # Résultats persistants sur l'hôte
+      - ./output:/app/output
+      # Données Pantheon+ (à placer dans data/ sur l'hôte)
+      - ./data:/app/data:ro
+    environment:
+      - RUST_LOG=info
+
+  # Simulation N-corps (GPU — étapes 2-3)
+  nbody:
+    build: .
+    image: janus-sim:latest
+    container_name: janus-nbody
+    command: cargo run --release --bin nbody -- --n 1000000 --steps 1000
+    volumes:
+      - ./output:/app/output
+      - ./data:/app/data:ro
+    environment:
+      - RUST_LOG=info
+      - CUDA_VISIBLE_DEVICES=0
+    # Accès GPU RTX 3060
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Shell interactif pour développement / debug
+  dev:
+    build: .
+    image: janus-sim:latest
+    container_name: janus-dev
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+    volumes:
+      # Le code source est monté — modifications visibles sans rebuild
+      - .:/app
+      - ./output:/app/output
+    environment:
+      - RUST_LOG=debug
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

@@ -1,58 +1,58 @@
 # VALIDATION_RULES.md
-# Règles de validation obligatoires — Projet Janus
-# À lire au début de chaque session Claude CLI
+# Mandatory Validation Rules — Janus Project
+# Read at the beginning of each Claude CLI session
 
-## RÈGLE FONDAMENTALE
+## FUNDAMENTAL RULE
 
-**Toute nouvelle fonction physique doit être validée sur un cas trivial
-avec résultat connu AVANT d'être utilisée dans une simulation.**
+**Every new physics function must be validated on a trivial case
+with known result BEFORE being used in a simulation.**
 
-Ordre obligatoire :
-1. Écrire le test trivial
-2. Vérifier que le test passe
-3. Seulement ensuite utiliser la fonction
-4. Ne jamais bypasser cette procédure même sous pression de temps
+Mandatory order:
+1. Write the trivial test
+2. Verify the test passes
+3. Only then use the function
+4. Never bypass this procedure even under time pressure
 
 ---
 
-## 1. SÉGRÉGATION
+## 1. SEGREGATION
 
-### Test obligatoire
+### Mandatory Test
 ```rust
 #[test]
 fn test_segregation_trivial() {
-    // 4 particules + à droite, 4 particules - à gauche
+    // 4 positive particles on right, 4 negative particles on left
     // COM+ = (10, 0, 0), COM- = (-10, 0, 0)
-    // Distance attendue = 20.0 EXACTEMENT
+    // Expected distance = 20.0 EXACTLY
     let positions_plus  = vec![(10.0, 0.0, 0.0); 4];
     let positions_minus = vec![(-10.0, 0.0, 0.0); 4];
     let distance = compute_segregation(&positions_plus, &positions_minus);
     assert!((distance - 20.0).abs() < 1e-10,
-        "Distance COM attendue 20.0, obtenu {}", distance);
+        "Expected COM distance 20.0, got {}", distance);
 }
 ```
 
-### Normalisation obligatoire
+### Mandatory Normalization
 ```rust
-// La ségrégation doit TOUJOURS être normalisée par box_size
+// Segregation must ALWAYS be normalized by box_size
 let segregation = distance_com / box_size;
-// Valeurs typiques : 0.0 (mélangé) à ~0.5 (ségrégé)
-// Phase 1b validée : Seg₀ ≈ 0.029, Seg_final ≈ 0.163 (+294%)
+// Typical values: 0.0 (mixed) to ~0.5 (segregated)
+// Phase 1b validated: Seg₀ ≈ 0.029, Seg_final ≈ 0.163 (+294%)
 ```
 
-### Piège connu — Conditions périodiques
+### Known Pitfall — Periodic Boundary Conditions
 ```
-ERREUR CLASSIQUE : Calculer COM avec moyenne simple des positions
-quand les particules wrappent autour de la boîte.
+CLASSIC ERROR: Computing COM with simple position average
+when particles wrap around the box.
 
-EXEMPLE DU BUG :
-  Boîte : half_size = 50
-  Particule A : x = +49
-  Particule B : x = -49
-  Moyenne naive : (49 + (-49)) / 2 = 0  ← FAUX
-  Distance réelle : 2                    ← CORRECT
+BUG EXAMPLE:
+  Box: half_size = 50
+  Particle A: x = +49
+  Particle B: x = -49
+  Naive average: (49 + (-49)) / 2 = 0  ← WRONG
+  Real distance: 2                      ← CORRECT
 
-SOLUTION : Algorithme "minimum image convention"
+SOLUTION: "minimum image convention" algorithm
 ```
 
 ```rust
@@ -64,7 +64,7 @@ fn minimum_image(dx: f64, box_size: f64) -> f64 {
 }
 
 fn compute_com_periodic(positions: &[(f64,f64,f64)], box_size: f64) -> (f64,f64,f64) {
-    // Utiliser position de la première particule comme référence
+    // Use first particle position as reference
     let ref_pos = positions[0];
     let mut sum = (0.0f64, 0.0f64, 0.0f64);
     for &(x, y, z) in positions {
@@ -77,172 +77,172 @@ fn compute_com_periodic(positions: &[(f64,f64,f64)], box_size: f64) -> (f64,f64,
 }
 ```
 
-### Test minimum image obligatoire
+### Mandatory Minimum Image Test
 ```rust
 #[test]
 fn test_minimum_image() {
     let box_size = 100.0;
-    // Deux particules "proches" à travers la frontière périodique
+    // Two particles "close" across periodic boundary
     assert!((minimum_image(49.0 - (-49.0), box_size) + 2.0).abs() < 1e-10,
-        "Distance périodique attendue -2.0");
+        "Expected periodic distance -2.0");
     assert!((minimum_image(1.0, box_size) - 1.0).abs() < 1e-10,
-        "Distance normale attendue 1.0");
+        "Expected normal distance 1.0");
 }
 ```
 
 ---
 
-## 2. CONSERVATION D'ÉNERGIE
+## 2. ENERGY CONSERVATION
 
-### Test obligatoire
+### Mandatory Test
 ```rust
 #[test]
 fn test_energy_conservation_2body() {
-    // 2 particules de même signe, loin l'une de l'autre
-    // KE initial = KE final à 0.01% près sur 100 steps
+    // 2 same-sign particles, far apart
+    // Initial KE = final KE within 0.01% over 100 steps
     let ke_initial = simulate_2body(steps=100);
     let ke_final = ...;
     let drift = (ke_final - ke_initial).abs() / ke_initial;
     assert!(drift < 1e-4,
-        "Dérive énergie {:.4}% > 0.01%", drift * 100.0);
+        "Energy drift {:.4}% > 0.01%", drift * 100.0);
 }
 ```
 
-### Seuils de validation par simulation
-| Simulation | KE/KE₀ max acceptable | Ségrégation attendue |
+### Validation Thresholds by Simulation
+| Simulation | Max acceptable KE/KE₀ | Expected segregation |
 |------------|----------------------|----------------------|
-| 2 corps    | 1.001 (0.1%)         | Non applicable       |
-| 100K test  | < 50 à step 50       | Doit augmenter       |
-| 1M Phase1b | 113 à step 200       | +294% validé         |
-| 5M Phase1c | < 200 à step 100     | À déterminer         |
+| 2-body     | 1.001 (0.1%)         | Not applicable       |
+| 100K test  | < 50 at step 50      | Must increase        |
+| 1M Phase1b | 113 at step 200      | +294% validated      |
+| 5M Phase1c | < 200 at step 100    | To be determined     |
 
 ---
 
-## 3. FORCES JANUS
+## 3. JANUS FORCES
 
-### Test obligatoire — Lois d'interaction
+### Mandatory Test — Interaction Laws
 ```rust
 #[test]
 fn test_janus_force_laws() {
     let origin = [0.0, 0.0, 0.0];
     let right   = [1.0, 0.0, 0.0];
 
-    // Même signe → ATTRACTION (force vers +x)
+    // Same sign → ATTRACTION (force toward +x)
     let f_pp = janus_force(origin, right, sign_i=+1, sign_j=+1);
-    assert!(f_pp[0] > 0.0, "Masse+ attire Masse+ vers +x");
+    assert!(f_pp[0] > 0.0, "Mass+ attracts Mass+ toward +x");
 
     let f_mm = janus_force(origin, right, sign_i=-1, sign_j=-1);
-    assert!(f_mm[0] > 0.0, "Masse- attire Masse- vers +x");
+    assert!(f_mm[0] > 0.0, "Mass- attracts Mass- toward +x");
 
-    // Signes opposés → RÉPULSION (force vers -x)
+    // Opposite signs → REPULSION (force toward -x)
     let f_pm = janus_force(origin, right, sign_i=+1, sign_j=-1);
-    assert!(f_pm[0] < 0.0, "Masse+ repousse Masse- vers -x");
+    assert!(f_pm[0] < 0.0, "Mass+ repels Mass- toward -x");
 
     let f_mp = janus_force(origin, right, sign_i=-1, sign_j=+1);
-    assert!(f_mp[0] < 0.0, "Masse- repousse Masse+ vers -x");
+    assert!(f_mp[0] < 0.0, "Mass- repels Mass+ toward -x");
 
-    // Magnitude : G*m/r² (softening négligeable à r=1)
+    // Magnitude: G*m/r² (softening negligible at r=1)
     let expected = G * 1.0 / 1.0;
     assert!((f_pp[0] - expected).abs() / expected < 0.01,
-        "Magnitude incorrecte");
+        "Incorrect magnitude");
 }
 ```
 
 ---
 
-## 4. CONDITIONS AUX LIMITES PÉRIODIQUES
+## 4. PERIODIC BOUNDARY CONDITIONS
 
-### Test obligatoire
+### Mandatory Test
 ```rust
 #[test]
 fn test_periodic_bc() {
     let box_half = 50.0;
-    
-    // Particule qui sort à droite
+
+    // Particle exiting right
     let mut x = 51.0;
     apply_periodic(&mut x, box_half);
-    assert!((x - (-49.0)).abs() < 1e-10, "Wrap droite : {}", x);
+    assert!((x - (-49.0)).abs() < 1e-10, "Wrap right: {}", x);
 
-    // Particule qui sort à gauche  
+    // Particle exiting left
     let mut x = -51.0;
     apply_periodic(&mut x, box_half);
-    assert!((x - 49.0).abs() < 1e-10, "Wrap gauche : {}", x);
+    assert!((x - 49.0).abs() < 1e-10, "Wrap left: {}", x);
 
-    // Particule dans la boîte — ne doit pas bouger
+    // Particle inside box — should not move
     let mut x = 10.0;
     apply_periodic(&mut x, box_half);
-    assert!((x - 10.0).abs() < 1e-10, "Pas de wrap : {}", x);
+    assert!((x - 10.0).abs() < 1e-10, "No wrap: {}", x);
 }
 ```
 
 ---
 
-## 5. INTÉGRATION FRIEDMANN
+## 5. FRIEDMANN INTEGRATION
 
-### Test obligatoire — Solution paramétrique exacte
+### Mandatory Test — Exact Parametric Solution
 ```rust
 #[test]
 fn test_friedmann_vs_parametric() {
-    // Comparer l'intégrateur RK4 avec la solution exacte
-    // a(u) = α²·ch²(u) pour η = 1.045
+    // Compare RK4 integrator with exact solution
+    // a(u) = α²·ch²(u) for η = 1.045
     let eta = 1.045;
     let params = JanusParams::from_eta(eta);
     let history = integrate_backward(&params, 2.0, 5000);
 
-    // À z=1 (a=0.5), comparer avec solution paramétrique
-    // Écart acceptable : < 1%
+    // At z=1 (a=0.5), compare with parametric solution
+    // Acceptable error: < 1%
     let a_numerical = interpolate_a(&history, z=1.0);
     let a_parametric = compute_parametric(eta, z=1.0);
     let error = (a_numerical - a_parametric).abs() / a_parametric;
-    assert!(error < 0.01, "Écart Friedmann/paramétrique {:.2}%", error*100.0);
+    assert!(error < 0.01, "Friedmann/parametric error {:.2}%", error*100.0);
 }
 ```
 
 ---
 
-## 6. FORMULE SNIa (mu_janus_for_fit)
+## 6. SNIa FORMULA (mu_janus_for_fit)
 
-### Test obligatoire — Cohérence avec résultat connu
+### Mandatory Test — Consistency with Known Result
 ```rust
 #[test]
 fn test_mu_janus_known_values() {
-    // Valeurs de référence : fit Pantheon+ validé
+    // Reference values: validated Pantheon+ fit
     // η = 1.045, q0 = -0.022, cst = 23.856
 
     let eta = 1.045;
     let cst = 23.856;
 
-    // À z=0.5, μ doit être ≈ 42.3 (from janus_exact_fit.json)
+    // At z=0.5, μ should be ≈ 42.3 (from janus_exact_fit.json)
     let mu = mu_janus_for_fit(0.5, eta, cst);
     assert!((mu - 42.3).abs() < 0.1,
-        "μ(z=0.5) attendu ~42.3, obtenu {}", mu);
+        "μ(z=0.5) expected ~42.3, got {}", mu);
 
-    // Monotonicité : μ doit croître avec z
+    // Monotonicity: μ must increase with z
     for z in [0.1, 0.5, 1.0, 2.0] {
         let mu_prev = mu_janus_for_fit(z * 0.9, eta, cst);
         let mu_curr = mu_janus_for_fit(z, eta, cst);
-        assert!(mu_curr > mu_prev, "μ non monotone à z={}", z);
+        assert!(mu_curr > mu_prev, "μ not monotonic at z={}", z);
     }
 }
 ```
 
 ---
 
-## 7. COSMOINTERPOLATOR — Synchronisation Friedmann ↔ N-corps
+## 7. COSMOINTERPOLATOR — Friedmann ↔ N-body Synchronization
 
-### Contexte
-La Tâche 2 (Hubble friction) nécessite de passer a(t) et H(t)
-au kernel CUDA à chaque step. Ces valeurs viennent de friedmann.rs
-mais les unités de temps sont différentes.
+### Context
+Task 2 (Hubble friction) requires passing a(t) and H(t)
+to the CUDA kernel at each step. These values come from friedmann.rs
+but time units are different.
 
-### Convention confirmée dans friedmann.rs (ligne 106)
+### Convention confirmed in friedmann.rs (line 106)
 ```rust
 let a_dot = params.omega_plus.sqrt();
-// H₀ = √Ω₊ en unités adimensionnelles
+// H₀ = √Ω₊ in dimensionless units
 ```
-Pour η=1.045 : H₀ = √(1/2.045) = 0.6993
+For η=1.045: H₀ = √(1/2.045) = 0.6993
 
-### Test obligatoire avant Tâche 2
+### Mandatory Test Before Task 2
 ```rust
 #[test]
 fn test_cosmo_interpolator() {
@@ -250,130 +250,130 @@ fn test_cosmo_interpolator() {
     let params = JanusParams::from_eta(eta);
     let cosmo = CosmoInterpolator::new(&params, 50.0);
 
-    // Passé : a = 1/(1+z_init)
+    // Past: a = 1/(1+z_init)
     let (a_start, _) = cosmo.get_params_at_tau(cosmo.tau_start);
     assert!((a_start - 1.0/51.0).abs() < 1e-4);
 
-    // Présent : a = 1.0 exactement
+    // Present: a = 1.0 exactly
     let (a_end, h_end) = cosmo.get_params_at_tau(cosmo.tau_end);
     assert!((a_end - 1.0).abs() < 1e-4);
 
-    // H₀ = √Ω₊ (convention friedmann.rs ligne 106)
+    // H₀ = √Ω₊ (friedmann.rs line 106 convention)
     assert!((h_end - params.omega_plus.sqrt()).abs() < 1e-4);
 
-    // Monotonie
+    // Monotonicity
     let tau_mid = cosmo.tau_start + (cosmo.tau_end - cosmo.tau_start) / 2.0;
     let (a_mid, _) = cosmo.get_params_at_tau(tau_mid);
     assert!(a_mid > a_start && a_mid < a_end);
 }
 ```
 
-### Piège connu — Fonctions fantômes
+### Known Pitfall — Ghost Functions
 ```
-Ces fonctions N'EXISTENT PAS dans friedmann.rs :
-  integrate_friedmann(eta, t)   ← INEXISTANT
-  interpolate_a(&history, t)    ← INEXISTANT
+These functions DO NOT EXIST in friedmann.rs:
+  integrate_friedmann(eta, t)   ← NONEXISTENT
+  interpolate_a(&history, t)    ← NONEXISTENT
 
-Utiliser CosmoInterpolator::new() et get_params_at_tau()
-(code dans janus_roadmap.md Tâche 2)
+Use CosmoInterpolator::new() and get_params_at_tau()
+(code in janus_roadmap.md Task 2)
 ```
 
-### Piège connu — Choc des unités de temps
+### Known Pitfall — Time Unit Mismatch
 ```
-t_nbody (dt=0.01 arbitraire) ≠ τ cosmologique (H₀·t)
+t_nbody (dt=0.01 arbitrary) ≠ τ cosmological (H₀·t)
 
-Conversion obligatoire :
+Mandatory conversion:
   dtau_cosmo = (tau_end - tau_start) / total_nbody_steps
 
-Ne jamais passer t_nbody directement à get_params_at_tau()
+Never pass t_nbody directly to get_params_at_tau()
 ```
 
 ---
 
-## 8. MÉTHODE DE FORCE N-CORPS
+## 8. N-BODY FORCE METHOD
 
-### Test de méthode — Avant toute simulation > 100K particules
+### Method Test — Before Any Simulation > 100K Particles
 ```
-La méthode de force doit être validée sur un cas physique simple :
+The force method must be validated on a simple physical case:
 
-TEST OBLIGATOIRE : Effondrement gravitationnel
-  - 1000 particules de même signe, distributions sphérique
-  - Après 50 steps : les particules doivent se rapprocher du centre
-  - Rayon moyen doit diminuer de > 5%
+MANDATORY TEST: Gravitational collapse
+  - 1000 same-sign particles, spherical distribution
+  - After 50 steps: particles must move toward center
+  - Mean radius must decrease by > 5%
 
-TEST ANTI-PM : Ségrégation sur 100K
-  - 50K particules+, 50K particules-
-  - Après 200 steps : ségrégation doit augmenter de > 10%
-  - Si ségrégation stagne : méthode PM inutilisable pour Janus
-  - → Utiliser Barnes-Hut obligatoirement
+ANTI-PM TEST: Segregation on 100K
+  - 50K positive particles, 50K negative particles
+  - After 200 steps: segregation must increase by > 10%
+  - If segregation stagnates: PM method unusable for Janus
+  - → Use Barnes-Hut mandatory
 
-MÉTHODES VALIDÉES pour Janus :
-  ✅ Barnes-Hut CPU (Rust) — Phase 1b validée
-  ✅ Barnes-Hut GPU (Rust+CUDA) — validé 0% écart
-  ❌ Particle-Mesh (Python+CuPy) — ségrégation nulle, inutilisable
-```
-
----
-
-## 8. PROCÉDURE DE LANCEMENT SIMULATION
-
-### Checklist obligatoire avant tout lancement > 1M particules
-
-```
-□ 1. Paramètres testés sur 100K, 50 steps
-     → KE/KE₀ < 50 à step 50 ✓
-     → Ségrégation augmente entre step 0 et step 50 ✓
-
-□ 2. Seeds synchronisées CPU/GPU si comparaison
-     → Écart ségrégation < 5% ✓
-
-□ 3. Estimation temps total calculée
-     → steps × temps/step = durée acceptable ✓
-
-□ 4. Espace disque vérifié
-     → snapshots NPZ + frames PNG ✓
-
-□ 5. nohup + PID sauvegardé
-
-□ 6. Surveillance steps 20, 50, 100 planifiée
-     → Critères d'arrêt définis AVANT le lancement
-
-□ 7. NE PAS LANCER sans validation explicite
+VALIDATED METHODS for Janus:
+  ✅ Barnes-Hut CPU (Rust) — Phase 1b validated
+  ✅ Barnes-Hut GPU (Rust+CUDA) — validated 0% deviation
+  ❌ Particle-Mesh (Python+CuPy) — zero segregation, unusable
 ```
 
 ---
 
-## 9. RÈGLES DE COMPORTEMENT CLAUDE CLI
+## 9. SIMULATION LAUNCH PROCEDURE
+
+### Mandatory Checklist Before Any Launch > 1M Particles
 
 ```
-1. Ne jamais lancer une simulation sans instruction explicite.
+□ 1. Parameters tested on 100K, 50 steps
+     → KE/KE₀ < 50 at step 50 ✓
+     → Segregation increases between step 0 and step 50 ✓
 
-2. Toujours rapporter step 20 et attendre confirmation
-   avant de continuer au-delà de step 50.
+□ 2. Seeds synchronized CPU/GPU if comparison
+     → Segregation deviation < 5% ✓
 
-3. Si un critère d'arrêt est atteint → arrêter et signaler.
-   Ne pas "laisser tourner pour avoir les frames".
+□ 3. Total time estimate calculated
+     → steps × time/step = acceptable duration ✓
 
-4. Tout changement de paramètre (softening, dt, méthode)
-   par rapport à la version validée doit être signalé
-   et re-validé sur 100K avant application.
+□ 4. Disk space verified
+     → NPZ snapshots + PNG frames ✓
 
-5. Ne jamais interpréter un résultat ambigu comme "correct".
-   Toujours poser la question explicitement.
+□ 5. nohup + PID saved
 
-6. Toute fonction de mesure physique (ségrégation, énergie,
-   COM, distance) doit avoir son test trivial dans le code.
+□ 6. Monitoring at steps 20, 50, 100 planned
+     → Stop criteria defined BEFORE launch
+
+□ 7. DO NOT LAUNCH without explicit validation
 ```
 
 ---
 
-## HISTORIQUE DES BUGS RENCONTRÉS
+## 10. CLAUDE CLI BEHAVIOR RULES
 
-| Bug | Cause | Leçon |
-|-----|-------|-------|
-| Équations accélération incorrectes | Densités locales au lieu de E conservé | Toujours vérifier vs papier source |
-| Écart analytique/numérique 0.8 mag | H(z) standard Friedmann mixé avec acc Janus | Cohérence théorique avant implémentation |
-| Ségrégation nulle avec PM | Méthode PM lisse interactions courte portée | Valider méthode sur cas physique connu |
-| OOM 10M f64 sur 12GB VRAM | Estimation VRAM incorrecte (arbre ×8) | Calculer VRAM avant de lancer |
-| COM faux avec conditions périodiques | Moyenne simple ignore wrap | Toujours utiliser minimum image convention |
-| Lancement sans instruction | Claude CLI autonome | Checklist obligatoire avant lancement |
+```
+1. Never launch a simulation without explicit instruction.
+
+2. Always report step 20 and wait for confirmation
+   before continuing beyond step 50.
+
+3. If a stop criterion is met → stop and report.
+   Do not "let it run for the frames".
+
+4. Any parameter change (softening, dt, method)
+   from the validated version must be reported
+   and re-validated on 100K before application.
+
+5. Never interpret an ambiguous result as "correct".
+   Always ask the question explicitly.
+
+6. Every physics measurement function (segregation, energy,
+   COM, distance) must have its trivial test in the code.
+```
+
+---
+
+## HISTORY OF ENCOUNTERED BUGS
+
+| Bug | Cause | Lesson |
+|-----|-------|--------|
+| Incorrect acceleration equations | Local densities instead of conserved E | Always verify vs source paper |
+| Analytical/numerical deviation 0.8 mag | Standard Friedmann H(z) mixed with Janus acc | Theoretical consistency before implementation |
+| Zero segregation with PM | PM method smooths short-range interactions | Validate method on known physical case |
+| OOM 10M f64 on 12GB VRAM | Incorrect VRAM estimate (tree ×8) | Calculate VRAM before launching |
+| Wrong COM with periodic conditions | Simple average ignores wrap | Always use minimum image convention |
+| Launch without instruction | Autonomous Claude CLI | Mandatory checklist before launch |

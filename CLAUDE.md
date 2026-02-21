@@ -11,6 +11,15 @@ Claude operates in **fully autonomous** mode on this server.
 
 ---
 
+## CRITICAL: READ FIRST
+
+1. **Read `VALIDATION_RULES.md`** at the start of every session
+2. **Every new physics function** must have a trivial test before use
+3. **Never launch simulations** without explicit user instruction
+4. **Report results** and wait for instruction after each task
+
+---
+
 ## DOCKER RULES — SHARED SERVER
 
 **Other Docker containers are running on this server. Never touch them.**
@@ -19,7 +28,7 @@ Claude operates in **fully autonomous** mode on this server.
 - Use `docker compose` from the `janus-sim/` folder
 - Check `docker ps` before any global action
 - Use `--rm` for ephemeral containers
-- Explicitly name the service: `docker compose run --rm friedmann`
+- Explicitly name the service: `docker compose run --rm dev`
 
 ### NEVER
 ```bash
@@ -32,9 +41,7 @@ docker volume rm ...
 ```
 
 ### Containers of this project (the only ones to manipulate)
-- `janus-friedmann`
-- `janus-nbody`
-- `janus-dev`
+- `janus-sim-dev` (main development container)
 
 ---
 
@@ -50,118 +57,158 @@ docker volume rm ...
 **Stack**
 - Docker + nvidia-container-toolkit (GPU → containers)
 - Rust compiled in container (CUDA 12.3 image)
-- CUDA via `cudarc` for GPU N-body kernels
+- CUDA via `cudarc` for GPU N-body kernels (f64 precision)
 
 ---
 
-## Host Prerequisites (check at startup)
+## Current Project Status (February 2026)
 
-```bash
-nvidia-smi                    # NVIDIA drivers OK?
-docker --version              # Docker installed?
-docker compose version        # Compose available?
-docker run --rm --gpus all nvidia/cuda:12.3.1-base-ubuntu22.04 nvidia-smi
-# GPU visible in Docker?
+### Phase 1a — Pantheon+ Fit ✅ COMPLETE
+- **η = 1.045** (single free parameter)
+- **q₀ = -0.022** (near-flat acceleration)
+- **χ²/dof = 0.914** (excellent fit on 1590 SNIa)
+
+### Phase 1b — CPU Barnes-Hut ✅ COMPLETE
+- 0% CPU/GPU deviation (validated with synchronized seeds)
+
+### Phase 1c — GPU N-body 🔄 IN PROGRESS
+- Virialized initial conditions implemented
+- Auto-stop conditions active
+- Current runs: 100K, 500K, 2M particles (10,000 steps each)
+
+---
+
+## Key Technical Insights
+
+### Janus Virialization (CRITICAL)
+Standard virialization (2KE + PE_total = 0) **fails** for Janus systems:
+- With η ≈ 1, repulsive +/− pairs dominate → PE_total > 0
+- KE_target = −PE_total/2 < 0 → impossible
+
+**Solution**: Use PE_binding (same-sign pairs only):
+```rust
+// PE_binding < 0 always (attractive pairs only)
+let alpha = (pe_binding.abs() / (2.0 * ke)).sqrt();
+// Typical alpha ≈ 4.57 for η=1.045
 ```
 
-If something is missing:
-```bash
-sudo apt install nvidia-container-toolkit
-sudo systemctl restart docker
-```
+### Bugs Fixed (lessons learned)
+| Bug | Root Cause | Lesson |
+|-----|-----------|--------|
+| Wrong acceleration | Local densities instead of conserved E | Verify vs source paper |
+| 0.8 mag offset | Mixed Friedmann H(z) with Janus accelerations | Theoretical consistency first |
+| Zero segregation | PM method smooths short-range | Validate method on known case |
+| COM periodic error | Simple average ignores wrap | Use minimum image convention |
+| GPU rsqrt() | rsqrt() is float intrinsic | Use 1.0/sqrt() for f64 |
+| Seg₀ ≈ 0.49 | Different COM references | Common origin for both populations |
 
 ---
 
 ## Project Commands
 
 ```bash
-# Build the image (first time ~5-10 min)
+# Build the image
 docker compose build
 
-# Step 1 — Friedmann FLRW (CPU)
-docker compose run --rm friedmann
+# Friedmann + Pantheon+ fit (CPU)
+docker compose run --rm dev cargo run --release --bin friedmann
 
-# Step 2 — N-body GPU
-docker compose run --rm nbody -- --n 1000000 --steps 1000
+# GPU N-body simulation
+docker compose run --rm dev cargo run --release --features cuda \
+  --bin nbody_overnight -- \
+  --n 500000 --eta 1.045 --dt 0.01 --steps 10000 \
+  --output /app/output/run_name
 
 # Interactive shell for debugging
 docker compose run --rm dev
 
-# Results
-ls output/
+# Check simulation progress
+tail -20 output/*/run.log
+ls output/*/snapshots/ | wc -l
 ```
 
 ---
 
-## Scientific Objective
+## Simulation Parameters
 
-Numerically validate Jean-Pierre Petit's Janus cosmological model
-by reproducing **real observables** (not illustrations).
+| Parameter | Description | Validated Value |
+|-----------|-------------|-----------------|
+| `--n` | Total particles | 100K-2M |
+| `--eta` | ρ̄/ρ ratio | 1.045 |
+| `--dt` | Time step | 0.01 |
+| `--steps` | Integration steps | 10000 |
+| `--output` | Output directory | /app/output/... |
 
-### The Janus Model
-Coupled bimetric model (Petit & D'Agostini 2014, EPJC 2024).
-Two metrics g+ and g- coexist on the same manifold M4.
-Replaces dark matter and dark energy with negative masses.
+### Auto-Stop Conditions
+- **KE/KE₀ > 50**: Energy instability → stop
+- **Seg decreases 500 consecutive steps**: Unphysical → stop
 
-### Interaction Rules (Newtonian limit)
-- mass+ attracts mass+ → classical Newton
-- mass- attracts mass- → attraction (symmetry)
-- mass+ and mass- repel each other → anti-Newton (runaway eliminated)
+---
 
-### Coupled FLRW Conservation Equation
+## Project Structure
+
 ```
-rho*c^2*a^3 + rho_bar*c_bar^2*a_bar^3 = E = constant,  E < 0
+janus-sim/
+├── CLAUDE.md              ← read first (this file)
+├── VALIDATION_RULES.md    ← mandatory tests for physics functions
+├── janus_roadmap.md       ← detailed task roadmap (Tasks 1-5)
+├── README.md              ← full project documentation
+├── Cargo.toml
+├── Dockerfile
+├── docker-compose.yml
+├── src/
+│   ├── lib.rs             ← constants + Janus interaction rules
+│   ├── friedmann.rs       ← coupled FLRW + RK4 + CosmoInterpolator
+│   ├── nbody.rs           ← CPU N-body (Barnes-Hut, Rayon parallel)
+│   ├── nbody_gpu.rs       ← GPU N-body (CUDA f64, virialization)
+│   ├── analysis.rs        ← χ² fitting on Pantheon+
+│   └── bin/
+│       ├── friedmann.rs       ← Friedmann solver + SNIa fit
+│       ├── nbody.rs           ← CPU N-body binary
+│       └── nbody_overnight.rs ← GPU production binary
+├── data/
+│   └── Pantheon+SH0ES.dat ← SNIa data (download from Scolnic 2022)
+└── output/                ← simulation results (not in git)
+    └── YYYY-MM-DD_run_*/
+        ├── snapshots/     ← particle data per step
+        ├── frames/        ← 4K PNG visualization
+        ├── time_series.csv
+        └── run.log
 ```
-Negative total energy → dominant negative sector → cosmic acceleration.
-
-### Single Free Parameter
-eta = |rho_bar_0|/rho_0  (negative/positive density ratio)
-H0 = 70 km/s/Mpc (consistent with Janus, vs 67 for LCDM)
 
 ---
 
 ## Roadmap
 
-### Phase 1 — Local Validation (current objective)
+### Completed ✅
+- [x] Phase 1a: Pantheon+ fit (η=1.045, χ²/dof=0.914)
+- [x] Barnes-Hut CPU/GPU with 0% validation error
+- [x] Bug fixes: rsqrt, COM periodic, acceleration equations
+- [x] Virialized IC (PE_binding method, virial error 0.0000%)
+- [x] Corrected COM reference (common origin)
+- [x] Auto-stop conditions
 
-**1a — Friedmann + Pantheon+ fit** (CPU)
-- Integrate coupled Janus FLRW equations
-- Scan eta, minimize chi^2 on ~1700 SNIa Pantheon+
-- Output: magnitude-redshift curve + optimal eta
+### In Progress 🔄
+- [ ] Convergence study: 100K / 500K / 2M (overnight runs)
+- [ ] Understanding segregation dynamics at η=1.045
 
-**1b — N-body 1M particles** (RTX 3060)
-- Verify +/- spatial segregation
-- Estimated time: ~1 min/run
-
-**1c — N-body 10M particles** (RTX 3060)
-- Measure two-point correlation function
-- Compare with SDSS DR16
-- Estimated time: ~10 min/run
-
-**1d — N-body 100M particles** (RTX 3060)
-- Power spectrum vs observations
-- Estimated time: ~2h/run
-
-### Phase 2 — Submission to Petit/Zejli
-- Public GitHub + technical report
-- Friedmann curves + N-body maps + statistics
-- Contact: jean-pierre.petit@manaty.net / hicham.zejli@manaty.net
-
-### Phase 3 — Distributed Computing (if validation OK)
-- Cross-platform Rust client + network layer
-- BOINC-like server (Axum/Rust)
-- Public dashboard for aggregated results
-- This server becomes the central node
+### Planned (see janus_roadmap.md)
+- [ ] Task 2: Hubble friction (couple a(t) from friedmann.rs)
+- [ ] Task 3: Full convergence study (criterion < 10%)
+- [ ] Task 4: Two-point correlation ξ(r) via Corrfunc
+- [ ] Task 5: Test η=1.0 (theoretical limit case)
 
 ---
 
 ## Key References
 
-1. Petit & D'Agostini (2014) — Astrophys. Space Sci. 354:611
-2. D'Agostini & Petit (2018) — Astrophys. Space Sci. 363:139 — fit 740 SNIa, 1 free parameter
-3. Petit, Margnat & Zejli (2024) — EPJC 84:1226 — current reference
-4. Zejli (2024) — technical book 233p — januscosmologicalmodel.com
-5. Petit (1995) — Astrophys. Space Sci. 226:273 — original simulations
+1. **Petit, Margnat & Zejli (2024)** — EPJC 84:1226 — current reference
+2. **D'Agostini & Petit (2018)** — Astrophys. Space Sci. 363:139 — exact μ(z) formula
+3. **Petit & D'Agostini (2014)** — Astrophys. Space Sci. 354:611 — Friedmann equations
+4. **Scolnic et al. (2022)** — ApJ 938:113 — Pantheon+ data
+5. **Lane et al. (2024)** — MNRAS arXiv:2311.01438 — ΛCDM calibration bias
+
+---
 
 ## Observational Data
 
@@ -171,30 +218,10 @@ H0 = 70 km/s/Mpc (consistent with Janus, vs 67 for LCDM)
 
 ---
 
-## Project Structure
-
-```
-janus-sim/
-├── CLAUDE.md              ← read first
-├── Cargo.toml
-├── Dockerfile
-├── docker-compose.yml
-├── src/
-│   ├── lib.rs             ← constants + Janus interaction rules
-│   ├── friedmann.rs       ← coupled FLRW + RK4
-│   ├── nbody.rs           ← N-body
-│   ├── analysis.rs        ← chi^2 fitting
-│   └── bin/
-│       ├── friedmann.rs   ← magnitude-redshift binary
-│       └── nbody.rs       ← GPU N-body binary
-├── data/                  ← obs. data (downloaded automatically)
-├── output/                ← simulation results
-└── tests/
-```
-
 ## Technical Notes
 
-- 1 free parameter model → 1D scan on eta for SNIa
-- Opposite masses mutually exclude in dense regions
-- Symplectic integrator (Leapfrog/Yoshida 4) mandatory
-- Barnes-Hut O(N log N) mandatory beyond 100K particles
+- **f64 everywhere**: GPU kernels use double precision
+- **Barnes-Hut θ = 0.5**: Balance speed/accuracy for N-body
+- **Leapfrog integrator**: Symplectic, time-reversible
+- **Plummer softening**: ε = 0.1 (prevents close encounters)
+- **Periodic BC**: Minimum image convention for all distances

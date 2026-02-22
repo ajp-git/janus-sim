@@ -1,0 +1,2 @@
+# CuPy for GPU FFT (requires CUDA 12.x)
+cupy-cuda12x>=14.0

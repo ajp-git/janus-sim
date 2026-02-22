@@ -1,0 +1,52 @@
+[package]
+name = "janus-pm"
+version = "0.1.0"
+edition = "2021"
+description = "Janus Particle-Mesh FFT solver — 20M particles target"
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
+[dependencies]
+janus-sim = { path = ".." }
+cudarc = { version = "0.12", features = ["cuda-12030"], optional = true }
+rand = "0.9"
+
+# FFT support
+rustfft = "6.2"          # CPU FFT for validation
+num-complex = "0.4"      # Complex numbers
+
+# Binary serialization for snapshots
+byteorder = "1.5"
+
+# Timestamps for output directories
+chrono = "0.4"
+
+[[bin]]
+name = "pm_solver"
+path = "src/main.rs"
+
+[[bin]]
+name = "fft_test"
+path = "src/bin/fft_test.rs"
+
+[[bin]]
+name = "fft_test_gpu"
+path = "src/bin/fft_test_gpu.rs"
+
+[[bin]]
+name = "cic_test"
+path = "src/bin/cic_test.rs"
+
+[[bin]]
+name = "pm_test"
+path = "src/bin/pm_test.rs"
+
+[[bin]]
+name = "janus_pm_test"
+path = "src/bin/janus_pm_test.rs"
+
+[[bin]]
+name = "pm5_production"
+path = "src/bin/pm5_production.rs"

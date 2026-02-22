@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "janus-pm"]
+resolver = "2"
+
 [package]
 name = "janus-sim"
 version = "0.1.0"

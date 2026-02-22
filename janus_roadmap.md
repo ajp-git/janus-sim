@@ -1,9 +1,11 @@
 # Feuille de route — Projet Janus
 # Document pour Claude CLI
-# Date : 20 février 2026
+# Mise à jour : 22 février 2026
 # Basé sur analyse de ChatGPT, Grok et Gemini
 
 ---
+## PROJET PM-FFT (parallèle)
+Voir janus_roadmap_pm.md pour les instructions complètes.
 
 ## CONTEXTE ET ÉTAT ACTUEL
 
@@ -14,20 +16,23 @@
 - **Tâche 1 COMPLÈTE** : virialization PE_binding, COM référence commune ✅
 - Seg₀ = 0.0024 (vs 0.49 avant correction) ✅
 - KE/KE₀ = 1.0003 stable (vs 115 avant virialization) ✅
+- **Tâche 2 COMPLÈTE** : Hubble friction, CosmoInterpolator, dtau_per_dt=0.013205 ✅
+- **Run 500K terminé** : S_max=0.513 (step 1453), KE/KE₀=6.01 ✅
+- **Run 2M en cours** : S_max=0.694 (step 2192 CSV), 51% complet 🔄
 
-### Run production terminé — Hubble friction (2026-02-21)
-| Paramètre | Valeur |
-|-----------|--------|
-| Run | 2026-02-21_run_hubble_mid |
-| N | 500,000 |
-| η | 1.045 |
-| Steps | 3,600 |
-| Runtime | 4h |
-| KE/KE₀ final | **6.01** ✅ |
-| Seg initiale | 0.24% |
-| Seg finale | **14.5%** ✅ |
+### Runs de production
+
+| Run | N | Steps | S_max | KE/KE₀ | Statut |
+|-----|---|-------|-------|---------|--------|
+| run_hubble_mid | 500K | 3 600 | **0.513** (step 1453) | 6.01 | ✅ TERMINÉ |
+| run_hubble_hi2 | 2M | 6 000 | **0.694** (step 2192) | 2.61@step3000 | 🔄 51% (~15h00) |
 
 Vidéo générée : `janus_hubble_500k.mp4` (24 sec, 721 frames)
+
+**Résultat clé — dépendance en N :**
+La ségrégation augmente avec N (+35% de 500K à 2M).
+Longueur caractéristique des structures > boîte 500K.
+→ Voir janus_roadmap_pm.md pour le projet Particle-Mesh 20M particules.
 
 ### Runs terminés / arrêtés
 - Run A (η=1.045, IC non virialisées) : ARRÊTÉ — données non interprétables
@@ -1063,20 +1068,25 @@ Si η=1.0 donne ségrégation nulle ou décroissante →
 
 ```
 COMPLÉTÉ ✅ :
-  ✅ Tâche 1 : Virialization (PE_binding, Seg₀=0.24%)
+  ✅ Tâche 1 : Virialization (PE_binding, Seg₀=0.0024, α=4.57)
   ✅ Tâche 2 : Hubble friction (dtau_per_dt=0.013205, KE/KE₀=6.01)
   ✅ Parallèle A : Vidéo 3-panel (721 frames, 24 sec)
+  ✅ Document LaTeX 13 pages (janus_validation.pdf)
+
+EN COURS 🔄 :
+  🔄 Tâche 3 : Run 2M × 6000 steps (51%, S_max=0.694, fin ~15h00)
 
 À FAIRE :
-  □ Tâche 3 : Convergence en N (100K → 2M)
+  □ Tâche 3 suite : S_max final 2M, mise à jour LaTeX
   □ Tâche 4 : ξ(r) en post-processing
-  □ Tâche 5 : Test η=1.0 (cas limite)
+  □ Tâche 5 : Test η=1.0 (cas limite, 30 min)
+  □ Projet PM : voir janus_roadmap_pm.md (objectif 20M particules)
 
 CONTACT PETIT :
-  ✅ Fit Pantheon+ (η=1.045, χ²/dof=0.914)
-  ✅ Vidéo simulation avec expansion cosmologique
-  □ Courbe ξ(r) qualitative
-  □ Comparaison convergence en N
+  ✅ Fit Pantheon+ (η=1.045, χ²/dof=0.607)
+  ✅ Ségrégation S_max=0.694 avec 2M particules
+  ✅ Document LaTeX 13 pages + frame_02192.png
+  □ ξ(r) qualitative (renforce le dossier)
 ```
 
 ---
@@ -1109,6 +1119,7 @@ CONTACT PETIT :
 - Petit, Margnat & Zejli (2024), EPJC 84:1226
 - D'Agostini & Petit (2018), Astrophys. Space Sci. 363:139
 - Lane et al. (2024), MNRAS (arXiv:2311.01438) — biais calibration
+- Lane et al. (2024), MNRAS arXiv:2311.01438 — biais calibration BAO
 - Gemini 2.0 Flash — code virialization et Hubble friction
 - ChatGPT o3 — analyse conditions initiales
 - Grok 3 — analyse régime quasi-symétrique η≈1

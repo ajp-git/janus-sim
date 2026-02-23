@@ -176,14 +176,14 @@ fn main() {
 
         // Full checkpoint every 500 steps (for resume)
         if step % 500 == 0 {
-            let ckpt_path = output_dir.join(format!("checkpoint_{:04}.bin", step));
+            let ckpt_path = output_dir.join(format!("checkpoint_{:06}.bin", step));
             save_checkpoint(&ckpt_path, &sim, n_pos, n_neg);
             println!("    [Checkpoint saved: {}]", ckpt_path.file_name().unwrap().to_string_lossy());
         }
 
         // Light snapshot every 200 steps (subsample 1M, for visualization)
         if step % 200 == 0 {
-            let snap_path = output_dir.join(format!("snapshot_{:04}.bin", step));
+            let snap_path = output_dir.join(format!("snapshot_{:06}.bin", step));
             save_snapshot_light(&snap_path, &sim, 1_000_000);
         }
 

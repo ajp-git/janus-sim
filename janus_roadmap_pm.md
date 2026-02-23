@@ -1,7 +1,8 @@
 # Feuille de route — Projet Janus PM-FFT
 # Projet Particle-Mesh f32 — Objectif 20M particules
 # Projet parallèle à janus_roadmap.md (Barnes-Hut f64)
-# Date : 22 février 2026
+# Date : 23 février 2026 (mise à jour finale)
+# Statut : COMPLÉTÉ — Résultat négatif (PM inadapté pour Janus)
 
 ---
 
@@ -289,32 +290,129 @@ BOTTLENECK RESTANT :
   - Non implémenté — acceptable pour PM-5 prototype
 ```
 
-### ÉTAPE PM-5 — 150M particules ⬜ EN PRÉPARATION
+### ÉTAPE PM-5 — Architecture GPU-Only ✅
 ```
-Simulation production : 150M particules, grille 512³, ~1000 steps
-Objectif : valider ségrégation Janus à grande échelle
+Migration vers architecture 100% GPU pour éliminer les transferts CPU↔GPU.
+
+ARCHITECTURE :
+  - Toutes les particules (positions f64, vitesses f32, signs i8) sur GPU
+  - Kernels CUDA pour : CIC deposit, Green's function, force interpolation, kick, drift
+  - CuFFT in-place sur GPU
+  - Zéro copie dans la boucle principale
+
+FICHIERS CRÉÉS :
+  janus-pm/src/kernels/pm_kernels.cu  — Kernels CUDA (CIC, Green, kick, drift)
+  janus-pm/src/gpu_simulation.rs      — JanusPMGpu struct, GPU-only pipeline
+  janus-pm/src/bin/pm5_production.rs  — Binaire production avec checkpoints
+  janus-pm/src/bin/pm5_resume.rs      — Reprise depuis checkpoint
+
+PERFORMANCE GPU-ONLY :
+  - 1M particules @ 256³ : 102-137 ms/step (28× speedup vs CPU)
+  - 45M particules @ 512³ : 2161 ms/step
+  - 150M particules @ 256³ : 5400 ms/step
+
+VALIDATION : ✓ Architecture fonctionnelle, kernels validés
+```
+
+### ÉTAPE PM-5.1 — Run A (256³, 150M) ✅ ABANDONNÉ
+```
+Première tentative production : 150M particules, grille 256³.
 
 PARAMÈTRES :
-  - N = 150M particules (vs 100K en PM-4)
-  - Grid = 512³
+  - N = 150,000,000 particules
+  - Grid = 256³
   - dt = 0.005, η = 1.045, z_init = 5.0
-  - Softening : k_s = π/(8*dx)
-  - Alpha = 4.57 (hardcoded from BH reference)
+  - Alpha = 4.57 (hardcoded)
 
-SNAPSHOTS :
-  - Step 0 : snapshot_0.bin (full)
-  - Peak S_max : snapshot_peak.bin (détection temps réel)
-  - Step final : snapshot_final.bin (full)
-  - Tous les 50 steps : positions f32 + subsample 1M particules
+RÉSULTATS (6000 steps, arrêté à step 2010) :
+  - S_max = 0.000036 << 0.01 threshold
+  - KE/KE₀ stable ~1.0
+  - Aucune croissance de ségrégation
+
+ANALYSE :
+  Résolution 256³ insuffisante pour 150M particules.
+  Δx = 500/256 = 1.95 Mpc — trop grossier pour interactions Janus.
+
+DÉCISION : Abandonner Run A, passer à 512³ avec moins de particules.
+```
+
+### ÉTAPE PM-5.2 — Run B (512³, 45M) ✅ COMPLÉTÉ
+```
+Production finale : 45M particules, grille 512³, 15000 steps (z=5 → z=0.3).
+
+PARAMÈTRES :
+  - N = 45,000,000 particules
+  - Grid = 512³ (Δx = 500/512 = 0.977 Mpc)
+  - dt = 0.005, η = 1.045, z_init = 5.0
+  - Alpha = 4.57 (hardcoded)
+  - Mémoire GPU : 10.26 GB (particles 1.67 GB + grids 8.59 GB)
+
+EXÉCUTION :
+  - Phase 1 (Run B) : steps 0-5000, ~3h, 26 snapshots
+  - Phase 2 (Continue) : steps 5001-15000, ~6h, 100 snapshots
+  - Runtime total : ~12.2 heures
+
+RÉSULTATS FINAUX :
+  - Scale factor final : a = 0.7713 (z = 0.30)
+  - S(final) = 0.000030
+  - S_max = 0.000082 at step 7012 (z ≈ 1.4)
+  - KE/KE₀ = 0.31 (stable)
 
 VALIDATION :
-  ✓ KE/KE₀ < 20
-  ✓ S(final) > 0.01 (ségrégation visible)
-  ✓ Mémoire GPU < 10 GB
+  ✗ S_max = 0.000082 << 0.01 threshold — ÉCHEC
+  ✓ KE/KE₀ < 20 — énergie stable
+  ✓ Pas d'explosion numérique
 
-ESTIMATION TEMPS :
-  - 1600 ms/step × 1000 steps = ~27 min
-  - Avec 150M : scaling O(N) pour CIC/interpolation → ~30-40 min total
+OUTPUT :
+  janus-pm/output/pm5_2026-02-22_211736/          — Phase 1 (10 checkpoints, 26 snapshots)
+  janus-pm/output/pm5_2026-02-22_211736_continue/ — Phase 2 (2 checkpoints, 100 snapshots)
+  126 light snapshots (1M subsample, 13 MB each)
+  time_series.csv avec S(t), KE(t), a(t) pour chaque step
+
+CHECKPOINT FORMAT (avec vélocités) :
+  Header (72 bytes) : n_particles, n_pos, n_neg, step, tau, a, seg, ke_ratio, ke_initial
+  Per particle (37 bytes) : x(f64), y(f64), z(f64), vx(f32), vy(f32), vz(f32), sign(i8)
+```
+
+---
+
+## CONCLUSIONS PM
+
+### Résultat principal
+**La méthode Particle-Mesh ne produit pas de ségrégation significative pour le modèle Janus.**
+
+Même avec 45M particules sur grille 512³ évoluant de z=5 à z=0.3 (15000 steps),
+la ségrégation reste < 0.0001, deux ordres de grandeur sous le seuil 0.01.
+
+### Analyse
+```
+1. RÉSOLUTION SPATIALE INSUFFISANTE
+   PM lisse les forces à l'échelle de la cellule (Δx ≈ 1 Mpc).
+   Les interactions Janus courte-portée sont supprimées par construction.
+
+2. COMPARAISON AVEC BARNES-HUT
+   BH f64 (2M particules) : S_max = 0.694 — ségrégation forte
+   PM f32 (45M particules) : S_max = 0.00008 — aucune ségrégation
+   → Le gain en N ne compense pas la perte de résolution force.
+
+3. VIRIALIZATION
+   Alpha = 4.57 (référence BH) peut ne pas être optimal pour PM.
+   PE_binding calculé différemment (grid vs pairwise).
+```
+
+### Recommandations
+```
+1. RETOUR À BARNES-HUT
+   PM n'est pas adapté à la physique Janus.
+   Continuer avec BH f64 à plus grand N (10M, 100M).
+
+2. HYBRIDE PM-PP (P³M)
+   Combiner PM pour grandes échelles + PP pour courte portée.
+   Complexité significative, gain incertain.
+
+3. ANALYSE DES DONNÉES PM
+   Les 126 snapshots restent utiles pour visualisation/debug.
+   time_series.csv permet d'analyser l'évolution cosmologique.
 ```
 
 ---
@@ -360,3 +458,25 @@ Prêt PM-X+1 : [OUI/NON]
 - Petit, Margnat & Zejli (2024), EPJC 84:1226
 - Peebles (1980) — Hubble friction eq. 5.111
 - Hockney & Eastwood (1981) — Particle-Mesh methods (référence PM classique)
+
+---
+
+## OUTPUT FILES
+
+```
+janus-pm/output/
+├── pm5_2026-02-22_211736/              # Run B Phase 1 (steps 0-5000)
+│   ├── checkpoint_0500.bin ... checkpoint_5000.bin
+│   ├── snapshot_0200.bin ... snapshot_5000.bin (26 files)
+│   ├── snapshot_final.bin (1.6 GB, with velocities)
+│   └── time_series.csv
+│
+└── pm5_2026-02-22_211736_continue/     # Run B Phase 2 (steps 5001-15000)
+    ├── checkpoint_peak.bin (S_max at step 7012)
+    ├── checkpoint_final.bin (step 15000)
+    ├── snapshot_005100.bin ... snapshot_015000.bin (100 files)
+    ├── summary.txt
+    └── time_series.csv
+
+Total : ~22 GB, 126 light snapshots, 12 full checkpoints
+```

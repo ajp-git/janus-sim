@@ -1,32 +1,35 @@
 //! PM-5 Resume: Continue simulation from checkpoint
 //!
-//! Usage: pm5_resume <checkpoint.bin> <additional_steps> [output_dir]
+//! Usage: pm5_resume <checkpoint.bin> <additional_steps> [grid_size] [output_dir]
 
 use std::path::Path;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use chrono::Local;
 
 use janus_pm::gpu_simulation::JanusPMGpu;
 
-// Same config as original run
-const GRID_SIZE: usize = 256;
+// Default config
 const BOX_SIZE: f64 = 500.0;
-const DT: f64 = 0.005;
+const DT: f32 = 0.005;
 const ETA: f64 = 1.045;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: pm5_resume <checkpoint.bin> <additional_steps> [output_dir]");
+        eprintln!("Usage: pm5_resume <checkpoint.bin> <additional_steps> [grid_size] [output_dir]");
         std::process::exit(1);
     }
 
     let checkpoint_path = Path::new(&args[1]);
     let additional_steps: usize = args[2].parse().expect("Invalid steps");
 
-    let output_dir = if args.len() > 3 {
-        std::path::PathBuf::from(&args[3])
+    let grid_size: usize = args.get(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);  // Default 512 for Run B
+
+    let output_dir = if args.len() > 4 {
+        std::path::PathBuf::from(&args[4])
     } else {
         std::path::PathBuf::from(format!(
             "janus-pm/output/pm5_resume_{}",
@@ -42,7 +45,8 @@ fn main() {
 
     // Load checkpoint
     println!("Loading checkpoint: {}", checkpoint_path.display());
-    let (mut sim, n_pos, n_neg, start_step) = load_checkpoint(checkpoint_path)
+    println!("Grid size: {}³", grid_size);
+    let (mut sim, n_pos, n_neg, start_step) = load_checkpoint(checkpoint_path, grid_size)
         .expect("Failed to load checkpoint");
 
     let n_particles = sim.n_particles;
@@ -129,7 +133,7 @@ fn main() {
 
         // Light snapshot every 100 steps
         if local_step % 100 == 0 {
-            let snap_path = output_dir.join(format!("snapshot_{:04}.bin", step));
+            let snap_path = output_dir.join(format!("snapshot_{:06}.bin", step));
             save_snapshot_light(&snap_path, &sim, 1_000_000);
         }
 
@@ -162,28 +166,36 @@ fn main() {
     println!("  S_max = {:.6} at step {}", s_max, s_max_step);
     println!("  KE/KE₀ = {:.4}", final_ke);
 
-    // Save summary
-    let summary = serde_json::json!({
-        "resumed_from": checkpoint_path.display().to_string(),
-        "start_step": start_step,
-        "final_step": sim.step,
-        "additional_steps": additional_steps,
-        "final_scale_factor": final_a,
-        "final_redshift": final_z,
-        "final_segregation": final_seg,
-        "max_segregation": s_max,
-        "max_seg_step": s_max_step,
-        "final_ke_ratio": final_ke,
-        "runtime_seconds": runtime
-    });
-    std::fs::write(
-        output_dir.join("summary.json"),
-        serde_json::to_string_pretty(&summary).unwrap()
-    ).ok();
+    // Save summary as text
+    let summary = format!(
+        "resumed_from: {}\n\
+         start_step: {}\n\
+         final_step: {}\n\
+         additional_steps: {}\n\
+         final_scale_factor: {:.6}\n\
+         final_redshift: {:.2}\n\
+         final_segregation: {:.6}\n\
+         max_segregation: {:.6}\n\
+         max_seg_step: {}\n\
+         final_ke_ratio: {:.4}\n\
+         runtime_seconds: {:.1}\n",
+        checkpoint_path.display(),
+        start_step,
+        sim.step,
+        additional_steps,
+        final_a,
+        final_z,
+        final_seg,
+        s_max,
+        s_max_step,
+        final_ke,
+        runtime
+    );
+    std::fs::write(output_dir.join("summary.txt"), &summary).ok();
 }
 
 /// Load checkpoint with velocities
-fn load_checkpoint(path: &Path) -> Result<(JanusPMGpu, usize, usize, usize), String> {
+fn load_checkpoint(path: &Path, grid_size: usize) -> Result<(JanusPMGpu, usize, usize, usize), String> {
     use std::fs::File;
 
     let file = File::open(path).map_err(|e| format!("Failed to open: {}", e))?;
@@ -245,13 +257,15 @@ fn load_checkpoint(path: &Path) -> Result<(JanusPMGpu, usize, usize, usize), Str
         pos_x, pos_y, pos_z,
         vel_x, vel_y, vel_z,
         signs,
-        GRID_SIZE,
+        grid_size,
         BOX_SIZE,
         DT,
         ETA,
         tau,
         step,
         ke_initial,
+        n_pos,
+        n_neg,
     )?;
 
     Ok((sim, n_pos, n_neg, step))

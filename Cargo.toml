@@ -89,6 +89,26 @@ path = "src/bin/test_theta_2m.rs"
 name = "final_benchmark"
 path = "src/bin/final_benchmark.rs"
 
+[[bin]]
+name = "validate_theta2"
+path = "src/bin/validate_theta2.rs"
+
+[[bin]]
+name = "quick_theta_scan"
+path = "src/bin/quick_theta_scan.rs"
+
+[[bin]]
+name = "test_theta07"
+path = "src/bin/test_theta07.rs"
+
+[[bin]]
+name = "run_8m"
+path = "src/bin/run_8m.rs"
+
+[[bin]]
+name = "test_anisotropic"
+path = "src/bin/test_anisotropic.rs"
+
 [lib]
 name = "janus"
 path = "src/lib.rs"

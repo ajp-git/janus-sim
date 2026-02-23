@@ -1,0 +1,140 @@
+# KNOWN_FIXES.md — Corrections critiques janus-sim
+# À lire AVANT toute modification de nbody_gpu.rs ou pm_kernels.cu
+# Dernière mise à jour : 23 février 2026
+
+---
+
+## RÈGLE ABSOLUE
+
+Avant de modifier un fichier source, vérifier que ces corrections
+sont présentes. Ne JAMAIS les réintroduire sous leur forme erronée.
+
+---
+
+## nbody_gpu.rs
+
+### [FIX-001] inv_rp3 — calcul de force gravitationnelle
+```cuda
+// ✅ CORRECT
+double inv_rp3 = 1.0 / (rp2 * sqrt(rp2));
+
+// ❌ INCORRECT — instable numériquement (rsqrt approximatif)
+double inv_rp3 = rsqrt(rp2) / rp2;
+```
+
+### [FIX-002] Format snapshot — interleaved, pas planaire
+```
+// ✅ Format réel des snapshots légers :
+// Header 32 bytes : n(u64), step(u64), scale_factor(f64), segregation(f64)
+// Par particule 13 bytes : x(f32), y(f32), z(f32), sign(i8) — INTERLEAVED
+
+// ❌ Format planaire INCORRECT (ne pas réintroduire) :
+// pos_x[n], pos_y[n], pos_z[n], signs[n]  ← FAUX
+```
+
+### [FIX-003] Header snapshot — 32 bytes, pas 64
+```rust
+// ✅ Header réel : 4 champs × 8 bytes = 32 bytes
+// n(u64), step(u64), scale_factor(f64), segregation(f64)
+
+// ❌ Header snapshot.rs (version théorique, pas utilisée en prod) : 64 bytes
+// Ne pas utiliser snapshot.rs comme référence de format
+```
+
+### [FIX-004] Ordre des champs header
+```rust
+// ✅ CORRECT : n en premier, step en second
+let (n, step, scale_factor, segregation) = struct.unpack('<QQdd', header)
+
+// ❌ INCORRECT : step en premier (induit step=1_000_000, N=1_200)
+let (step, n, ...) = ...
+```
+
+### [FIX-005] DKD intégrateur — kernel leapfrog_kick_drift
+```rust
+// ✅ DKD correct : Drift(dt/2) → Force → Kick(dt) → Drift(dt/2)
+// Validé 2.0× speedup vs KDK, S(t) et KE/KE₀ conservés ±1%
+
+// ❌ Ne pas revenir au KDK (2 builds d'arbre par step)
+// ❌ Ne pas passer kick_dt=0.0 pour "drift pur" sans vérifier les termes cosmo
+```
+
+---
+
+## pm_kernels.cu / gpu_simulation.rs
+
+### [FIX-006] Grille PM — format snapshot snapshot.rs vs réel
+```
+// ⚠️ snapshot.rs dans le repo décrit un format théorique (64 bytes header)
+// Le code réel écrit un format différent (32 bytes header, interleaved)
+// Toujours se fier aux mesures hexdump plutôt qu'au code snapshot.rs
+```
+
+### [FIX-007] GRID_SIZE par défaut dans pm5_resume.rs
+```rust
+// ✅ CORRECT pour Run B
+const GRID_SIZE: usize = 512;  // 512³
+
+// ❌ Valeur ancienne à ne pas réintroduire
+const GRID_SIZE: usize = 256;  // 256³ — Run A uniquement
+```
+
+---
+
+## Résultats de référence (ne pas invalider)
+
+### Run BH 2M (janus-sim, KDK original)
+```
+S_max   = 0.6940 au step 2192 (z≈1.8)
+KE/KE₀  = 1.924 au pic
+Runtime = 16.3h
+θ       = 0.7
+softening = 0.1
+```
+
+### Run PM-5 Phase 1 (janus-pm, 512³, 45M)
+```
+S_max   = 0.000140 au step 119 (bruit IC — pas de ségrégation PM)
+KE/KE₀  = 0.349 final
+Conclusion : ségrégation Janus sub-Mpc, PM insuffisant
+```
+
+### Optimisations BH validées
+```
+KDK baseline  : 7810 ms/step (2M)
++ DKD         : 3868 ms/step (2.0×) ✅
++ Morton CPU  : 2662 ms/step (2.9×) ✅
++ Async θ     : 3228 ms/step — REJETÉ (overhead > gain en CI mixtes)
+```
+
+---
+
+## Tests de non-régression
+
+Après toute modification de nbody_gpu.rs, valider :
+```bash
+# Test 500K, 50 steps
+cargo run --release --features cuda --bin test_dkd -- \
+  --n-particles 500000 --steps 50
+
+# Critères PASS :
+#   S(50)   dans [0.0001, 0.002]  (pas de divergence)
+#   KE/KE₀  dans [0.85, 1.15]    (pas d'explosion)
+#   Temps/step < 300ms pour 500K
+```
+
+---
+
+## Physique Janus — rappels
+
+```
+Masses de même signe  → attraction  (Newton)
+Masses de signes opposés → répulsion (anti-Newton)
+
+η = 1.045 (validé Pantheon+, χ²/dof = 0.914)
+Ω₊ ≈ 0.31, Ω₋ ≈ 0.69
+H₀ = 70 km/s/Mpc
+
+Ségrégation sub-Mpc confirmée (Run PM 45M, 512³, z=5→0.3)
+→ méthode BH obligatoire pour capturer la ségrégation
+```

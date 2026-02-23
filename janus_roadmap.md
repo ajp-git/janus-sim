@@ -1122,29 +1122,27 @@ Résultat: seulement 1.1× speedup (275 ms vs 306 ms)
 Cause: bottleneck = force kernel, pas tree build
 ```
 
-### Opt6 θ=2.0 + Minimal Reset — Validé ✅
+### Opt6 θ + Minimal Reset — Validé ✅
 
 ```
-Deux optimisations combinées :
+Optimisation reset minimal:
+  - Avant: reset_buffers() = 130 ms (tous les buffers GPU)
+  - Après: reset atomic_counter seulement = ~1 ms
+  - Raison: algorithme Karras écrase entièrement les buffers
 
-1. Barnes-Hut θ = 2.0 (était 0.7)
-   - θ plus élevé = plus d'approximations = moins de traversées
-   - Force kernel: ~2200 ms → ~150 ms
-   - Erreur physique: 2.74% (acceptable pour BH)
+Performance θ @ 2M particles (10 steps):
+  θ=0.7:  2370 ms/step (référence physique)
+  θ=1.0:  1034 ms/step
+  θ=1.5:   398 ms/step ← choisi pour run 8M
+  θ=2.0:   224 ms/step
 
-2. Reset minimal des buffers
-   - Avant: reset_buffers() = 130 ms (tous les buffers GPU)
-   - Après: reset atomic_counter seulement = ~1 ms
-   - Raison: algorithme Karras écrase entièrement les buffers
+Validation physique θ=1.0 (500K, 500 steps):
+  S(500) ref (θ=0.5) = 1.014422
+  S(500) test (θ=1.0) = 0.926436
+  Erreur: 8.67% — trajectoire individuelle diverge, mais S(t) qualitativement correct
 
-Validation @ 2M particles, 100 steps :
-  ✓ Average: 197.3 ms/step (cible < 250 ms) ✅
-  ✓ Min: 178.6 ms/step
-  ✓ Max: 240.6 ms/step
-  ✓ Throughput: 10.1M particles/sec
-  ✓ Physics error vs θ=0.7: 2.74%
-
-Speedup total depuis baseline: 39.6×
+Note: Pour système chaotique, seul S_max et forme de S(t) comptent.
+θ=1.5 choisi comme compromis performance/physique pour run 8M.
 ```
 
 ### Optimisations futures (si nécessaire)
@@ -1170,14 +1168,17 @@ COMPLÉTÉ ✅ :
   ✅ GPU Opt 6 : θ=2.0 + minimal reset (39.6× speedup total, 197 ms/step @ 2M)
 
 EN COURS 🔄 :
-  🔄 Tâche 3 : Run 2M × 6000 steps (51%, S_max=0.694, fin ~15h00)
+  🔄 Run BH 8M : 8M particles, θ=1.5, dt=0.005, 12000 steps
+     Lancé: 23 février 2026
+     Estimé: ~398 ms/step × 12000 = ~1.3h
+     Snapshots: /200 steps, Checkpoints: /1000 steps
+     Auto-stop: KE/KE₀ > 50
 
 À FAIRE :
-  □ Tâche 3 suite : S_max final 2M, mise à jour LaTeX
+  □ Post-run 8M : Analyser S_max, générer vidéo
   □ Tâche 4 : ξ(r) en post-processing
   □ Tâche 5 : Test η=1.0 (cas limite, 30 min)
-  □ Projet PM : voir janus_roadmap_pm.md (objectif 20M particules)
-  □ GPU Opt 7-9 : optimisations supplémentaires si >250ms nécessaire
+  □ GPU Opt 7-9 : optimisations supplémentaires si nécessaire
 
 CONTACT PETIT :
   ✅ Fit Pantheon+ (η=1.045, χ²/dof=0.607)
@@ -1220,3 +1221,154 @@ CONTACT PETIT :
 - Gemini 2.0 Flash — code virialization et Hubble friction
 - ChatGPT o3 — analyse conditions initiales
 - Grok 3 — analyse régime quasi-symétrique η≈1
+
+---
+
+## PROJET FILAMENTS COSMOLOGIQUES
+
+### Problème identifié (23 février 2026)
+
+Les simulations actuelles produisent une **structure sphérique concentrique**
+(blob central + périphérie) — pas de filaments cosmologiques.
+
+**Cause confirmée par analyse linéaire + 5 IA :**
+Avec α=1 (code actuel), le mode de filamentation λ₋ = 0 exactement.
+Ce n'est pas un problème numérique — c'est une propriété du modèle.
+
+```
+interaction = if sign_i == sign_j { 1.0 } else { -1.0 }
+→ α = 1 strict → λ₋ = 0 → croissance anisotrope nulle
+```
+
+**Théorème de Birkhoff (DeepSeek) :** avec ICs uniformes, le collapse
+est toujours sphérique. Aucune boîte plus grande ne changera ça.
+
+### Analyse linéaire — résultats clés
+
+Document complet : `janus_linear_analysis.md` (769 lignes, 22 sections)
+
+```
+Mode λ₊ = ρ̄₊(1+r) > 0  →  ségrégation S(t) ✅ (observée)
+Mode λ₋ = ρ̄(1−α) = 0   →  croissance anisotrope ❌ (filaments impossibles)
+
+Pour α < 1 : λ₋ > 0, p ≈ (3/5)×[2r/(1+r)²]×ε
+Condition filaments : ε = 1−α ≥ 0.3 (p ≥ 0.2)
+```
+
+**Ni l'asymétrie ρ₊≠ρ₋, ni l'expansion H(t), ni le régime non-linéaire,
+ni un spectre non-gaussien ne peuvent compenser α=1.**
+
+### Solution validée par 5 IA
+
+**α(k) de type Yukawa :**
+
+```rust
+let r_c = 40.0;      // Échelle de transition (Mpc)
+let epsilon = 0.3;   // Force de la brisure (ε ≥ 0.3 requis)
+let alpha_r = 1.0 - epsilon * (-r / r_c).exp();
+let interaction = if sign_i == sign_j { 1.0 } else { -alpha_r };
+```
+
+- k → 0 : α → 1 (symétrie Janus préservée à grande échelle)
+- k ~ kc : α → 1−ε (gravité effective restaurée → filaments)
+- Compatible Barnes-Hut, relativité bimétrique, médiateur massif
+
+### Plan 5 jours — weekend (validé Grok, ChatGPT, Gemini, DeepSeek, Grok2)
+
+```
+Jour 1 : Test mode unique anisotrope (4h, 4M particules)
+         Run A : α=0 (attraction pure ΛCDM)
+         Run B : α=1 (Janus actuel)
+         Mesure : anisotropy(t) = σx / mean(σy, σz)
+         Critère : A croissant, B ≈ 1 → théorie confirmée
+
+Jour 2 : Implémentation α(k) Yukawa dans kernel CUDA
+         ε=0.3, rc=40 Mpc
+         Test 500K, 500 steps → confirme croissance anisotrope
+
+Jour 3 : ICs Zel'dovich (Python FFT)
+         Grille 256³, P(k) ≈ k^ns/(1+(k/k0)^4)
+         Anti-corrélation δ₋ = −δ₊ (β=1.0)
+         z_init=10, box=400 Mpc
+
+Jour 4 : Run 16-32M
+         Test allocation mémoire GPU d'abord
+         α(k) Yukawa + ICs Zel'dovich + box=400 Mpc
+         θ=1.2, dt=0.005
+
+Jour 5 : Analyse morphologique
+         σx(t)/σy(t), ξ(r), Minkowski
+         Vidéo formation filaments
+```
+
+### Paramètres cibles
+
+```
+N        = 16-32M (selon mémoire GPU disponible)
+box      = 400 Mpc
+z_init   = 10
+θ        = 1.2
+ε        = 0.3
+rc       = 40 Mpc
+softening = box / (40 × N^(1/3))
+```
+
+### Critères de succès
+
+```
+✓ anisotropy_A >> 1 (Run A Jour 1)
+✓ anisotropy_B ≈ 1 (Run B Jour 1) → α=1 confirmé bloquant
+✓ Structure en réseau visible (pas blob) avec α(k)
+✓ Voids persistants remplis de m−
+✓ S_max > 0.6
+✓ ξ(r) pente ~ −1.8 (compatible SDSS)
+```
+
+### État run 8M (terminé 23 février 2026)
+
+```
+S_max = 0.459 au step 2800 (z=2.07)
+S_final = 0.427 (z=1.95)
+KE/KE₀ = 2.71
+Note : θ=1.5 (vs θ=0.7 pour 2M) — comparaison S_max(N) biaisée
+→ Run 8M θ=0.7 à faire ce weekend pour comparaison propre
+```
+
+### Question pour JPP (après simulations)
+
+α=1 est-il une contrainte fondamentale du modèle de Petit,
+ou une extension α(k) est-elle permissible par l'action bimétrique ?
+
+Si α=1 strict : Janus ne prédit pas de filaments par instabilité linéaire.
+Si α(k) permis : médiateur massif entre secteurs → filaments possibles.
+
+---
+
+## ÉTAT ACTUEL — ORDRE D'EXÉCUTION MIS À JOUR
+
+```
+COMPLÉTÉ ✅ :
+  ✅ Tâche 1 : Virialization (PE_binding, Seg₀=0.0024, α=4.57)
+  ✅ Tâche 2 : Hubble friction (dtau_per_dt=0.013205)
+  ✅ Parallèle A : Vidéo 3-panel (721 frames)
+  ✅ Document LaTeX 13 pages (janus_validation.pdf)
+  ✅ GPU Opt 1-2-4-6 : 39.6× speedup (197 ms/step @ 2M)
+  ✅ Run BH 2M : S_max=0.694 (step 2192, z=1.8)
+  ✅ Run PM 45M : S_max=0.000082 — ségrégation sub-Mpc confirmée
+  ✅ Run BH 8M : S_max=0.459 (step 2800, z=2.07, θ=1.5)
+  ✅ Analyse linéaire Janus : α=1 → λ₋=0 → filaments impossibles
+  ✅ Consultation 5 IA : consensus α(k) Yukawa + ICs Zel'dovich
+
+EN COURS / À FAIRE CE WEEKEND :
+  □ Jour 1 : Test mode unique anisotrope (Run A vs B)
+  □ Jour 2 : α(k) Yukawa dans kernel CUDA
+  □ Jour 3 : ICs Zel'dovich Python
+  □ Jour 4 : Run 16-32M
+  □ Jour 5 : Analyse morphologique
+
+À FAIRE (après weekend) :
+  □ Run 8M avec θ=0.7 (comparaison S_max(N) propre)
+  □ Tâche 4 : ξ(r) post-processing
+  □ Tâche 5 : Test η=1.0 (cas limite)
+  □ Contact JPP avec résultats complets
+```

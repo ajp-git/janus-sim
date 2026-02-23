@@ -735,6 +735,109 @@ extern "C" __global__ void compute_forces_bvh(
     acc[tid * 3 + 2] = az;
 }
 
+// Compute forces with configurable cross-sign interaction
+// cross_factor: 0.0 = no cross interaction (attraction only)
+//              -1.0 = Janus (repulsion between opposite signs)
+extern "C" __global__ void compute_forces_bvh_cross(
+    const double* __restrict__ pos,
+    const int* __restrict__ signs,
+    const double* __restrict__ node_data,
+    const int* __restrict__ left_child,
+    const int* __restrict__ right_child,
+    const int* __restrict__ node_types,
+    double* __restrict__ acc,
+    int n_particles,
+    int n_internal,
+    double theta,
+    double softening,
+    double cross_factor
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_particles) return;
+
+    double px = pos[tid * 3];
+    double py = pos[tid * 3 + 1];
+    double pz = pos[tid * 3 + 2];
+    int my_sign = signs[tid];
+
+    double ax = 0.0, ay = 0.0, az = 0.0;
+    double eps2 = softening * softening;
+
+    int stack[64];
+    int stack_ptr = 0;
+    stack[stack_ptr++] = 0;
+
+    while (stack_ptr > 0) {
+        int node_idx = stack[--stack_ptr];
+        if (node_idx < 0) continue;
+
+        int node_type = node_types[node_idx];
+        if (node_type == 0) continue;
+
+        int base = node_idx * 12;
+        double cx = node_data[base + 0];
+        double cy = node_data[base + 1];
+        double cz = node_data[base + 2];
+        double half_size = node_data[base + 3];
+
+        double dx = cx - px;
+        double dy = cy - py;
+        double dz = cz - pz;
+        double r2 = dx*dx + dy*dy + dz*dz;
+        double r = sqrt(r2 + 1e-20);
+
+        double s_over_r = (2.0 * half_size) / r;
+
+        if (node_type == 1 || s_over_r < theta) {
+            double mass_plus = node_data[base + 7];
+            double mass_minus = node_data[base + 11];
+
+            if (mass_plus > 0.0) {
+                double com_plus_x = node_data[base + 4];
+                double com_plus_y = node_data[base + 5];
+                double com_plus_z = node_data[base + 6];
+                double dpx = com_plus_x - px;
+                double dpy = com_plus_y - py;
+                double dpz = com_plus_z - pz;
+                double rp2 = dpx*dpx + dpy*dpy + dpz*dpz + eps2;
+                double inv_rp3 = 1.0 / (rp2 * sqrt(rp2));
+                // Same sign: attraction (1.0), Opposite sign: cross_factor
+                double interaction = (my_sign > 0) ? 1.0 : cross_factor;
+                double f = interaction * mass_plus * inv_rp3;
+                ax += f * dpx;
+                ay += f * dpy;
+                az += f * dpz;
+            }
+
+            if (mass_minus > 0.0) {
+                double com_minus_x = node_data[base + 8];
+                double com_minus_y = node_data[base + 9];
+                double com_minus_z = node_data[base + 10];
+                double dmx = com_minus_x - px;
+                double dmy = com_minus_y - py;
+                double dmz = com_minus_z - pz;
+                double rm2 = dmx*dmx + dmy*dmy + dmz*dmz + eps2;
+                double inv_rm3 = 1.0 / (rm2 * sqrt(rm2));
+                // Same sign: attraction (1.0), Opposite sign: cross_factor
+                double interaction = (my_sign < 0) ? 1.0 : cross_factor;
+                double f = interaction * mass_minus * inv_rm3;
+                ax += f * dmx;
+                ay += f * dmy;
+                az += f * dmz;
+            }
+        } else {
+            int left = left_child[node_idx];
+            int right = right_child[node_idx];
+            if (left >= 0 && stack_ptr < 63) stack[stack_ptr++] = left;
+            if (right >= 0 && stack_ptr < 63) stack[stack_ptr++] = right;
+        }
+    }
+
+    acc[tid * 3] = ax;
+    acc[tid * 3 + 1] = ay;
+    acc[tid * 3 + 2] = az;
+}
+
 // Simple GPU bitonic sort for Morton codes (for small N)
 // For larger N, we use CPU sort (hybrid approach)
 extern "C" __global__ void bitonic_sort_step(
@@ -1214,7 +1317,7 @@ impl GpuNBodySimulation {
             "compute_forces_simple", "leapfrog_kick_drift", "drift_only", "kick_only",
             "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs",
             "build_bvh_internal", "init_leaves", "reduce_com", "compute_forces_bvh",
-            "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
+            "compute_forces_bvh_cross", "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
         ])?;
 
         let n_total = n_positive + n_negative;
@@ -1333,7 +1436,7 @@ impl GpuNBodySimulation {
             "compute_forces_simple", "leapfrog_kick_drift", "drift_only", "kick_only",
             "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs",
             "build_bvh_internal", "init_leaves", "reduce_com", "compute_forces_bvh",
-            "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
+            "compute_forces_bvh_cross", "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
         ])?;
 
         let n_total = n_positive + n_negative;
@@ -2237,6 +2340,84 @@ impl GpuNBodySimulation {
                 &mut self.vel, &self.acc,
                 dt, n as i32,
                 hubble, dtau_per_dt,
+            ))?;
+        }
+
+        // Step 5: Drift(dt/2)
+        unsafe {
+            drift_kernel.launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half,
+                n as i32,
+            ))?;
+        }
+
+        self.device.synchronize()?;
+        self.time += dt;
+
+        Ok(())
+    }
+
+    /// DKD integrator with configurable cross-sign interaction
+    /// cross_factor: 0.0 = attraction only, -1.0 = Janus repulsion
+    pub fn step_with_cross_factor(&mut self, dt: f64, cross_factor: f64)
+        -> Result<(), Box<dyn std::error::Error>>
+    {
+        let half_dt = dt * 0.5;
+        let box_half = self.box_size / 2.0;
+        let n = self.n_particles;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Get kernels
+        let drift_kernel = self.device.get_func("nbody", "drift_only")
+            .ok_or("Failed to get drift_only kernel")?;
+        let kick_kernel = self.device.get_func("nbody", "kick_only")
+            .ok_or("Failed to get kick_only kernel")?;
+        let force_kernel = self.device.get_func("nbody", "compute_forces_bvh_cross")
+            .ok_or("Failed to get compute_forces_bvh_cross kernel")?;
+
+        // Step 1: Drift(dt/2)
+        unsafe {
+            drift_kernel.clone().launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half,
+                n as i32,
+            ))?;
+        }
+
+        // Step 2: Build GPU tree
+        self.build_gpu_tree()?;
+
+        // Step 3: Compute forces with configurable cross interaction
+        unsafe {
+            force_kernel.launch(cfg, (
+                &self.pos,
+                &self.signs,
+                &self.bvh_node_data,
+                &self.bvh_left_child,
+                &self.bvh_right_child,
+                &self.bvh_node_types,
+                &mut self.acc,
+                n as i32,
+                (n - 1) as i32,  // n_internal
+                self.theta,
+                self.softening,
+                cross_factor,  // New parameter
+            ))?;
+        }
+
+        // Step 4: Kick(dt) - no Hubble damping for this test
+        unsafe {
+            kick_kernel.clone().launch(cfg, (
+                &mut self.vel, &self.acc,
+                dt, n as i32,
+                0.0_f64, 0.0_f64,  // H=0, dtau_per_dt=0
             ))?;
         }
 

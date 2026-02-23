@@ -1,7 +1,7 @@
-/// Janus N-body GPU — Anisotropic Mode Test (Jour 1)
-/// Compare Run A (attraction only) vs Run B (Janus alpha=1)
+/// Janus N-body GPU — Anisotropic Mode Test (Jour 1-2)
+/// Compare Run A (attraction only) vs Run B (Janus α=1) vs Run C (Yukawa α(r))
 /// Single-mode perturbation: pos.x += A * sin(kx * x0)
-/// Measures mode amplitude δ(t) = <ξ_x × sin(kx × x0)> / A
+/// Measures mode amplitude δ(t) via Fourier analysis
 
 #[cfg(feature = "cuda")]
 use janus::nbody_gpu::GpuNBodySimulation;
@@ -31,12 +31,16 @@ fn main() {
         let kx = 2.0 * PI / box_size;
         let amplitude = 0.002 * box_size;  // 0.2% - LINEAR REGIME
 
+        // Yukawa screening parameters (Jour 2)
+        let epsilon = 0.3;   // Breaking strength
+        let r_c = 40.0;      // Characteristic scale (Mpc)
+
         let timestamp = chrono_lite();
-        let output_dir = format!("/app/output/aniso_linear_{}", timestamp);
+        let output_dir = format!("/app/output/aniso_3runs_{}", timestamp);
         fs::create_dir_all(&output_dir).ok();
 
         println!("╔════════════════════════════════════════════════════════════════╗");
-        println!("║   Janus Anisotropic Mode Test — LINEAR REGIME                  ║");
+        println!("║   Janus Anisotropic Mode Test — 3 Runs (A/B/C)                 ║");
         println!("╚════════════════════════════════════════════════════════════════╝");
         println!("\nParameters:");
         println!("  Grid: {}³ = {} particles", grid_side, actual_n);
@@ -46,6 +50,7 @@ fn main() {
         println!("  box = {} Mpc, theta = {}, dt = {}, steps = {}", box_size, theta, dt, steps);
         println!("  Perturbation: A = {:.4} Mpc ({:.2}% of box)", amplitude, amplitude / box_size * 100.0);
         println!("  kx = 2π/box = {:.6}", kx);
+        println!("  Yukawa: ε = {}, r_c = {} Mpc", epsilon, r_c);
         println!("\nOutput: {}\n", output_dir);
 
         // Generate grid with single-mode perturbation
@@ -117,9 +122,21 @@ fn main() {
 
         let results_b = run_test(
             n_positive, n_negative, box_size, theta, dt, steps,
-            positions, velocities, signs,
+            positions.clone(), velocities.clone(), signs.clone(),
             kx,
             -1.0, &format!("{}/run_b.csv", output_dir)
+        );
+
+        // ========== RUN C: Yukawa ==========
+        println!("\n╔══════════════════════════════════════════════════════════════╗");
+        println!("║   RUN C: Yukawa α(r) = 1 - {}×exp(-r/{})                   ║", epsilon, r_c);
+        println!("╚══════════════════════════════════════════════════════════════╝\n");
+
+        let results_c = run_test_yukawa(
+            n_positive, n_negative, box_size, theta, dt, steps,
+            positions, velocities, signs,
+            kx, epsilon, r_c,
+            &format!("{}/run_c.csv", output_dir)
         );
 
         // Summary
@@ -127,53 +144,55 @@ fn main() {
         println!("║   SUMMARY                                                    ║");
         println!("╚══════════════════════════════════════════════════════════════╝\n");
 
-        // Write combined CSV
+        // Write combined CSV with all 3 runs
         let mut combined = BufWriter::new(File::create(format!("{}/combined.csv", output_dir)).unwrap());
-        writeln!(combined, "step,delta_k_A,delta_k_B,delta_rms_A,delta_rms_B,sigma_x_A,sigma_x_B").unwrap();
-        for i in 0..results_a.len().min(results_b.len()) {
-            writeln!(combined, "{},{:.6e},{:.6e},{:.6},{:.6},{:.6},{:.6}",
-                results_a[i].0, results_a[i].1, results_b[i].1,
-                results_a[i].2, results_b[i].2,
-                results_a[i].3, results_b[i].3).unwrap();
+        writeln!(combined, "step,delta_k_A,delta_k_B,delta_k_C,sigma_x_A,sigma_x_B,sigma_x_yukawa").unwrap();
+        let n_results = results_a.len().min(results_b.len()).min(results_c.len());
+        for i in 0..n_results {
+            writeln!(combined, "{},{:.6e},{:.6e},{:.6e},{:.6},{:.6},{:.6}",
+                results_a[i].0,
+                results_a[i].1, results_b[i].1, results_c[i].1,
+                results_a[i].3, results_b[i].3, results_c[i].3).unwrap();
         }
 
-        if let (Some(a0), Some(af), Some(b0), Some(bf)) =
-            (results_a.first(), results_a.last(), results_b.first(), results_b.last()) {
+        if let (Some(a0), Some(af), Some(b0), Some(bf), Some(c0), Some(cf)) =
+            (results_a.first(), results_a.last(), results_b.first(), results_b.last(),
+             results_c.first(), results_c.last()) {
 
             println!("Fourier mode amplitude δ_k:");
             println!("  Run A (attraction): {:.4e} → {:.4e} ({:+.2}%)",
                 a0.1, af.1, (af.1 / a0.1 - 1.0) * 100.0);
             println!("  Run B (Janus α=1):  {:.4e} → {:.4e} ({:+.2}%)",
                 b0.1, bf.1, (bf.1 / b0.1 - 1.0) * 100.0);
-
-            println!("\nDensity contrast δ_rms:");
-            println!("  Run A: {:.6} → {:.6} ({:+.2}%)",
-                a0.2, af.2, (af.2 / a0.2 - 1.0) * 100.0);
-            println!("  Run B: {:.6} → {:.6} ({:+.2}%)",
-                b0.2, bf.2, (bf.2 / b0.2 - 1.0) * 100.0);
+            println!("  Run C (Yukawa):     {:.4e} → {:.4e} ({:+.2}%)",
+                c0.1, cf.1, (cf.1 / c0.1 - 1.0) * 100.0);
 
             println!("\nσx evolution:");
             println!("  Run A: {:.4} → {:.4} ({:+.2}%)",
                 a0.3, af.3, (af.3 / a0.3 - 1.0) * 100.0);
             println!("  Run B: {:.4} → {:.4} ({:+.2}%)",
                 b0.3, bf.3, (bf.3 / b0.3 - 1.0) * 100.0);
+            println!("  Run C: {:.4} → {:.4} ({:+.2}%)",
+                c0.3, cf.3, (cf.3 / c0.3 - 1.0) * 100.0);
 
             println!("\nInterpretation:");
-            let delta_a_grows = af.1 > a0.1 * 1.05;
-            let delta_b_slower = (bf.1 / b0.1 - 1.0).abs() < (af.1 / a0.1 - 1.0).abs() * 0.8;
+            let growth_a = (af.1 / a0.1 - 1.0) * 100.0;
+            let growth_b = (bf.1 / b0.1 - 1.0) * 100.0;
+            let growth_c = (cf.1 / c0.1 - 1.0) * 100.0;
 
-            if delta_a_grows && delta_b_slower {
-                println!("  ✓ Run A: δ_k GROWING → standard gravitational instability");
-                println!("  ✓ Run B: δ_k grows SLOWER → Janus α=1 suppresses growth");
-                println!("  → Janus model shows reduced perturbation growth rate");
-            } else if delta_a_grows {
-                println!("  ✓ Run A: δ_k GROWING");
-                let ratio = (bf.1 / b0.1 - 1.0) / (af.1 / a0.1 - 1.0);
-                println!("  ~ Run B: growth rate {:.1}% of Run A", ratio * 100.0);
+            println!("  Run A (attraction): δ_k growth = {:+.1}%", growth_a);
+            println!("  Run B (Janus α=1):  δ_k growth = {:+.1}% ({:.0}% of A)",
+                growth_b, growth_b / growth_a * 100.0);
+            println!("  Run C (Yukawa):     δ_k growth = {:+.1}% ({:.0}% of A)",
+                growth_c, growth_c / growth_a * 100.0);
+
+            if growth_c > growth_b * 1.2 {
+                println!("\n  ✓ Yukawa screening restores perturbation growth!");
+                println!("  → α(r) < 1 at small r → effective attraction → filaments possible");
+            } else if growth_c > growth_b {
+                println!("\n  ~ Yukawa shows slightly faster growth than pure Janus");
             } else {
-                println!("  ? Run A: δ_k changed by {:.1}%", (af.1 / a0.1 - 1.0) * 100.0);
-                println!("  ? Run B: δ_k changed by {:.1}%", (bf.1 / b0.1 - 1.0) * 100.0);
-                println!("  → May need more steps or larger perturbation");
+                println!("\n  ? Yukawa growth similar to Janus - may need different ε or r_c");
             }
         }
 
@@ -215,6 +234,56 @@ fn run_test(
             for step in 1..=steps {
                 let t0 = Instant::now();
                 if sim.step_with_cross_factor(dt, cross_factor).is_err() { break; }
+                let ms = t0.elapsed().as_millis();
+
+                if step % 50 == 0 || step == steps {
+                    let pos = sim.get_positions().unwrap();
+                    let (sx, sy, sz) = compute_sigma(&pos);
+                    let delta_k = compute_mode_amplitude_fourier(&pos, kx, box_size);
+                    let (delta_rms, _) = compute_density_contrast(&pos, box_size, 128);
+                    results.push((step, delta_k, delta_rms, sx));
+                    writeln!(csv, "{},{:.6e},{:.6e},{:.6},{:.6},{:.6},{}", step, delta_k, delta_rms, sx, sy, sz, ms).unwrap();
+                    println!("{:>6}  {:>12.6e}  {:>10.6}  {:>10.4}  {:>8} ms", step, delta_k, delta_rms, sx, ms);
+                }
+            }
+            println!("Total: {:.1}s\n", start.elapsed().as_secs_f64());
+            results
+        }
+        Err(e) => { eprintln!("Init failed: {}", e); Vec::new() }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn run_test_yukawa(
+    n_positive: usize, n_negative: usize, box_size: f64,
+    theta: f64, dt: f64, steps: usize,
+    positions: Vec<f64>, velocities: Vec<f64>, signs: Vec<i32>,
+    kx: f64, epsilon: f64, r_c: f64,
+    csv_path: &str
+) -> Vec<(usize, f64, f64, f64)> {  // (step, delta_k, delta_rms, sigma_x)
+    match GpuNBodySimulation::new_with_state(n_positive, n_negative, box_size, positions, velocities, signs) {
+        Ok(mut sim) => {
+            sim.set_theta(theta);
+            let mut results = Vec::new();
+            let mut csv = BufWriter::new(File::create(csv_path).unwrap());
+            writeln!(csv, "step,delta_k,delta_rms,sigma_x,sigma_y,sigma_z,time_ms").unwrap();
+
+            // Initial measurements
+            let pos = sim.get_positions().unwrap();
+            let (sx, sy, sz) = compute_sigma(&pos);
+            let delta_k = compute_mode_amplitude_fourier(&pos, kx, box_size);
+            let (delta_rms, _) = compute_density_contrast(&pos, box_size, 128);
+            results.push((0, delta_k, delta_rms, sx));
+            writeln!(csv, "0,{:.6e},{:.6e},{:.6},{:.6},{:.6},0", delta_k, delta_rms, sx, sy, sz).unwrap();
+
+            println!("{:>6}  {:>12}  {:>10}  {:>10}  {:>10}", "Step", "δ_k", "δ_rms", "σx", "Time");
+            println!("{}", "─".repeat(60));
+            println!("{:>6}  {:>12.6e}  {:>10.6}  {:>10.4}  {:>10}", 0, delta_k, delta_rms, sx, "-");
+
+            let start = Instant::now();
+            for step in 1..=steps {
+                let t0 = Instant::now();
+                if sim.step_with_yukawa(dt, epsilon, r_c).is_err() { break; }
                 let ms = t0.elapsed().as_millis();
 
                 if step % 50 == 0 || step == steps {

@@ -127,16 +127,52 @@ fn main() {
             -1.0, &format!("{}/run_b.csv", output_dir)
         );
 
-        // ========== RUN C: Yukawa ==========
+        // ========== RUN C: Yukawa ε=0.3, rc=40 ==========
         println!("\n╔══════════════════════════════════════════════════════════════╗");
-        println!("║   RUN C: Yukawa α(r) = 1 - {}×exp(-r/{})                   ║", epsilon, r_c);
+        println!("║   RUN C: Yukawa ε=0.3, rc=40  → α(5)=0.74                    ║");
         println!("╚══════════════════════════════════════════════════════════════╝\n");
 
         let results_c = run_test_yukawa(
             n_positive, n_negative, box_size, theta, dt, steps,
-            positions, velocities, signs,
-            kx, epsilon, r_c,
+            positions.clone(), velocities.clone(), signs.clone(),
+            kx, 0.3, 40.0,
             &format!("{}/run_c.csv", output_dir)
+        );
+
+        // ========== RUN D: Yukawa ε=0.3, rc=10 ==========
+        println!("\n╔══════════════════════════════════════════════════════════════╗");
+        println!("║   RUN D: Yukawa ε=0.3, rc=10  → α(5)=0.82                    ║");
+        println!("╚══════════════════════════════════════════════════════════════╝\n");
+
+        let results_d = run_test_yukawa(
+            n_positive, n_negative, box_size, theta, dt, steps,
+            positions.clone(), velocities.clone(), signs.clone(),
+            kx, 0.3, 10.0,
+            &format!("{}/run_d.csv", output_dir)
+        );
+
+        // ========== RUN E: Yukawa ε=0.7, rc=40 ==========
+        println!("\n╔══════════════════════════════════════════════════════════════╗");
+        println!("║   RUN E: Yukawa ε=0.7, rc=40  → α(5)=0.38                    ║");
+        println!("╚══════════════════════════════════════════════════════════════╝\n");
+
+        let results_e = run_test_yukawa(
+            n_positive, n_negative, box_size, theta, dt, steps,
+            positions.clone(), velocities.clone(), signs.clone(),
+            kx, 0.7, 40.0,
+            &format!("{}/run_e.csv", output_dir)
+        );
+
+        // ========== RUN F: Yukawa ε=0.7, rc=10 ==========
+        println!("\n╔══════════════════════════════════════════════════════════════╗");
+        println!("║   RUN F: Yukawa ε=0.7, rc=10  → α(5)=0.57                    ║");
+        println!("╚══════════════════════════════════════════════════════════════╝\n");
+
+        let results_f = run_test_yukawa(
+            n_positive, n_negative, box_size, theta, dt, steps,
+            positions, velocities, signs,
+            kx, 0.7, 10.0,
+            &format!("{}/run_f.csv", output_dir)
         );
 
         // Summary
@@ -144,56 +180,72 @@ fn main() {
         println!("║   SUMMARY                                                    ║");
         println!("╚══════════════════════════════════════════════════════════════╝\n");
 
-        // Write combined CSV with all 3 runs
+        // Write combined CSV with all 6 runs
         let mut combined = BufWriter::new(File::create(format!("{}/combined.csv", output_dir)).unwrap());
-        writeln!(combined, "step,delta_k_A,delta_k_B,delta_k_C,sigma_x_A,sigma_x_B,sigma_x_yukawa").unwrap();
-        let n_results = results_a.len().min(results_b.len()).min(results_c.len());
+        writeln!(combined, "step,delta_k_A,delta_k_B,delta_k_C,delta_k_D,delta_k_E,delta_k_F,sigma_x_A,sigma_x_B,sigma_x_C,sigma_x_D,sigma_x_E,sigma_x_F").unwrap();
+        let n_results = results_a.len().min(results_b.len()).min(results_c.len())
+            .min(results_d.len()).min(results_e.len()).min(results_f.len());
         for i in 0..n_results {
-            writeln!(combined, "{},{:.6e},{:.6e},{:.6e},{:.6},{:.6},{:.6}",
+            writeln!(combined, "{},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
                 results_a[i].0,
-                results_a[i].1, results_b[i].1, results_c[i].1,
-                results_a[i].3, results_b[i].3, results_c[i].3).unwrap();
+                results_a[i].1, results_b[i].1, results_c[i].1, results_d[i].1, results_e[i].1, results_f[i].1,
+                results_a[i].3, results_b[i].3, results_c[i].3, results_d[i].3, results_e[i].3, results_f[i].3).unwrap();
         }
 
-        if let (Some(a0), Some(af), Some(b0), Some(bf), Some(c0), Some(cf)) =
-            (results_a.first(), results_a.last(), results_b.first(), results_b.last(),
-             results_c.first(), results_c.last()) {
+        // Helper to compute growth percentage
+        let growth = |r: &Vec<(usize, f64, f64, f64)>| -> f64 {
+            if let (Some(r0), Some(rf)) = (r.first(), r.last()) {
+                (rf.1 / r0.1 - 1.0) * 100.0
+            } else { 0.0 }
+        };
+        let sigma_change = |r: &Vec<(usize, f64, f64, f64)>| -> f64 {
+            if let (Some(r0), Some(rf)) = (r.first(), r.last()) {
+                (rf.3 / r0.3 - 1.0) * 100.0
+            } else { 0.0 }
+        };
 
-            println!("Fourier mode amplitude δ_k:");
-            println!("  Run A (attraction): {:.4e} → {:.4e} ({:+.2}%)",
-                a0.1, af.1, (af.1 / a0.1 - 1.0) * 100.0);
-            println!("  Run B (Janus α=1):  {:.4e} → {:.4e} ({:+.2}%)",
-                b0.1, bf.1, (bf.1 / b0.1 - 1.0) * 100.0);
-            println!("  Run C (Yukawa):     {:.4e} → {:.4e} ({:+.2}%)",
-                c0.1, cf.1, (cf.1 / c0.1 - 1.0) * 100.0);
+        let g_a = growth(&results_a);
+        let g_b = growth(&results_b);
+        let g_c = growth(&results_c);
+        let g_d = growth(&results_d);
+        let g_e = growth(&results_e);
+        let g_f = growth(&results_f);
 
-            println!("\nσx evolution:");
-            println!("  Run A: {:.4} → {:.4} ({:+.2}%)",
-                a0.3, af.3, (af.3 / a0.3 - 1.0) * 100.0);
-            println!("  Run B: {:.4} → {:.4} ({:+.2}%)",
-                b0.3, bf.3, (bf.3 / b0.3 - 1.0) * 100.0);
-            println!("  Run C: {:.4} → {:.4} ({:+.2}%)",
-                c0.3, cf.3, (cf.3 / c0.3 - 1.0) * 100.0);
+        println!("δ_k growth (Fourier mode amplitude):");
+        println!("┌─────────────────────────────────────────────────────────────┐");
+        println!("│ Run │ Parameters          │ α(5Mpc) │ δ_k growth │ vs Run A │");
+        println!("├─────┼─────────────────────┼─────────┼────────────┼──────────┤");
+        println!("│  A  │ Attraction only     │   1.0   │ {:+7.1}%  │   100%   │", g_a);
+        println!("│  B  │ Janus α=1           │  -1.0   │ {:+7.1}%  │   {:4.0}%   │", g_b, g_b/g_a*100.0);
+        println!("│  C  │ ε=0.3, rc=40        │   0.74  │ {:+7.1}%  │   {:4.0}%   │", g_c, g_c/g_a*100.0);
+        println!("│  D  │ ε=0.3, rc=10        │   0.82  │ {:+7.1}%  │   {:4.0}%   │", g_d, g_d/g_a*100.0);
+        println!("│  E  │ ε=0.7, rc=40        │   0.38  │ {:+7.1}%  │   {:4.0}%   │", g_e, g_e/g_a*100.0);
+        println!("│  F  │ ε=0.7, rc=10        │   0.57  │ {:+7.1}%  │   {:4.0}%   │", g_f, g_f/g_a*100.0);
+        println!("└─────────────────────────────────────────────────────────────┘");
 
-            println!("\nInterpretation:");
-            let growth_a = (af.1 / a0.1 - 1.0) * 100.0;
-            let growth_b = (bf.1 / b0.1 - 1.0) * 100.0;
-            let growth_c = (cf.1 / c0.1 - 1.0) * 100.0;
+        println!("\nσx evolution:");
+        println!("  A: {:+.2}%  B: {:+.2}%  C: {:+.2}%  D: {:+.2}%  E: {:+.2}%  F: {:+.2}%",
+            sigma_change(&results_a), sigma_change(&results_b), sigma_change(&results_c),
+            sigma_change(&results_d), sigma_change(&results_e), sigma_change(&results_f));
 
-            println!("  Run A (attraction): δ_k growth = {:+.1}%", growth_a);
-            println!("  Run B (Janus α=1):  δ_k growth = {:+.1}% ({:.0}% of A)",
-                growth_b, growth_b / growth_a * 100.0);
-            println!("  Run C (Yukawa):     δ_k growth = {:+.1}% ({:.0}% of A)",
-                growth_c, growth_c / growth_a * 100.0);
+        println!("\nInterpretation:");
+        let best_yukawa = if g_e > g_d && g_e > g_c && g_e > g_f { ("E", g_e, "ε=0.7, rc=40") }
+            else if g_f > g_d && g_f > g_c { ("F", g_f, "ε=0.7, rc=10") }
+            else if g_d > g_c { ("D", g_d, "ε=0.3, rc=10") }
+            else { ("C", g_c, "ε=0.3, rc=40") };
 
-            if growth_c > growth_b * 1.2 {
-                println!("\n  ✓ Yukawa screening restores perturbation growth!");
-                println!("  → α(r) < 1 at small r → effective attraction → filaments possible");
-            } else if growth_c > growth_b {
-                println!("\n  ~ Yukawa shows slightly faster growth than pure Janus");
-            } else {
-                println!("\n  ? Yukawa growth similar to Janus - may need different ε or r_c");
-            }
+        if best_yukawa.1 > g_b * 1.5 {
+            println!("  ✓ Run {} ({}) shows SIGNIFICANTLY faster growth!", best_yukawa.0, best_yukawa.2);
+            println!("    Growth: {:+.1}% vs {:+.1}% for Janus α=1 ({:.0}× faster)",
+                best_yukawa.1, g_b, best_yukawa.1 / g_b);
+            println!("  → Yukawa screening RESTORES perturbation growth");
+            println!("  → Filament formation possible with α(r) < 1 at small scales");
+        } else if best_yukawa.1 > g_b * 1.1 {
+            println!("  ~ Run {} ({}) shows moderately faster growth", best_yukawa.0, best_yukawa.2);
+            println!("    Growth: {:+.1}% vs {:+.1}% for Janus α=1", best_yukawa.1, g_b);
+        } else {
+            println!("  ? All Yukawa runs similar to Janus α=1");
+            println!("  → May need even larger ε or non-linear regime");
         }
 
         println!("\nOutput: {}/combined.csv", output_dir);

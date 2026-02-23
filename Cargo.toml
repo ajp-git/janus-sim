@@ -109,6 +109,10 @@ path = "src/bin/run_8m.rs"
 name = "test_anisotropic"
 path = "src/bin/test_anisotropic.rs"
 
+[[bin]]
+name = "test_yukawa_n2"
+path = "src/bin/test_yukawa_n2.rs"
+
 [lib]
 name = "janus"
 path = "src/lib.rs"

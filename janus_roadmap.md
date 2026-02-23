@@ -1064,6 +1064,99 @@ Si η=1.0 donne ségrégation nulle ou décroissante →
 
 ---
 
+## OPTIMISATIONS GPU BARNES-HUT
+
+### Résultats mesurés (23 février 2026)
+
+| Opt | Description           | Temps/step 2M | Speedup cumulé | Statut |
+|-----|-----------------------|---------------|----------------|--------|
+| 0   | KDK baseline          | 7810 ms       | 1.0×           | ✅     |
+| 1   | DKD intégrateur       | 3868 ms       | 2.0×           | ✅     |
+| 2   | Morton sorting (CPU)  | 2662 ms       | 2.9×           | ✅     |
+| 3   | Asymmetric θ          | N/A           | (rejeté)       | ❌     |
+| 4   | GPU tree build        | 306 ms        | 25.5×          | ✅     |
+| 5   | Incremental updates   | ~275 ms       | (1.1× seul)    | ❌     |
+| 6   | **θ=2.0 + min reset** | **197 ms**    | **39.6×**      | ✅     |
+
+### GPU Tree Build (Karras 2012) — Validé
+
+```
+Pipeline GPU complet :
+  a) Morton codes GPU        O(N)
+  b) CPU RadixSort (rayon)   O(N log N) — à remplacer par CUB
+  c) Karras BVH construction O(N)
+  d) COM reduction GPU       O(N log N)
+  e) Force computation BVH   O(N log N)
+
+Validation performance @ 2M particles, 10 steps :
+  ✓ Time/step: 306 ms (cible < 500 ms)
+  ✓ S(10) = 0.000991, ΔS = -0.60%
+  → Optimisé à 197 ms/step avec θ=2.0 + minimal reset (voir Opt6)
+
+Validation physique @ 500K particles, 200 steps (vs Morton+DKD) :
+  ✓ S(200) GPU tree = 0.002422
+  ✓ S(200) Morton   = 0.002474
+  ✓ Différence: 2.08% (cible ±10%)
+  ✓ Tous les checkpoints < 3% d'écart
+
+Projection @ 8M particles (avec Opt6 θ=2.0) :
+  Estimé: ~870 ms/step → 6000 steps ≈ 1.5h
+  Horizon 16M overnight: FAISABLE
+```
+
+### Asymmetric θ — Rejeté
+
+```
+Testé avec θ_self=0.5, θ_cross=1.0
+Résultat: overhead > gain dans conditions initiales mixtes
+Temps/step 2M: 3228 ms (vs 2662 ms baseline) → 21% plus lent
+Cause: lecture anticipée des masses pour chaque nœud
+À revisiter pour simulations post-ségrégation (S > 0.05)
+```
+
+### Opt5 Incremental Updates — Rejeté
+
+```
+Implémenté update_com_only() pour éviter rebuild complet.
+Résultat: seulement 1.1× speedup (275 ms vs 306 ms)
+Cause: bottleneck = force kernel, pas tree build
+```
+
+### Opt6 θ=2.0 + Minimal Reset — Validé ✅
+
+```
+Deux optimisations combinées :
+
+1. Barnes-Hut θ = 2.0 (était 0.7)
+   - θ plus élevé = plus d'approximations = moins de traversées
+   - Force kernel: ~2200 ms → ~150 ms
+   - Erreur physique: 2.74% (acceptable pour BH)
+
+2. Reset minimal des buffers
+   - Avant: reset_buffers() = 130 ms (tous les buffers GPU)
+   - Après: reset atomic_counter seulement = ~1 ms
+   - Raison: algorithme Karras écrase entièrement les buffers
+
+Validation @ 2M particles, 100 steps :
+  ✓ Average: 197.3 ms/step (cible < 250 ms) ✅
+  ✓ Min: 178.6 ms/step
+  ✓ Max: 240.6 ms/step
+  ✓ Throughput: 10.1M particles/sec
+  ✓ Physics error vs θ=0.7: 2.74%
+
+Speedup total depuis baseline: 39.6×
+```
+
+### Optimisations futures (si nécessaire)
+
+| Opt | Description           | Cible        | Statut |
+|-----|-----------------------|--------------|--------|
+| 7   | Async multi-stream    | 1.2-2× supp  | ⬜     |
+| 8   | GPU RadixSort (CUB)   | ~1.3× supp   | ⬜     |
+| 9   | Force Freezing        | (post-seg)   | ⬜     |
+
+---
+
 ## ORDRE D'EXÉCUTION — ÉTAT ACTUEL
 
 ```
@@ -1072,6 +1165,9 @@ COMPLÉTÉ ✅ :
   ✅ Tâche 2 : Hubble friction (dtau_per_dt=0.013205, KE/KE₀=6.01)
   ✅ Parallèle A : Vidéo 3-panel (721 frames, 24 sec)
   ✅ Document LaTeX 13 pages (janus_validation.pdf)
+  ✅ GPU Opt 1-2 : DKD + Morton (2.9× speedup)
+  ✅ GPU Opt 4 : GPU tree build Karras (25.5× speedup, 306 ms/step @ 2M)
+  ✅ GPU Opt 6 : θ=2.0 + minimal reset (39.6× speedup total, 197 ms/step @ 2M)
 
 EN COURS 🔄 :
   🔄 Tâche 3 : Run 2M × 6000 steps (51%, S_max=0.694, fin ~15h00)
@@ -1081,6 +1177,7 @@ EN COURS 🔄 :
   □ Tâche 4 : ξ(r) en post-processing
   □ Tâche 5 : Test η=1.0 (cas limite, 30 min)
   □ Projet PM : voir janus_roadmap_pm.md (objectif 20M particules)
+  □ GPU Opt 7-9 : optimisations supplémentaires si >250ms nécessaire
 
 CONTACT PETIT :
   ✅ Fit Pantheon+ (η=1.045, χ²/dof=0.607)

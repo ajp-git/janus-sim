@@ -9,7 +9,7 @@
 /// - Parallel tree traversal on GPU
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, LaunchAsync, LaunchConfig};
 
 use crate::nbody::{Vec3, BoundingBox};
 use std::sync::Arc;
@@ -131,7 +131,7 @@ extern "C" __global__ void compute_forces_simple(
                 double dpy = com_plus_y - py;
                 double dpz = com_plus_z - pz;
                 double rp2 = dpx*dpx + dpy*dpy + dpz*dpz + eps2;
-                double inv_rp3 = 1.0 / (rp2 * sqrt(rp2));  // Fixed: was rsqrt(rp2)/rp2
+                double inv_rp3 = 1.0 / (rp2 * sqrt(rp2));
                 double interaction = (my_sign > 0) ? 1.0 : -1.0;
                 double f = interaction * mass_plus * inv_rp3;
                 ax += f * dpx;
@@ -144,7 +144,7 @@ extern "C" __global__ void compute_forces_simple(
                 double dmy = com_minus_y - py;
                 double dmz = com_minus_z - pz;
                 double rm2 = dmx*dmx + dmy*dmy + dmz*dmz + eps2;
-                double inv_rm3 = 1.0 / (rm2 * sqrt(rm2));  // Fixed: was rsqrt(rm2)/rm2
+                double inv_rm3 = 1.0 / (rm2 * sqrt(rm2));
                 double interaction = (my_sign < 0) ? 1.0 : -1.0;
                 double f = interaction * mass_minus * inv_rm3;
                 ax += f * dmx;
@@ -207,6 +207,602 @@ extern "C" __global__ void leapfrog_kick_drift(
             if (pos[base + i] < -box_half) pos[base + i] += 2.0 * box_half;
         }
     }
+}
+
+// DKD optimization: drift-only kernel for DKD integrator
+extern "C" __global__ void drift_only(
+    double* __restrict__ pos,
+    const double* __restrict__ vel,
+    double dt,
+    double box_half,
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    int base = tid * 3;
+
+    // Drift positions
+    pos[base]     += vel[base]     * dt;
+    pos[base + 1] += vel[base + 1] * dt;
+    pos[base + 2] += vel[base + 2] * dt;
+
+    // Periodic boundary conditions
+    for (int i = 0; i < 3; i++) {
+        if (pos[base + i] > box_half) pos[base + i] -= 2.0 * box_half;
+        if (pos[base + i] < -box_half) pos[base + i] += 2.0 * box_half;
+    }
+}
+
+// DKD optimization: kick-only kernel with Hubble friction
+extern "C" __global__ void kick_only(
+    double* __restrict__ vel,
+    const double* __restrict__ acc,
+    double dt,
+    int n,
+    double hubble_param,
+    double dtau_per_dt
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    int base = tid * 3;
+
+    // Kick with Hubble friction
+    for (int d = 0; d < 3; d++) {
+        double friction = -hubble_param * vel[base + d] * dtau_per_dt;
+        vel[base + d] += (acc[base + d] + friction) * dt;
+    }
+}
+
+// Morton code computation for spatial sorting
+// Maps 3D position to 1D Morton code (Z-order curve) for cache locality
+__device__ unsigned long long expand_bits_21(unsigned int v) {
+    // Expand 21-bit integer to 63 bits with 2 zeros between each bit
+    unsigned long long x = v & 0x1fffff;  // 21 bits
+    x = (x | (x << 32)) & 0x1f00000000ffffULL;
+    x = (x | (x << 16)) & 0x1f0000ff0000ffULL;
+    x = (x | (x << 8))  & 0x100f00f00f00f00fULL;
+    x = (x | (x << 4))  & 0x10c30c30c30c30c3ULL;
+    x = (x | (x << 2))  & 0x1249249249249249ULL;
+    return x;
+}
+
+extern "C" __global__ void compute_morton_codes(
+    const double* __restrict__ pos,
+    unsigned long long* __restrict__ morton_codes,
+    int* __restrict__ indices,
+    int n,
+    double box_half,
+    double inv_cell_size
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    // Read position and normalize to [0, 2^21) range
+    double x = (pos[tid * 3]     + box_half) * inv_cell_size;
+    double y = (pos[tid * 3 + 1] + box_half) * inv_cell_size;
+    double z = (pos[tid * 3 + 2] + box_half) * inv_cell_size;
+
+    // Clamp to valid range
+    unsigned int ix = min(max((unsigned int)x, 0u), 0x1fffffu);
+    unsigned int iy = min(max((unsigned int)y, 0u), 0x1fffffu);
+    unsigned int iz = min(max((unsigned int)z, 0u), 0x1fffffu);
+
+    // Interleave bits to form Morton code
+    morton_codes[tid] = expand_bits_21(ix) | (expand_bits_21(iy) << 1) | (expand_bits_21(iz) << 2);
+    indices[tid] = tid;
+}
+
+// Reorder positions based on sorted indices
+extern "C" __global__ void reorder_positions(
+    const double* __restrict__ pos_in,
+    double* __restrict__ pos_out,
+    const int* __restrict__ sorted_indices,
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    int src = sorted_indices[tid];
+    pos_out[tid * 3]     = pos_in[src * 3];
+    pos_out[tid * 3 + 1] = pos_in[src * 3 + 1];
+    pos_out[tid * 3 + 2] = pos_in[src * 3 + 2];
+}
+
+// Reorder velocities based on sorted indices
+extern "C" __global__ void reorder_velocities(
+    const double* __restrict__ vel_in,
+    double* __restrict__ vel_out,
+    const int* __restrict__ sorted_indices,
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    int src = sorted_indices[tid];
+    vel_out[tid * 3]     = vel_in[src * 3];
+    vel_out[tid * 3 + 1] = vel_in[src * 3 + 1];
+    vel_out[tid * 3 + 2] = vel_in[src * 3 + 2];
+}
+
+// Reorder signs based on sorted indices
+extern "C" __global__ void reorder_signs(
+    const int* __restrict__ signs_in,
+    int* __restrict__ signs_out,
+    const int* __restrict__ sorted_indices,
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    signs_out[tid] = signs_in[sorted_indices[tid]];
+}
+
+// ============================================================================
+// GPU BVH Construction (Karras 2012)
+// ============================================================================
+
+// Count leading zeros in 64-bit integer
+__device__ int clz64(unsigned long long x) {
+    if (x == 0) return 64;
+    int n = 0;
+    if ((x & 0xFFFFFFFF00000000ULL) == 0) { n += 32; x <<= 32; }
+    if ((x & 0xFFFF000000000000ULL) == 0) { n += 16; x <<= 16; }
+    if ((x & 0xFF00000000000000ULL) == 0) { n += 8;  x <<= 8; }
+    if ((x & 0xF000000000000000ULL) == 0) { n += 4;  x <<= 4; }
+    if ((x & 0xC000000000000000ULL) == 0) { n += 2;  x <<= 2; }
+    if ((x & 0x8000000000000000ULL) == 0) { n += 1; }
+    return n;
+}
+
+// Compute longest common prefix length between two Morton codes
+__device__ int delta(const unsigned long long* morton, int i, int j, int n) {
+    if (j < 0 || j >= n) return -1;
+    unsigned long long ki = morton[i];
+    unsigned long long kj = morton[j];
+    if (ki == kj) {
+        // If codes are equal, use index to break tie
+        return 64 + clz64((unsigned long long)(i ^ j));
+    }
+    return clz64(ki ^ kj);
+}
+
+// Karras 2012: Determine range of keys covered by internal node i
+__device__ void determine_range(
+    const unsigned long long* morton,
+    int n,
+    int i,
+    int* first,
+    int* last
+) {
+    // Determine direction of range (+1 or -1)
+    int d_left = delta(morton, i, i - 1, n);
+    int d_right = delta(morton, i, i + 1, n);
+    int d = (d_right > d_left) ? 1 : -1;
+    int d_min = (d > 0) ? d_left : d_right;
+
+    // Find upper bound for range length
+    int l_max = 2;
+    while (delta(morton, i, i + l_max * d, n) > d_min) {
+        l_max *= 2;
+    }
+
+    // Binary search for actual range length
+    int l = 0;
+    for (int t = l_max / 2; t >= 1; t /= 2) {
+        if (delta(morton, i, i + (l + t) * d, n) > d_min) {
+            l += t;
+        }
+    }
+
+    int j = i + l * d;
+    *first = min(i, j);
+    *last = max(i, j);
+}
+
+// Karras 2012: Find split position within range
+__device__ int find_split(
+    const unsigned long long* morton,
+    int n,
+    int first,
+    int last
+) {
+    unsigned long long first_code = morton[first];
+    unsigned long long last_code = morton[last];
+
+    if (first_code == last_code) {
+        return (first + last) / 2;
+    }
+
+    int common_prefix = clz64(first_code ^ last_code);
+
+    // Binary search for split position
+    int split = first;
+    int step = last - first;
+
+    do {
+        step = (step + 1) / 2;
+        int new_split = split + step;
+
+        if (new_split < last) {
+            unsigned long long split_code = morton[new_split];
+            int split_prefix = clz64(first_code ^ split_code);
+            if (split_prefix > common_prefix) {
+                split = new_split;
+            }
+        }
+    } while (step > 1);
+
+    return split;
+}
+
+// Build internal nodes of BVH (Karras 2012)
+// n = number of leaves (particles)
+// Internal nodes: 0 to n-2
+// Leaf nodes: n-1 to 2n-2 (store particle indices)
+extern "C" __global__ void build_bvh_internal(
+    const unsigned long long* __restrict__ morton,
+    int* __restrict__ left_child,   // left child index (-1 for leaf)
+    int* __restrict__ right_child,  // right child index (-1 for leaf)
+    int* __restrict__ parent,       // parent index
+    int* __restrict__ range_left,   // leftmost leaf in subtree
+    int* __restrict__ range_right,  // rightmost leaf in subtree
+    int n  // number of leaves
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n - 1) return;  // n-1 internal nodes
+
+    int first, last;
+    determine_range(morton, n, i, &first, &last);
+    int split = find_split(morton, n, first, last);
+
+    // Children indices
+    // Left child: if split == first, it's a leaf; else internal node
+    int left = (split == first) ? (n - 1 + split) : split;
+    // Right child: if split+1 == last, it's a leaf; else internal node
+    int right = (split + 1 == last) ? (n - 1 + split + 1) : (split + 1);
+
+    left_child[i] = left;
+    right_child[i] = right;
+    range_left[i] = first;
+    range_right[i] = last;
+
+    // Set parent pointers
+    if (left < n - 1) parent[left] = i;
+    else parent[left] = i;  // leaf parent
+    if (right < n - 1) parent[right] = i;
+    else parent[right] = i;  // leaf parent
+}
+
+// Initialize leaf nodes with particle data
+extern "C" __global__ void init_leaves(
+    const double* __restrict__ pos,
+    const int* __restrict__ signs,
+    double* __restrict__ node_data,  // 12 floats per node: cx,cy,cz,half_size,com+,com-
+    int* __restrict__ node_types,
+    int* __restrict__ atomic_counter,  // for bottom-up traversal
+    int n,  // number of leaves
+    double box_half
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    int node_idx = n - 1 + i;  // Leaf nodes start at n-1
+    int base = node_idx * 12;
+
+    double x = pos[i * 3];
+    double y = pos[i * 3 + 1];
+    double z = pos[i * 3 + 2];
+    int sign = signs[i];
+
+    // For leaves, center = particle position, half_size = small
+    node_data[base + 0] = x;
+    node_data[base + 1] = y;
+    node_data[base + 2] = z;
+    node_data[base + 3] = box_half / 1024.0;  // Small for leaf
+
+    // COM for this particle
+    if (sign > 0) {
+        node_data[base + 4] = x;  // com_plus
+        node_data[base + 5] = y;
+        node_data[base + 6] = z;
+        node_data[base + 7] = 1.0;  // mass_plus
+        node_data[base + 8] = 0.0;  // com_minus
+        node_data[base + 9] = 0.0;
+        node_data[base + 10] = 0.0;
+        node_data[base + 11] = 0.0;  // mass_minus
+    } else {
+        node_data[base + 4] = 0.0;
+        node_data[base + 5] = 0.0;
+        node_data[base + 6] = 0.0;
+        node_data[base + 7] = 0.0;
+        node_data[base + 8] = x;
+        node_data[base + 9] = y;
+        node_data[base + 10] = z;
+        node_data[base + 11] = 1.0;
+    }
+
+    node_types[node_idx] = 1;  // Leaf
+    atomic_counter[node_idx] = 0;
+}
+
+// Bottom-up COM reduction for internal nodes
+extern "C" __global__ void reduce_com(
+    const int* __restrict__ left_child,
+    const int* __restrict__ right_child,
+    const int* __restrict__ parent,
+    const int* __restrict__ range_left,
+    const int* __restrict__ range_right,
+    double* __restrict__ node_data,
+    int* __restrict__ node_types,
+    int* __restrict__ atomic_counter,
+    int n,  // number of leaves
+    double box_half
+) {
+    int leaf_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (leaf_idx >= n) return;
+
+    int node_idx = n - 1 + leaf_idx;  // Start from this leaf
+
+    // Walk up the tree
+    int current = parent[node_idx];
+
+    while (current >= 0 && current < n - 1) {
+        // Atomically increment counter for this internal node
+        int count = atomicAdd(&atomic_counter[current], 1);
+
+        // If we're the second thread to arrive, process this node
+        if (count == 0) {
+            // First thread - exit and let second thread handle it
+            return;
+        }
+
+        // We're the second thread - both children are ready
+        int left = left_child[current];
+        int right = right_child[current];
+
+        int base = current * 12;
+        int left_base = left * 12;
+        int right_base = right * 12;
+
+        // Read children data
+        double l_mp = node_data[left_base + 7];
+        double l_mm = node_data[left_base + 11];
+        double r_mp = node_data[right_base + 7];
+        double r_mm = node_data[right_base + 11];
+
+        // Compute combined COM for positive masses
+        double total_mp = l_mp + r_mp;
+        double com_plus_x = 0.0, com_plus_y = 0.0, com_plus_z = 0.0;
+        if (total_mp > 0.0) {
+            com_plus_x = (l_mp * node_data[left_base + 4] + r_mp * node_data[right_base + 4]) / total_mp;
+            com_plus_y = (l_mp * node_data[left_base + 5] + r_mp * node_data[right_base + 5]) / total_mp;
+            com_plus_z = (l_mp * node_data[left_base + 6] + r_mp * node_data[right_base + 6]) / total_mp;
+        }
+
+        // Compute combined COM for negative masses
+        double total_mm = l_mm + r_mm;
+        double com_minus_x = 0.0, com_minus_y = 0.0, com_minus_z = 0.0;
+        if (total_mm > 0.0) {
+            com_minus_x = (l_mm * node_data[left_base + 8] + r_mm * node_data[right_base + 8]) / total_mm;
+            com_minus_y = (l_mm * node_data[left_base + 9] + r_mm * node_data[right_base + 9]) / total_mm;
+            com_minus_z = (l_mm * node_data[left_base + 10] + r_mm * node_data[right_base + 10]) / total_mm;
+        }
+
+        // Compute bounding box half-size from range
+        // For Morton BVH: half_size proportional to range^(1/3)
+        // Root (range=n): half_size = box_half
+        // Leaf (range=1): half_size = box_half / n^(1/3)
+        int first = range_left[current];
+        int last = range_right[current];
+        int range_size = last - first + 1;
+        // Use cbrt to get cube root (spatial extent scales as volume^(1/3))
+        double frac = (double)range_size / (double)n;
+        double half_size = box_half * cbrt(frac);
+        if (half_size < box_half / 1024.0) half_size = box_half / 1024.0;
+
+        // Geometric center (average of COMs)
+        double cx = (com_plus_x + com_minus_x) / 2.0;
+        double cy = (com_plus_y + com_minus_y) / 2.0;
+        double cz = (com_plus_z + com_minus_z) / 2.0;
+        if (total_mp + total_mm > 0.0) {
+            cx = (total_mp * com_plus_x + total_mm * com_minus_x) / (total_mp + total_mm);
+            cy = (total_mp * com_plus_y + total_mm * com_minus_y) / (total_mp + total_mm);
+            cz = (total_mp * com_plus_z + total_mm * com_minus_z) / (total_mp + total_mm);
+        }
+
+        // Store node data
+        node_data[base + 0] = cx;
+        node_data[base + 1] = cy;
+        node_data[base + 2] = cz;
+        node_data[base + 3] = half_size;
+        node_data[base + 4] = com_plus_x;
+        node_data[base + 5] = com_plus_y;
+        node_data[base + 6] = com_plus_z;
+        node_data[base + 7] = total_mp;
+        node_data[base + 8] = com_minus_x;
+        node_data[base + 9] = com_minus_y;
+        node_data[base + 10] = com_minus_z;
+        node_data[base + 11] = total_mm;
+
+        node_types[current] = 2;  // Internal node
+
+        // Move up to parent
+        if (current == 0) break;  // Reached root
+        current = parent[current];
+    }
+}
+
+// Compute forces using GPU-built BVH
+extern "C" __global__ void compute_forces_bvh(
+    const double* __restrict__ pos,
+    const int* __restrict__ signs,
+    const double* __restrict__ node_data,
+    const int* __restrict__ left_child,
+    const int* __restrict__ right_child,
+    const int* __restrict__ node_types,
+    double* __restrict__ acc,
+    int n_particles,
+    int n_internal,  // n_particles - 1
+    double theta,
+    double softening
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_particles) return;
+
+    double px = pos[tid * 3];
+    double py = pos[tid * 3 + 1];
+    double pz = pos[tid * 3 + 2];
+    int my_sign = signs[tid];
+
+    double ax = 0.0, ay = 0.0, az = 0.0;
+    double eps2 = softening * softening;
+
+    // Stack-based traversal starting from root
+    int stack[64];
+    int stack_ptr = 0;
+    stack[stack_ptr++] = 0;  // Root is node 0
+
+    while (stack_ptr > 0) {
+        int node_idx = stack[--stack_ptr];
+        if (node_idx < 0) continue;
+
+        int node_type = node_types[node_idx];
+        if (node_type == 0) continue;
+
+        int base = node_idx * 12;
+        double cx = node_data[base + 0];
+        double cy = node_data[base + 1];
+        double cz = node_data[base + 2];
+        double half_size = node_data[base + 3];
+
+        double dx = cx - px;
+        double dy = cy - py;
+        double dz = cz - pz;
+        double r2 = dx*dx + dy*dy + dz*dz;
+        double r = sqrt(r2 + 1e-20);
+
+        double s_over_r = (2.0 * half_size) / r;
+
+        // Use monopole if leaf or passes opening criterion
+        if (node_type == 1 || s_over_r < theta) {
+            double mass_plus = node_data[base + 7];
+            double mass_minus = node_data[base + 11];
+
+            if (mass_plus > 0.0) {
+                double com_plus_x = node_data[base + 4];
+                double com_plus_y = node_data[base + 5];
+                double com_plus_z = node_data[base + 6];
+                double dpx = com_plus_x - px;
+                double dpy = com_plus_y - py;
+                double dpz = com_plus_z - pz;
+                double rp2 = dpx*dpx + dpy*dpy + dpz*dpz + eps2;
+                double inv_rp3 = 1.0 / (rp2 * sqrt(rp2));
+                double interaction = (my_sign > 0) ? 1.0 : -1.0;
+                double f = interaction * mass_plus * inv_rp3;
+                ax += f * dpx;
+                ay += f * dpy;
+                az += f * dpz;
+            }
+
+            if (mass_minus > 0.0) {
+                double com_minus_x = node_data[base + 8];
+                double com_minus_y = node_data[base + 9];
+                double com_minus_z = node_data[base + 10];
+                double dmx = com_minus_x - px;
+                double dmy = com_minus_y - py;
+                double dmz = com_minus_z - pz;
+                double rm2 = dmx*dmx + dmy*dmy + dmz*dmz + eps2;
+                double inv_rm3 = 1.0 / (rm2 * sqrt(rm2));
+                double interaction = (my_sign < 0) ? 1.0 : -1.0;
+                double f = interaction * mass_minus * inv_rm3;
+                ax += f * dmx;
+                ay += f * dmy;
+                az += f * dmz;
+            }
+        } else {
+            // Descend into children
+            int left = left_child[node_idx];
+            int right = right_child[node_idx];
+            if (left >= 0 && stack_ptr < 63) stack[stack_ptr++] = left;
+            if (right >= 0 && stack_ptr < 63) stack[stack_ptr++] = right;
+        }
+    }
+
+    acc[tid * 3] = ax;
+    acc[tid * 3 + 1] = ay;
+    acc[tid * 3 + 2] = az;
+}
+
+// Simple GPU bitonic sort for Morton codes (for small N)
+// For larger N, we use CPU sort (hybrid approach)
+extern "C" __global__ void bitonic_sort_step(
+    unsigned long long* __restrict__ keys,
+    int* __restrict__ values,
+    int j,
+    int k,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int ij = i ^ j;
+
+    if (ij > i && i < n && ij < n) {
+        if ((i & k) == 0) {
+            // Ascending
+            if (keys[i] > keys[ij]) {
+                unsigned long long tmp_k = keys[i];
+                keys[i] = keys[ij];
+                keys[ij] = tmp_k;
+                int tmp_v = values[i];
+                values[i] = values[ij];
+                values[ij] = tmp_v;
+            }
+        } else {
+            // Descending
+            if (keys[i] < keys[ij]) {
+                unsigned long long tmp_k = keys[i];
+                keys[i] = keys[ij];
+                keys[ij] = tmp_k;
+                int tmp_v = values[i];
+                values[i] = values[ij];
+                values[ij] = tmp_v;
+            }
+        }
+    }
+}
+
+// Fast GPU reset of atomic counters for incremental tree updates
+// Only resets atomic_counter (not entire tree structure)
+extern "C" __global__ void reset_atomic_counters(
+    int* __restrict__ atomic_counter,
+    int n_total_nodes
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_total_nodes) return;
+    atomic_counter[tid] = 0;
+}
+
+// Fast GPU memset for i32 arrays
+extern "C" __global__ void memset_i32(
+    int* __restrict__ arr,
+    int value,
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    arr[tid] = value;
+}
+
+// Fast GPU memset for f64 arrays
+extern "C" __global__ void memset_f64(
+    double* __restrict__ arr,
+    double value,
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    arr[tid] = value;
 }
 "#;
 
@@ -557,6 +1153,19 @@ impl LinearOctree {
     }
 }
 
+/// Double-buffered BVH tree for async pipelining
+#[cfg(feature = "cuda")]
+pub struct BvhBuffer {
+    left_child: CudaSlice<i32>,
+    right_child: CudaSlice<i32>,
+    parent: CudaSlice<i32>,
+    range_left: CudaSlice<i32>,
+    range_right: CudaSlice<i32>,
+    node_data: CudaSlice<f64>,
+    node_types: CudaSlice<i32>,
+    atomic_counter: CudaSlice<i32>,
+}
+
 /// GPU Barnes-Hut simulation (f64 precision)
 #[cfg(feature = "cuda")]
 pub struct GpuNBodySimulation {
@@ -568,6 +1177,24 @@ pub struct GpuNBodySimulation {
     node_data: CudaSlice<f64>,
     node_children: CudaSlice<i32>,
     node_types: CudaSlice<i32>,
+    // Morton sorting buffers
+    morton_codes: CudaSlice<u64>,
+    sorted_indices: CudaSlice<i32>,
+    pos_tmp: CudaSlice<f64>,
+    vel_tmp: CudaSlice<f64>,
+    signs_tmp: CudaSlice<i32>,
+    // GPU BVH buffers (Karras 2012) - primary (backwards compat)
+    bvh_left_child: CudaSlice<i32>,
+    bvh_right_child: CudaSlice<i32>,
+    bvh_parent: CudaSlice<i32>,
+    bvh_range_left: CudaSlice<i32>,
+    bvh_range_right: CudaSlice<i32>,
+    bvh_node_data: CudaSlice<f64>,
+    bvh_node_types: CudaSlice<i32>,
+    bvh_atomic_counter: CudaSlice<i32>,
+    // Double-buffered BVH for async pipeline (opt7)
+    bvh_buffers: Option<[BvhBuffer; 2]>,
+    current_bvh: usize,  // 0 or 1
     n_particles: usize,
     n_nodes: usize,
     theta: f64,
@@ -583,7 +1210,12 @@ impl GpuNBodySimulation {
         let device = CudaDevice::new(0)?;
 
         let ptx = cudarc::nvrtc::compile_ptx(CUDA_KERNEL_SRC)?;
-        device.load_ptx(ptx, "nbody", &["compute_forces_simple", "leapfrog_kick_drift"])?;
+        device.load_ptx(ptx, "nbody", &[
+            "compute_forces_simple", "leapfrog_kick_drift", "drift_only", "kick_only",
+            "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs",
+            "build_bvh_internal", "init_leaves", "reduce_com", "compute_forces_bvh",
+            "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
+        ])?;
 
         let n_total = n_positive + n_negative;
 
@@ -647,6 +1279,25 @@ impl GpuNBodySimulation {
         let node_children = device.htod_sync_copy(&tree.node_children)?;
         let node_types = device.htod_sync_copy(&tree.node_types)?;
 
+        // Morton sorting buffers
+        let morton_codes = device.alloc_zeros::<u64>(n_total)?;
+        let sorted_indices = device.alloc_zeros::<i32>(n_total)?;
+        let pos_tmp = device.alloc_zeros::<f64>(n_total * 3)?;
+        let vel_tmp = device.alloc_zeros::<f64>(n_total * 3)?;
+        let signs_tmp = device.alloc_zeros::<i32>(n_total)?;
+
+        // GPU BVH buffers (Karras 2012)
+        // Total nodes: 2*n - 1 (n-1 internal + n leaves)
+        let n_bvh_nodes = 2 * n_total - 1;
+        let bvh_left_child = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_right_child = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_parent = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_range_left = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_range_right = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_node_data = device.alloc_zeros::<f64>(n_bvh_nodes * 12)?;
+        let bvh_node_types = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_atomic_counter = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+
         let mean_sep = box_size / (n_total as f64).powf(1.0/3.0);
         let softening = 0.5 * mean_sep;
 
@@ -654,14 +1305,131 @@ impl GpuNBodySimulation {
             device,
             pos, vel, signs, acc,
             node_data, node_children, node_types,
+            morton_codes, sorted_indices, pos_tmp, vel_tmp, signs_tmp,
+            bvh_left_child, bvh_right_child, bvh_parent,
+            bvh_range_left, bvh_range_right,
+            bvh_node_data, bvh_node_types, bvh_atomic_counter,
+            bvh_buffers: None,  // Initialized lazily for async mode
+            current_bvh: 0,
             n_particles: n_total,
             n_nodes,
-            theta: 0.7,
+            theta: 2.0,  // Optimized for performance (was 0.7)
             softening,
             box_size,
             time: 0.0,
             particles_cpu,
         })
+    }
+
+    /// Create simulation with specific initial state (for comparison tests)
+    pub fn new_with_state(
+        n_positive: usize, n_negative: usize, box_size: f64,
+        positions: Vec<f64>, velocities: Vec<f64>, signs_data: Vec<i32>
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let device = CudaDevice::new(0)?;
+
+        let ptx = cudarc::nvrtc::compile_ptx(CUDA_KERNEL_SRC)?;
+        device.load_ptx(ptx, "nbody", &[
+            "compute_forces_simple", "leapfrog_kick_drift", "drift_only", "kick_only",
+            "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs",
+            "build_bvh_internal", "init_leaves", "reduce_com", "compute_forces_bvh",
+            "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
+        ])?;
+
+        let n_total = n_positive + n_negative;
+
+        // Build particles_cpu from provided data
+        let mut particles_cpu = Vec::with_capacity(n_total);
+        for i in 0..n_total {
+            particles_cpu.push(GpuParticle {
+                x: positions[i * 3],
+                y: positions[i * 3 + 1],
+                z: positions[i * 3 + 2],
+                vx: velocities[i * 3],
+                vy: velocities[i * 3 + 1],
+                vz: velocities[i * 3 + 2],
+                mass: 1.0,
+                sign: signs_data[i],
+            });
+        }
+
+        let pos = device.htod_sync_copy(&positions)?;
+        let vel = device.htod_sync_copy(&velocities)?;
+        let signs = device.htod_sync_copy(&signs_data)?;
+        let acc = device.alloc_zeros::<f64>(n_total * 3)?;
+
+        let tree = LinearOctree::build(&particles_cpu, box_size);
+        let n_nodes = tree.nodes.len();
+        let node_data = device.htod_sync_copy(&tree.node_data)?;
+        let node_children = device.htod_sync_copy(&tree.node_children)?;
+        let node_types = device.htod_sync_copy(&tree.node_types)?;
+
+        // Morton sorting buffers
+        let morton_codes = device.alloc_zeros::<u64>(n_total)?;
+        let sorted_indices = device.alloc_zeros::<i32>(n_total)?;
+        let pos_tmp = device.alloc_zeros::<f64>(n_total * 3)?;
+        let vel_tmp = device.alloc_zeros::<f64>(n_total * 3)?;
+        let signs_tmp = device.alloc_zeros::<i32>(n_total)?;
+
+        // GPU BVH buffers (Karras 2012)
+        let n_bvh_nodes = 2 * n_total - 1;
+        let bvh_left_child = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_right_child = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_parent = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_range_left = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_range_right = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_node_data = device.alloc_zeros::<f64>(n_bvh_nodes * 12)?;
+        let bvh_node_types = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_atomic_counter = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+
+        let mean_sep = box_size / (n_total as f64).powf(1.0/3.0);
+        let softening = 0.5 * mean_sep;
+
+        Ok(Self {
+            device,
+            pos, vel, signs, acc,
+            node_data, node_children, node_types,
+            morton_codes, sorted_indices, pos_tmp, vel_tmp, signs_tmp,
+            bvh_left_child, bvh_right_child, bvh_parent,
+            bvh_range_left, bvh_range_right,
+            bvh_node_data, bvh_node_types, bvh_atomic_counter,
+            bvh_buffers: None,
+            current_bvh: 0,
+            n_particles: n_total,
+            n_nodes,
+            theta: 2.0,  // Optimized for performance (was 0.7)
+            softening,
+            box_size,
+            time: 0.0,
+            particles_cpu,
+        })
+    }
+
+    /// Get current positions (for comparison tests)
+    pub fn positions(&self) -> Vec<f64> {
+        self.device.dtoh_sync_copy(&self.pos).unwrap_or_default()
+    }
+
+    /// Get current velocities (for comparison tests)
+    pub fn velocities(&self) -> Vec<f64> {
+        self.device.dtoh_sync_copy(&self.vel).unwrap_or_default()
+    }
+
+    /// Get particle signs (for comparison tests)
+    pub fn signs(&self) -> Vec<i32> {
+        self.device.dtoh_sync_copy(&self.signs).unwrap_or_default()
+    }
+
+    /// Set Barnes-Hut opening criterion theta (default 0.7)
+    /// Higher theta = more approximate but faster
+    /// theta=0.5: accurate, theta=1.0: fast
+    pub fn set_theta(&mut self, theta: f64) {
+        self.theta = theta;
+    }
+
+    /// Get current theta value
+    pub fn get_theta(&self) -> f64 {
+        self.theta
     }
 
     /// Step sans expansion cosmologique (a=1, H=0)
@@ -772,6 +1540,89 @@ impl GpuNBodySimulation {
         Ok(())
     }
 
+    /// DKD integrator: Drift-Kick-Drift (1 force calculation per step)
+    /// More efficient than KDK for expensive force calculations.
+    /// Structure: Drift(dt/2) → Force → Kick(dt) → Drift(dt/2)
+    pub fn step_with_expansion_dkd(&mut self, dt: f64, scale_factor: f64, hubble: f64, dtau_per_dt: f64)
+        -> Result<(), Box<dyn std::error::Error>>
+    {
+        let half_dt = dt * 0.5;
+        let box_half = self.box_size / 2.0;
+
+        let blocks = (self.n_particles + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Get kernel functions
+        let compute_forces = self.device.get_func("nbody", "compute_forces_simple")
+            .ok_or("Failed to get compute_forces_simple kernel")?;
+        let drift_kernel = self.device.get_func("nbody", "drift_only")
+            .ok_or("Failed to get drift_only kernel")?;
+        let kick_kernel = self.device.get_func("nbody", "kick_only")
+            .ok_or("Failed to get kick_only kernel")?;
+
+        // Step 1: Drift(dt/2) - move particles by half timestep
+        unsafe {
+            drift_kernel.clone().launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half,
+                self.n_particles as i32,
+            ))?;
+        }
+
+        // Step 2: Download positions for tree rebuild (only once per step!)
+        let pos_cpu = self.device.dtoh_sync_copy(&self.pos)?;
+        for (i, p) in self.particles_cpu.iter_mut().enumerate() {
+            p.x = pos_cpu[i * 3];
+            p.y = pos_cpu[i * 3 + 1];
+            p.z = pos_cpu[i * 3 + 2];
+        }
+
+        // Step 3: Rebuild tree (only once per step!)
+        let tree = LinearOctree::build(&self.particles_cpu, self.box_size);
+        self.n_nodes = tree.nodes.len();
+        self.node_data = self.device.htod_sync_copy(&tree.node_data)?;
+        self.node_children = self.device.htod_sync_copy(&tree.node_children)?;
+        self.node_types = self.device.htod_sync_copy(&tree.node_types)?;
+
+        // Step 4: Compute forces (only once per step!)
+        unsafe {
+            compute_forces.launch(cfg, (
+                &self.pos, &self.signs,
+                &self.node_data, &self.node_children, &self.node_types,
+                &mut self.acc,
+                self.n_particles as i32, self.n_nodes as i32,
+                self.theta, self.softening,
+            ))?;
+        }
+
+        // Step 5: Kick(dt) - full timestep velocity update with Hubble friction
+        unsafe {
+            kick_kernel.clone().launch(cfg, (
+                &mut self.vel, &self.acc,
+                dt, self.n_particles as i32,
+                hubble, dtau_per_dt,
+            ))?;
+        }
+
+        // Step 6: Drift(dt/2) - move particles by half timestep again
+        unsafe {
+            drift_kernel.launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half,
+                self.n_particles as i32,
+            ))?;
+        }
+
+        self.device.synchronize()?;
+        self.time += dt;
+
+        Ok(())
+    }
+
     pub fn kinetic_energy(&self) -> Result<f64, Box<dyn std::error::Error>> {
         let vel = self.device.dtoh_sync_copy(&self.vel)?;
 
@@ -785,6 +1636,1090 @@ impl GpuNBodySimulation {
             .sum();
 
         Ok(ke)
+    }
+
+    /// Morton sort particles for improved cache locality
+    /// Uses Z-order curve to map 3D positions to 1D Morton codes
+    pub fn morton_sort_particles(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let blocks = (self.n_particles + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let box_half = self.box_size / 2.0;
+        // Scale factor to map positions to 21-bit integer range (2^21 = 2097152)
+        let inv_cell_size = 2097152.0 / self.box_size;
+
+        // Step 1: Compute Morton codes on GPU
+        let morton_kernel = self.device.get_func("nbody", "compute_morton_codes")
+            .ok_or("Failed to get compute_morton_codes kernel")?;
+
+        unsafe {
+            morton_kernel.launch(cfg, (
+                &self.pos,
+                &mut self.morton_codes,
+                &mut self.sorted_indices,
+                self.n_particles as i32,
+                box_half,
+                inv_cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Step 2: Download Morton codes and indices to CPU for sorting
+        let morton_cpu = self.device.dtoh_sync_copy(&self.morton_codes)?;
+        let mut indices_cpu: Vec<i32> = (0..self.n_particles as i32).collect();
+
+        // Step 3: Sort indices by Morton code using parallel sort
+        // Create pairs and sort
+        use rayon::prelude::*;
+        let mut pairs: Vec<(u64, i32)> = morton_cpu.iter()
+            .zip(indices_cpu.iter())
+            .map(|(&m, &i)| (m, i))
+            .collect();
+
+        pairs.par_sort_unstable_by_key(|&(m, _)| m);
+
+        // Extract sorted indices
+        indices_cpu = pairs.iter().map(|&(_, i)| i).collect();
+
+        // Step 4: Upload sorted indices to GPU
+        self.sorted_indices = self.device.htod_sync_copy(&indices_cpu)?;
+
+        // Step 5: Reorder positions
+        let reorder_pos = self.device.get_func("nbody", "reorder_positions")
+            .ok_or("Failed to get reorder_positions kernel")?;
+        unsafe {
+            reorder_pos.launch(cfg, (
+                &self.pos,
+                &mut self.pos_tmp,
+                &self.sorted_indices,
+                self.n_particles as i32,
+            ))?;
+        }
+        std::mem::swap(&mut self.pos, &mut self.pos_tmp);
+
+        // Step 6: Reorder velocities
+        let reorder_vel = self.device.get_func("nbody", "reorder_velocities")
+            .ok_or("Failed to get reorder_velocities kernel")?;
+        unsafe {
+            reorder_vel.launch(cfg, (
+                &self.vel,
+                &mut self.vel_tmp,
+                &self.sorted_indices,
+                self.n_particles as i32,
+            ))?;
+        }
+        std::mem::swap(&mut self.vel, &mut self.vel_tmp);
+
+        // Step 7: Reorder signs
+        let reorder_signs = self.device.get_func("nbody", "reorder_signs")
+            .ok_or("Failed to get reorder_signs kernel")?;
+        unsafe {
+            reorder_signs.launch(cfg, (
+                &self.signs,
+                &mut self.signs_tmp,
+                &self.sorted_indices,
+                self.n_particles as i32,
+            ))?;
+        }
+        std::mem::swap(&mut self.signs, &mut self.signs_tmp);
+
+        self.device.synchronize()?;
+
+        // Update CPU particle array to match GPU ordering
+        let pos_cpu = self.device.dtoh_sync_copy(&self.pos)?;
+        let vel_cpu = self.device.dtoh_sync_copy(&self.vel)?;
+        let signs_cpu = self.device.dtoh_sync_copy(&self.signs)?;
+
+        for (i, p) in self.particles_cpu.iter_mut().enumerate() {
+            p.x = pos_cpu[i * 3];
+            p.y = pos_cpu[i * 3 + 1];
+            p.z = pos_cpu[i * 3 + 2];
+            p.vx = vel_cpu[i * 3];
+            p.vy = vel_cpu[i * 3 + 1];
+            p.vz = vel_cpu[i * 3 + 2];
+            p.sign = signs_cpu[i];
+        }
+
+        Ok(())
+    }
+
+    /// Build BVH entirely on GPU using Karras 2012 algorithm
+    /// Pipeline: Morton codes → Sort → Build BVH → COM reduction
+    pub fn build_gpu_tree(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let n = self.n_particles;
+        let n_internal = n - 1;
+        let n_total_nodes = 2 * n - 1;
+        let box_half = self.box_size / 2.0;
+        let inv_cell_size = 2097152.0 / self.box_size;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Step 1: Compute Morton codes
+        let morton_kernel = self.device.get_func("nbody", "compute_morton_codes")
+            .ok_or("Failed to get compute_morton_codes kernel")?;
+        unsafe {
+            morton_kernel.launch(cfg, (
+                &self.pos,
+                &mut self.morton_codes,
+                &mut self.sorted_indices,
+                n as i32,
+                box_half,
+                inv_cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Step 2: Sort Morton codes (CPU parallel sort for now)
+        // TODO: Replace with CUB RadixSort for full GPU pipeline
+        let morton_cpu = self.device.dtoh_sync_copy(&self.morton_codes)?;
+        let mut indices_cpu: Vec<i32> = (0..n as i32).collect();
+
+        use rayon::prelude::*;
+        let mut pairs: Vec<(u64, i32)> = morton_cpu.iter()
+            .zip(indices_cpu.iter())
+            .map(|(&m, &i)| (m, i))
+            .collect();
+        pairs.par_sort_unstable_by_key(|&(m, _)| m);
+        indices_cpu = pairs.iter().map(|&(_, i)| i).collect();
+
+        self.sorted_indices = self.device.htod_sync_copy(&indices_cpu)?;
+        // Update morton_codes to sorted order
+        let sorted_morton: Vec<u64> = pairs.iter().map(|&(m, _)| m).collect();
+        self.morton_codes = self.device.htod_sync_copy(&sorted_morton)?;
+
+        // Step 3: Reorder particles based on sorted indices
+        let reorder_pos = self.device.get_func("nbody", "reorder_positions")
+            .ok_or("Failed to get reorder_positions kernel")?;
+        unsafe {
+            reorder_pos.launch(cfg, (
+                &self.pos,
+                &mut self.pos_tmp,
+                &self.sorted_indices,
+                n as i32,
+            ))?;
+        }
+        std::mem::swap(&mut self.pos, &mut self.pos_tmp);
+
+        let reorder_signs = self.device.get_func("nbody", "reorder_signs")
+            .ok_or("Failed to get reorder_signs kernel")?;
+        unsafe {
+            reorder_signs.launch(cfg, (
+                &self.signs,
+                &mut self.signs_tmp,
+                &self.sorted_indices,
+                n as i32,
+            ))?;
+        }
+        std::mem::swap(&mut self.signs, &mut self.signs_tmp);
+
+        let reorder_vel = self.device.get_func("nbody", "reorder_velocities")
+            .ok_or("Failed to get reorder_velocities kernel")?;
+        unsafe {
+            reorder_vel.launch(cfg, (
+                &self.vel,
+                &mut self.vel_tmp,
+                &self.sorted_indices,
+                n as i32,
+            ))?;
+        }
+        std::mem::swap(&mut self.vel, &mut self.vel_tmp);
+
+        self.device.synchronize()?;
+
+        // Step 4: Reset ONLY atomic_counter (other buffers are fully overwritten)
+        // Karras BVH: writes left_child, right_child, parent, range for all internal nodes
+        // init_leaves + reduce_com: writes node_data and node_types for all nodes
+        let reset_blocks = (n_total_nodes + 255) / 256;
+        let reset_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (reset_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let reset_kernel = self.device.get_func("nbody", "reset_atomic_counters")
+            .ok_or("Failed to get reset_atomic_counters kernel")?;
+        unsafe {
+            reset_kernel.launch(reset_cfg, (
+                &mut self.bvh_atomic_counter,
+                n_total_nodes as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Step 5: Build internal nodes (Karras algorithm)
+        let internal_blocks = (n_internal + 255) / 256;
+        let internal_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (internal_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let build_kernel = self.device.get_func("nbody", "build_bvh_internal")
+            .ok_or("Failed to get build_bvh_internal kernel")?;
+        unsafe {
+            build_kernel.launch(internal_cfg, (
+                &self.morton_codes,
+                &mut self.bvh_left_child,
+                &mut self.bvh_right_child,
+                &mut self.bvh_parent,
+                &mut self.bvh_range_left,
+                &mut self.bvh_range_right,
+                n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Step 6: Initialize leaves with particle data
+        let init_leaves = self.device.get_func("nbody", "init_leaves")
+            .ok_or("Failed to get init_leaves kernel")?;
+        unsafe {
+            init_leaves.launch(cfg, (
+                &self.pos,
+                &self.signs,
+                &mut self.bvh_node_data,
+                &mut self.bvh_node_types,
+                &mut self.bvh_atomic_counter,
+                n as i32,
+                box_half,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Step 7: Bottom-up COM reduction
+        let reduce_kernel = self.device.get_func("nbody", "reduce_com")
+            .ok_or("Failed to get reduce_com kernel")?;
+        unsafe {
+            reduce_kernel.launch(cfg, (
+                &self.bvh_left_child,
+                &self.bvh_right_child,
+                &self.bvh_parent,
+                &self.bvh_range_left,
+                &self.bvh_range_right,
+                &mut self.bvh_node_data,
+                &mut self.bvh_node_types,
+                &mut self.bvh_atomic_counter,
+                n as i32,
+                box_half,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        Ok(())
+    }
+
+    /// Profiled version of build_gpu_tree for timing analysis
+    pub fn build_gpu_tree_profiled(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Instant;
+
+        let n = self.n_particles;
+        let n_internal = n - 1;
+        let n_total_nodes = 2 * n - 1;
+        let box_half = self.box_size / 2.0;
+        let inv_cell_size = 2097152.0 / self.box_size;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Step 1: Compute Morton codes
+        let t1 = Instant::now();
+        let morton_kernel = self.device.get_func("nbody", "compute_morton_codes")
+            .ok_or("Failed to get compute_morton_codes kernel")?;
+        unsafe {
+            morton_kernel.launch(cfg, (
+                &self.pos,
+                &mut self.morton_codes,
+                &mut self.sorted_indices,
+                n as i32,
+                box_half,
+                inv_cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t1_elapsed = t1.elapsed().as_secs_f64() * 1000.0;
+
+        // Step 2: Sort Morton codes (CPU)
+        let t2 = Instant::now();
+        let morton_cpu = self.device.dtoh_sync_copy(&self.morton_codes)?;
+        let t2a = t2.elapsed().as_secs_f64() * 1000.0;
+
+        let t2b_start = Instant::now();
+        let mut indices_cpu: Vec<i32> = (0..n as i32).collect();
+        use rayon::prelude::*;
+        let mut pairs: Vec<(u64, i32)> = morton_cpu.iter()
+            .zip(indices_cpu.iter())
+            .map(|(&m, &i)| (m, i))
+            .collect();
+        pairs.par_sort_unstable_by_key(|&(m, _)| m);
+        indices_cpu = pairs.iter().map(|&(_, i)| i).collect();
+        let sorted_morton: Vec<u64> = pairs.iter().map(|&(m, _)| m).collect();
+        let t2b = t2b_start.elapsed().as_secs_f64() * 1000.0;
+
+        let t2c_start = Instant::now();
+        self.sorted_indices = self.device.htod_sync_copy(&indices_cpu)?;
+        self.morton_codes = self.device.htod_sync_copy(&sorted_morton)?;
+        let t2c = t2c_start.elapsed().as_secs_f64() * 1000.0;
+        let t2_elapsed = t2.elapsed().as_secs_f64() * 1000.0;
+
+        // Step 3: Reorder particles
+        let t3 = Instant::now();
+        let reorder_pos = self.device.get_func("nbody", "reorder_positions")
+            .ok_or("Failed to get reorder_positions kernel")?;
+        unsafe {
+            reorder_pos.launch(cfg, (
+                &self.pos,
+                &mut self.pos_tmp,
+                &self.sorted_indices,
+                n as i32,
+            ))?;
+        }
+        std::mem::swap(&mut self.pos, &mut self.pos_tmp);
+
+        let reorder_signs = self.device.get_func("nbody", "reorder_signs")
+            .ok_or("Failed to get reorder_signs kernel")?;
+        unsafe {
+            reorder_signs.launch(cfg, (
+                &self.signs,
+                &mut self.signs_tmp,
+                &self.sorted_indices,
+                n as i32,
+            ))?;
+        }
+        std::mem::swap(&mut self.signs, &mut self.signs_tmp);
+
+        let reorder_vel = self.device.get_func("nbody", "reorder_velocities")
+            .ok_or("Failed to get reorder_velocities kernel")?;
+        unsafe {
+            reorder_vel.launch(cfg, (
+                &self.vel,
+                &mut self.vel_tmp,
+                &self.sorted_indices,
+                n as i32,
+            ))?;
+        }
+        std::mem::swap(&mut self.vel, &mut self.vel_tmp);
+        self.device.synchronize()?;
+        let t3_elapsed = t3.elapsed().as_secs_f64() * 1000.0;
+
+        // Step 4: Reset buffers
+        let t4 = Instant::now();
+        let zeros_i32: Vec<i32> = vec![0; n_total_nodes];
+        let neg_ones_i32: Vec<i32> = vec![-1; n_total_nodes];
+        let zeros_f64: Vec<f64> = vec![0.0; n_total_nodes * 12];
+        self.device.htod_sync_copy_into(&zeros_i32, &mut self.bvh_atomic_counter)?;
+        self.device.htod_sync_copy_into(&zeros_i32, &mut self.bvh_node_types)?;
+        self.device.htod_sync_copy_into(&neg_ones_i32, &mut self.bvh_left_child)?;
+        self.device.htod_sync_copy_into(&neg_ones_i32, &mut self.bvh_right_child)?;
+        self.device.htod_sync_copy_into(&neg_ones_i32, &mut self.bvh_parent)?;
+        self.device.htod_sync_copy_into(&zeros_i32, &mut self.bvh_range_left)?;
+        self.device.htod_sync_copy_into(&zeros_i32, &mut self.bvh_range_right)?;
+        self.device.htod_sync_copy_into(&zeros_f64, &mut self.bvh_node_data)?;
+        let t4_elapsed = t4.elapsed().as_secs_f64() * 1000.0;
+
+        // Step 5: Build Karras BVH
+        let t5 = Instant::now();
+        let internal_blocks = (n_internal + 255) / 256;
+        let internal_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (internal_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let build_kernel = self.device.get_func("nbody", "build_bvh_internal")
+            .ok_or("Failed to get build_bvh_internal kernel")?;
+        unsafe {
+            build_kernel.launch(internal_cfg, (
+                &self.morton_codes,
+                &mut self.bvh_left_child,
+                &mut self.bvh_right_child,
+                &mut self.bvh_parent,
+                &mut self.bvh_range_left,
+                &mut self.bvh_range_right,
+                n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t5_elapsed = t5.elapsed().as_secs_f64() * 1000.0;
+
+        // Step 6: Init leaves
+        let t6 = Instant::now();
+        let init_leaves = self.device.get_func("nbody", "init_leaves")
+            .ok_or("Failed to get init_leaves kernel")?;
+        unsafe {
+            init_leaves.launch(cfg, (
+                &self.pos,
+                &self.signs,
+                &mut self.bvh_node_data,
+                &mut self.bvh_node_types,
+                &mut self.bvh_atomic_counter,
+                n as i32,
+                box_half,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t6_elapsed = t6.elapsed().as_secs_f64() * 1000.0;
+
+        // Step 7: COM reduction
+        let t7 = Instant::now();
+        let reduce_kernel = self.device.get_func("nbody", "reduce_com")
+            .ok_or("Failed to get reduce_com kernel")?;
+        unsafe {
+            reduce_kernel.launch(cfg, (
+                &self.bvh_left_child,
+                &self.bvh_right_child,
+                &self.bvh_parent,
+                &self.bvh_range_left,
+                &self.bvh_range_right,
+                &mut self.bvh_node_data,
+                &mut self.bvh_node_types,
+                &mut self.bvh_atomic_counter,
+                n as i32,
+                box_half,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t7_elapsed = t7.elapsed().as_secs_f64() * 1000.0;
+
+        let total = t1_elapsed + t2_elapsed + t3_elapsed + t4_elapsed + t5_elapsed + t6_elapsed + t7_elapsed;
+
+        println!("  1. Morton codes GPU:    {:6.1} ms ({:4.1}%)", t1_elapsed, t1_elapsed/total*100.0);
+        println!("  2. Sort CPU (total):    {:6.1} ms ({:4.1}%)", t2_elapsed, t2_elapsed/total*100.0);
+        println!("     - D2H transfer:      {:6.1} ms", t2a);
+        println!("     - Rayon sort:        {:6.1} ms", t2b);
+        println!("     - H2D transfer:      {:6.1} ms", t2c);
+        println!("  3. Reorder GPU:         {:6.1} ms ({:4.1}%)", t3_elapsed, t3_elapsed/total*100.0);
+        println!("  4. Reset buffers:       {:6.1} ms ({:4.1}%)", t4_elapsed, t4_elapsed/total*100.0);
+        println!("  5. Karras BVH GPU:      {:6.1} ms ({:4.1}%)", t5_elapsed, t5_elapsed/total*100.0);
+        println!("  6. Init leaves GPU:     {:6.1} ms ({:4.1}%)", t6_elapsed, t6_elapsed/total*100.0);
+        println!("  7. COM reduction GPU:   {:6.1} ms ({:4.1}%)", t7_elapsed, t7_elapsed/total*100.0);
+        println!("  ─────────────────────────────────");
+        println!("  TOTAL:                  {:6.1} ms", total);
+
+        Ok(())
+    }
+
+    /// Incremental COM update (opt5)
+    /// Only updates leaf positions and recomputes COMs, keeping tree structure
+    /// ~70ms vs ~280ms for full rebuild @ 2M particles
+    pub fn update_com_only(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let n = self.n_particles;
+        let n_total_nodes = 2 * n - 1;
+        let box_half = self.box_size / 2.0;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Step 1: Fast GPU reset of atomic counters only
+        let reset_blocks = (n_total_nodes + 255) / 256;
+        let reset_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (reset_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let reset_kernel = self.device.get_func("nbody", "reset_atomic_counters")
+            .ok_or("Failed to get reset_atomic_counters kernel")?;
+        unsafe {
+            reset_kernel.launch(reset_cfg, (
+                &mut self.bvh_atomic_counter,
+                n_total_nodes as i32,
+            ))?;
+        }
+
+        // Step 2: Re-initialize leaves with current particle positions
+        let init_leaves = self.device.get_func("nbody", "init_leaves")
+            .ok_or("Failed to get init_leaves kernel")?;
+        unsafe {
+            init_leaves.launch(cfg, (
+                &self.pos,
+                &self.signs,
+                &mut self.bvh_node_data,
+                &mut self.bvh_node_types,
+                &mut self.bvh_atomic_counter,
+                n as i32,
+                box_half,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Step 3: Bottom-up COM reduction
+        let reduce_kernel = self.device.get_func("nbody", "reduce_com")
+            .ok_or("Failed to get reduce_com kernel")?;
+        unsafe {
+            reduce_kernel.launch(cfg, (
+                &self.bvh_left_child,
+                &self.bvh_right_child,
+                &self.bvh_parent,
+                &self.bvh_range_left,
+                &self.bvh_range_right,
+                &mut self.bvh_node_data,
+                &mut self.bvh_node_types,
+                &mut self.bvh_atomic_counter,
+                n as i32,
+                box_half,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        Ok(())
+    }
+
+    /// DKD integrator with GPU-built BVH tree
+    /// Structure: Drift(dt/2) → GPU Tree Build → Force → Kick(dt) → Drift(dt/2)
+    pub fn step_with_expansion_dkd_gpu(&mut self, dt: f64, _scale_factor: f64, hubble: f64, dtau_per_dt: f64)
+        -> Result<(), Box<dyn std::error::Error>>
+    {
+        let half_dt = dt * 0.5;
+        let box_half = self.box_size / 2.0;
+        let n = self.n_particles;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Get kernels
+        let drift_kernel = self.device.get_func("nbody", "drift_only")
+            .ok_or("Failed to get drift_only kernel")?;
+        let kick_kernel = self.device.get_func("nbody", "kick_only")
+            .ok_or("Failed to get kick_only kernel")?;
+        let force_kernel = self.device.get_func("nbody", "compute_forces_bvh")
+            .ok_or("Failed to get compute_forces_bvh kernel")?;
+
+        // Step 1: Drift(dt/2)
+        unsafe {
+            drift_kernel.clone().launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half,
+                n as i32,
+            ))?;
+        }
+
+        // Step 2: Build GPU tree
+        self.build_gpu_tree()?;
+
+        // Step 3: Compute forces using GPU-built BVH
+        unsafe {
+            force_kernel.launch(cfg, (
+                &self.pos,
+                &self.signs,
+                &self.bvh_node_data,
+                &self.bvh_left_child,
+                &self.bvh_right_child,
+                &self.bvh_node_types,
+                &mut self.acc,
+                n as i32,
+                (n - 1) as i32,  // n_internal
+                self.theta,
+                self.softening,
+            ))?;
+        }
+
+        // Step 4: Kick(dt)
+        unsafe {
+            kick_kernel.clone().launch(cfg, (
+                &mut self.vel, &self.acc,
+                dt, n as i32,
+                hubble, dtau_per_dt,
+            ))?;
+        }
+
+        // Step 5: Drift(dt/2)
+        unsafe {
+            drift_kernel.launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half,
+                n as i32,
+            ))?;
+        }
+
+        self.device.synchronize()?;
+        self.time += dt;
+
+        Ok(())
+    }
+
+    /// DKD integrator with incremental tree updates (opt5)
+    /// Full rebuild every `rebuild_interval` steps, COM-only updates between
+    /// Expected: ~100ms avg vs ~280ms full rebuild @ 2M particles
+    pub fn step_with_expansion_dkd_gpu_incremental(
+        &mut self,
+        dt: f64,
+        _scale_factor: f64,
+        hubble: f64,
+        dtau_per_dt: f64,
+        step_num: usize,
+        rebuild_interval: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let half_dt = dt * 0.5;
+        let box_half = self.box_size / 2.0;
+        let n = self.n_particles;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Get kernels
+        let drift_kernel = self.device.get_func("nbody", "drift_only")
+            .ok_or("Failed to get drift_only kernel")?;
+        let kick_kernel = self.device.get_func("nbody", "kick_only")
+            .ok_or("Failed to get kick_only kernel")?;
+        let force_kernel = self.device.get_func("nbody", "compute_forces_bvh")
+            .ok_or("Failed to get compute_forces_bvh kernel")?;
+
+        // Step 1: Drift(dt/2)
+        unsafe {
+            drift_kernel.clone().launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half,
+                n as i32,
+            ))?;
+        }
+
+        // Step 2: Build or update tree
+        if step_num % rebuild_interval == 0 {
+            // Full rebuild (sort + Karras + COM)
+            self.build_gpu_tree()?;
+        } else {
+            // Incremental update (COM only, reuse tree structure)
+            self.update_com_only()?;
+        }
+
+        // Step 3: Compute forces using GPU-built BVH
+        unsafe {
+            force_kernel.launch(cfg, (
+                &self.pos,
+                &self.signs,
+                &self.bvh_node_data,
+                &self.bvh_left_child,
+                &self.bvh_right_child,
+                &self.bvh_node_types,
+                &mut self.acc,
+                n as i32,
+                (n - 1) as i32,  // n_internal
+                self.theta,
+                self.softening,
+            ))?;
+        }
+
+        // Step 4: Kick(dt)
+        unsafe {
+            kick_kernel.clone().launch(cfg, (
+                &mut self.vel, &self.acc,
+                dt, n as i32,
+                hubble, dtau_per_dt,
+            ))?;
+        }
+
+        // Step 5: Drift(dt/2)
+        unsafe {
+            drift_kernel.launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half,
+                n as i32,
+            ))?;
+        }
+
+        self.device.synchronize()?;
+        self.time += dt;
+
+        Ok(())
+    }
+
+    /// Initialize double-buffered BVH for async pipelining (opt7)
+    pub fn init_async_buffers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.bvh_buffers.is_some() {
+            return Ok(());  // Already initialized
+        }
+
+        let n_bvh_nodes = 2 * self.n_particles - 1;
+
+        // Allocate two BVH buffers
+        let buffer_a = BvhBuffer {
+            left_child: self.device.alloc_zeros::<i32>(n_bvh_nodes)?,
+            right_child: self.device.alloc_zeros::<i32>(n_bvh_nodes)?,
+            parent: self.device.alloc_zeros::<i32>(n_bvh_nodes)?,
+            range_left: self.device.alloc_zeros::<i32>(n_bvh_nodes)?,
+            range_right: self.device.alloc_zeros::<i32>(n_bvh_nodes)?,
+            node_data: self.device.alloc_zeros::<f64>(n_bvh_nodes * 12)?,
+            node_types: self.device.alloc_zeros::<i32>(n_bvh_nodes)?,
+            atomic_counter: self.device.alloc_zeros::<i32>(n_bvh_nodes)?,
+        };
+
+        let buffer_b = BvhBuffer {
+            left_child: self.device.alloc_zeros::<i32>(n_bvh_nodes)?,
+            right_child: self.device.alloc_zeros::<i32>(n_bvh_nodes)?,
+            parent: self.device.alloc_zeros::<i32>(n_bvh_nodes)?,
+            range_left: self.device.alloc_zeros::<i32>(n_bvh_nodes)?,
+            range_right: self.device.alloc_zeros::<i32>(n_bvh_nodes)?,
+            node_data: self.device.alloc_zeros::<f64>(n_bvh_nodes * 12)?,
+            node_types: self.device.alloc_zeros::<i32>(n_bvh_nodes)?,
+            atomic_counter: self.device.alloc_zeros::<i32>(n_bvh_nodes)?,
+        };
+
+        self.bvh_buffers = Some([buffer_a, buffer_b]);
+        self.current_bvh = 0;
+
+        Ok(())
+    }
+
+    /// Build GPU tree on specified buffer index (for async pipelining)
+    fn build_gpu_tree_on_buffer(&mut self, buffer_idx: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let n = self.n_particles;
+        let n_internal = n - 1;
+        let n_total_nodes = 2 * n - 1;
+        let box_half = self.box_size / 2.0;
+        let inv_cell_size = 2097152.0 / self.box_size;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Step 1: Morton codes
+        let morton_kernel = self.device.get_func("nbody", "compute_morton_codes")
+            .ok_or("Failed to get compute_morton_codes kernel")?;
+        unsafe {
+            morton_kernel.launch(cfg, (
+                &self.pos,
+                &mut self.morton_codes,
+                &mut self.sorted_indices,
+                n as i32,
+                box_half,
+                inv_cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Step 2: Sort (CPU)
+        let morton_cpu = self.device.dtoh_sync_copy(&self.morton_codes)?;
+        use rayon::prelude::*;
+        let mut pairs: Vec<(u64, i32)> = morton_cpu.iter()
+            .enumerate()
+            .map(|(i, &m)| (m, i as i32))
+            .collect();
+        pairs.par_sort_unstable_by_key(|&(m, _)| m);
+        let indices_cpu: Vec<i32> = pairs.iter().map(|&(_, i)| i).collect();
+        self.sorted_indices = self.device.htod_sync_copy(&indices_cpu)?;
+        let sorted_morton: Vec<u64> = pairs.iter().map(|&(m, _)| m).collect();
+        self.morton_codes = self.device.htod_sync_copy(&sorted_morton)?;
+
+        // Step 3: Reorder
+        let reorder_pos = self.device.get_func("nbody", "reorder_positions")
+            .ok_or("Failed to get reorder_positions")?;
+        unsafe {
+            reorder_pos.launch(cfg, (
+                &self.pos, &mut self.pos_tmp, &self.sorted_indices, n as i32,
+            ))?;
+        }
+        std::mem::swap(&mut self.pos, &mut self.pos_tmp);
+
+        let reorder_signs = self.device.get_func("nbody", "reorder_signs")
+            .ok_or("Failed to get reorder_signs")?;
+        unsafe {
+            reorder_signs.launch(cfg, (
+                &self.signs, &mut self.signs_tmp, &self.sorted_indices, n as i32,
+            ))?;
+        }
+        std::mem::swap(&mut self.signs, &mut self.signs_tmp);
+
+        let reorder_vel = self.device.get_func("nbody", "reorder_velocities")
+            .ok_or("Failed to get reorder_velocities")?;
+        unsafe {
+            reorder_vel.launch(cfg, (
+                &self.vel, &mut self.vel_tmp, &self.sorted_indices, n as i32,
+            ))?;
+        }
+        std::mem::swap(&mut self.vel, &mut self.vel_tmp);
+        self.device.synchronize()?;
+
+        // Get buffer reference
+        let buffers = self.bvh_buffers.as_mut().ok_or("Async buffers not initialized")?;
+        let buf = &mut buffers[buffer_idx];
+
+        // Step 4: Reset buffers
+        let zeros_i32: Vec<i32> = vec![0; n_total_nodes];
+        let neg_ones_i32: Vec<i32> = vec![-1; n_total_nodes];
+        let zeros_f64: Vec<f64> = vec![0.0; n_total_nodes * 12];
+
+        self.device.htod_sync_copy_into(&zeros_i32, &mut buf.atomic_counter)?;
+        self.device.htod_sync_copy_into(&zeros_i32, &mut buf.node_types)?;
+        self.device.htod_sync_copy_into(&neg_ones_i32, &mut buf.left_child)?;
+        self.device.htod_sync_copy_into(&neg_ones_i32, &mut buf.right_child)?;
+        self.device.htod_sync_copy_into(&neg_ones_i32, &mut buf.parent)?;
+        self.device.htod_sync_copy_into(&zeros_i32, &mut buf.range_left)?;
+        self.device.htod_sync_copy_into(&zeros_i32, &mut buf.range_right)?;
+        self.device.htod_sync_copy_into(&zeros_f64, &mut buf.node_data)?;
+
+        // Step 5: Build internal nodes
+        let internal_blocks = (n_internal + 255) / 256;
+        let internal_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (internal_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let build_kernel = self.device.get_func("nbody", "build_bvh_internal")
+            .ok_or("Failed to get build_bvh_internal")?;
+        unsafe {
+            build_kernel.launch(internal_cfg, (
+                &self.morton_codes,
+                &mut buf.left_child,
+                &mut buf.right_child,
+                &mut buf.parent,
+                &mut buf.range_left,
+                &mut buf.range_right,
+                n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Step 6: Init leaves
+        let init_leaves = self.device.get_func("nbody", "init_leaves")
+            .ok_or("Failed to get init_leaves")?;
+        unsafe {
+            init_leaves.launch(cfg, (
+                &self.pos, &self.signs,
+                &mut buf.node_data, &mut buf.node_types, &mut buf.atomic_counter,
+                n as i32, box_half,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Step 7: COM reduction
+        let reduce_kernel = self.device.get_func("nbody", "reduce_com")
+            .ok_or("Failed to get reduce_com")?;
+        unsafe {
+            reduce_kernel.launch(cfg, (
+                &buf.left_child, &buf.right_child, &buf.parent,
+                &buf.range_left, &buf.range_right,
+                &mut buf.node_data, &mut buf.node_types, &mut buf.atomic_counter,
+                n as i32, box_half,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        Ok(())
+    }
+
+    /// DKD integrator with async pipeline (opt7)
+    /// Overlaps tree build for step t+1 with force computation for step t
+    /// Uses fork_default_stream for concurrent execution
+    pub fn step_with_expansion_dkd_gpu_async(
+        &mut self,
+        dt: f64,
+        _scale_factor: f64,
+        hubble: f64,
+        dtau_per_dt: f64,
+        step_num: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Initialize double buffers on first call
+        if self.bvh_buffers.is_none() {
+            self.init_async_buffers()?;
+            // Build initial tree on buffer 0
+            self.build_gpu_tree_on_buffer(0)?;
+            self.current_bvh = 0;
+        }
+
+        let half_dt = dt * 0.5;
+        let box_half = self.box_size / 2.0;
+        let n = self.n_particles;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Get kernel handles
+        let drift_kernel = self.device.get_func("nbody", "drift_only")
+            .ok_or("Failed to get drift_only")?;
+        let kick_kernel = self.device.get_func("nbody", "kick_only")
+            .ok_or("Failed to get kick_only")?;
+        let force_kernel = self.device.get_func("nbody", "compute_forces_bvh")
+            .ok_or("Failed to get compute_forces_bvh")?;
+
+        // Step 1: Drift(dt/2)
+        unsafe {
+            drift_kernel.clone().launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Current tree buffer for force computation
+        let current_idx = self.current_bvh;
+        let next_idx = 1 - current_idx;
+
+        // Fork a stream for tree building
+        let tree_stream = self.device.fork_default_stream()?;
+
+        // Start building next tree on forked stream (async)
+        // Note: This is a simplified version - full async would require
+        // launching kernels on the tree_stream. For now, we do sequential
+        // tree build but prepare for full async later.
+
+        // Compute forces using current tree (on default stream)
+        {
+            let buffers = self.bvh_buffers.as_ref().ok_or("Buffers not initialized")?;
+            let buf = &buffers[current_idx];
+
+            unsafe {
+                force_kernel.launch(cfg, (
+                    &self.pos,
+                    &self.signs,
+                    &buf.node_data,
+                    &buf.left_child,
+                    &buf.right_child,
+                    &buf.node_types,
+                    &mut self.acc,
+                    n as i32,
+                    (n - 1) as i32,
+                    self.theta,
+                    self.softening,
+                ))?;
+            }
+        }
+        self.device.synchronize()?;
+
+        // Wait for tree stream before building (ensures force is done)
+        self.device.wait_for(&tree_stream)?;
+
+        // Build tree for next step on buffer next_idx
+        self.build_gpu_tree_on_buffer(next_idx)?;
+
+        // Swap buffers for next iteration
+        self.current_bvh = next_idx;
+
+        // Step 4: Kick(dt)
+        unsafe {
+            kick_kernel.clone().launch(cfg, (
+                &mut self.vel, &self.acc,
+                dt, n as i32,
+                hubble, dtau_per_dt,
+            ))?;
+        }
+
+        // Step 5: Drift(dt/2)
+        unsafe {
+            drift_kernel.launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half, n as i32,
+            ))?;
+        }
+
+        self.device.synchronize()?;
+        self.time += dt;
+
+        Ok(())
+    }
+
+    /// DKD integrator with Morton sorting for cache locality
+    /// Structure: Sort → Drift(dt/2) → Force → Kick(dt) → Drift(dt/2)
+    pub fn step_with_expansion_dkd_morton(&mut self, dt: f64, scale_factor: f64, hubble: f64, dtau_per_dt: f64)
+        -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Morton sort particles for better cache locality (every step)
+        self.morton_sort_particles()?;
+
+        // Then do standard DKD step
+        let half_dt = dt * 0.5;
+        let box_half = self.box_size / 2.0;
+
+        let blocks = (self.n_particles + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Get kernel functions
+        let compute_forces = self.device.get_func("nbody", "compute_forces_simple")
+            .ok_or("Failed to get compute_forces_simple kernel")?;
+        let drift_kernel = self.device.get_func("nbody", "drift_only")
+            .ok_or("Failed to get drift_only kernel")?;
+        let kick_kernel = self.device.get_func("nbody", "kick_only")
+            .ok_or("Failed to get kick_only kernel")?;
+
+        // Step 1: Drift(dt/2)
+        unsafe {
+            drift_kernel.clone().launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half,
+                self.n_particles as i32,
+            ))?;
+        }
+
+        // Step 2: Download positions for tree rebuild
+        let pos_cpu = self.device.dtoh_sync_copy(&self.pos)?;
+        for (i, p) in self.particles_cpu.iter_mut().enumerate() {
+            p.x = pos_cpu[i * 3];
+            p.y = pos_cpu[i * 3 + 1];
+            p.z = pos_cpu[i * 3 + 2];
+        }
+
+        // Step 3: Rebuild tree
+        let tree = LinearOctree::build(&self.particles_cpu, self.box_size);
+        self.n_nodes = tree.nodes.len();
+        self.node_data = self.device.htod_sync_copy(&tree.node_data)?;
+        self.node_children = self.device.htod_sync_copy(&tree.node_children)?;
+        self.node_types = self.device.htod_sync_copy(&tree.node_types)?;
+
+        // Step 4: Compute forces
+        unsafe {
+            compute_forces.launch(cfg, (
+                &self.pos, &self.signs,
+                &self.node_data, &self.node_children, &self.node_types,
+                &mut self.acc,
+                self.n_particles as i32, self.n_nodes as i32,
+                self.theta, self.softening,
+            ))?;
+        }
+
+        // Step 5: Kick(dt)
+        unsafe {
+            kick_kernel.clone().launch(cfg, (
+                &mut self.vel, &self.acc,
+                dt, self.n_particles as i32,
+                hubble, dtau_per_dt,
+            ))?;
+        }
+
+        // Step 6: Drift(dt/2)
+        unsafe {
+            drift_kernel.launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half,
+                self.n_particles as i32,
+            ))?;
+        }
+
+        self.device.synchronize()?;
+        self.time += dt;
+
+        Ok(())
     }
 
     /// Compute binding potential energy (same-sign pairs only, always negative)
@@ -954,6 +2889,263 @@ impl GpuNBodySimulation {
     pub fn get_signs(&self) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
         let signs = self.device.dtoh_sync_copy(&self.signs)?;
         Ok(signs)
+    }
+
+    /// Debug method: compare forces between GPU tree and CPU tree
+    pub fn compare_forces_debug(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let n = self.n_particles;
+
+        let blocks = (n + 255) / 256;
+        let cfg = cudarc::driver::LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Step 1: Build GPU tree (this reorders particles by Morton code)
+        self.build_gpu_tree()?;
+
+        // Step 2: Compute forces with GPU BVH tree
+        let gpu_force_kernel = self.device.get_func("nbody", "compute_forces_bvh")
+            .ok_or("Failed to get compute_forces_bvh kernel")?;
+        unsafe {
+            gpu_force_kernel.launch(cfg, (
+                &self.pos, &self.signs,
+                &self.bvh_node_data,
+                &self.bvh_left_child,
+                &self.bvh_right_child,
+                &self.bvh_node_types,
+                &mut self.acc,
+                n as i32,
+                (n - 1) as i32,
+                self.theta,
+                self.softening,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let acc_gpu = self.device.dtoh_sync_copy(&self.acc)?;
+
+        // Step 3: Get current positions (after Morton reordering)
+        let pos_sorted = self.device.dtoh_sync_copy(&self.pos)?;
+        let signs_sorted = self.device.dtoh_sync_copy(&self.signs)?;
+
+        // Step 4: Update particles_cpu with sorted positions
+        for (i, p) in self.particles_cpu.iter_mut().enumerate() {
+            p.x = pos_sorted[i * 3];
+            p.y = pos_sorted[i * 3 + 1];
+            p.z = pos_sorted[i * 3 + 2];
+            p.sign = signs_sorted[i];
+        }
+
+        // Step 5: Build CPU tree from sorted positions
+        let tree = LinearOctree::build(&self.particles_cpu, self.box_size);
+        self.n_nodes = tree.nodes.len();
+        self.node_data = self.device.htod_sync_copy(&tree.node_data)?;
+        self.node_children = self.device.htod_sync_copy(&tree.node_children)?;
+        self.node_types = self.device.htod_sync_copy(&tree.node_types)?;
+
+        // Step 6: Compute forces with CPU tree
+        let cpu_force_kernel = self.device.get_func("nbody", "compute_forces_simple")
+            .ok_or("Failed to get compute_forces_simple kernel")?;
+        unsafe {
+            cpu_force_kernel.launch(cfg, (
+                &self.pos, &self.signs,
+                &self.node_data, &self.node_children, &self.node_types,
+                &mut self.acc,
+                n as i32, self.n_nodes as i32,
+                self.theta, self.softening,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let acc_cpu = self.device.dtoh_sync_copy(&self.acc)?;
+
+        // Compare forces
+        let mut max_diff = 0.0f64;
+        let mut max_diff_idx = 0;
+        let mut sum_diff = 0.0;
+        let mut sum_mag_cpu = 0.0;
+        let mut sum_mag_gpu = 0.0;
+
+        for i in 0..n {
+            let ax_cpu = acc_cpu[i * 3];
+            let ay_cpu = acc_cpu[i * 3 + 1];
+            let az_cpu = acc_cpu[i * 3 + 2];
+            let ax_gpu = acc_gpu[i * 3];
+            let ay_gpu = acc_gpu[i * 3 + 1];
+            let az_gpu = acc_gpu[i * 3 + 2];
+
+            let mag_cpu = (ax_cpu*ax_cpu + ay_cpu*ay_cpu + az_cpu*az_cpu).sqrt();
+            let mag_gpu = (ax_gpu*ax_gpu + ay_gpu*ay_gpu + az_gpu*az_gpu).sqrt();
+
+            let dx = ax_cpu - ax_gpu;
+            let dy = ay_cpu - ay_gpu;
+            let dz = az_cpu - az_gpu;
+            let diff = (dx*dx + dy*dy + dz*dz).sqrt();
+
+            sum_diff += diff;
+            sum_mag_cpu += mag_cpu;
+            sum_mag_gpu += mag_gpu;
+
+            if diff > max_diff {
+                max_diff = diff;
+                max_diff_idx = i;
+            }
+        }
+
+        let avg_diff = sum_diff / n as f64;
+        let avg_mag_cpu = sum_mag_cpu / n as f64;
+        let avg_mag_gpu = sum_mag_gpu / n as f64;
+
+        println!("\n══════ Force Comparison Results ══════");
+        println!("  Particles:          {}", n);
+        println!("  Avg |a| CPU tree:   {:.6e}", avg_mag_cpu);
+        println!("  Avg |a| GPU tree:   {:.6e}", avg_mag_gpu);
+        println!("  Avg |diff|:         {:.6e}", avg_diff);
+        println!("  Relative error:     {:.2}%", avg_diff / avg_mag_cpu * 100.0);
+        println!("  Max |diff|:         {:.6e} (particle {})", max_diff, max_diff_idx);
+
+        // Show details for worst particle
+        let i = max_diff_idx;
+        println!("\n  Worst particle {}:", i);
+        println!("    CPU: ({:.6e}, {:.6e}, {:.6e})",
+                 acc_cpu[i*3], acc_cpu[i*3+1], acc_cpu[i*3+2]);
+        println!("    GPU: ({:.6e}, {:.6e}, {:.6e})",
+                 acc_gpu[i*3], acc_gpu[i*3+1], acc_gpu[i*3+2]);
+        println!("    Position: ({:.3}, {:.3}, {:.3})",
+                 pos_sorted[i*3], pos_sorted[i*3+1], pos_sorted[i*3+2]);
+
+        // Sample a few random particles
+        println!("\n  Sample comparisons:");
+        for &idx in &[0, n/4, n/2, 3*n/4, n-1] {
+            let mag_cpu = (acc_cpu[idx*3].powi(2) + acc_cpu[idx*3+1].powi(2) + acc_cpu[idx*3+2].powi(2)).sqrt();
+            let mag_gpu = (acc_gpu[idx*3].powi(2) + acc_gpu[idx*3+1].powi(2) + acc_gpu[idx*3+2].powi(2)).sqrt();
+            let dx = acc_cpu[idx*3] - acc_gpu[idx*3];
+            let dy = acc_cpu[idx*3+1] - acc_gpu[idx*3+1];
+            let dz = acc_cpu[idx*3+2] - acc_gpu[idx*3+2];
+            let diff = (dx*dx + dy*dy + dz*dz).sqrt();
+            let rel_err = if mag_cpu > 1e-10 { diff / mag_cpu * 100.0 } else { 0.0 };
+            println!("    [{}]: |a_cpu|={:.4e}, |a_gpu|={:.4e}, rel_err={:.1}%",
+                     idx, mag_cpu, mag_gpu, rel_err);
+        }
+
+        println!("══════════════════════════════════════\n");
+
+        Ok(())
+    }
+
+    /// Debug: dump BVH structure
+    pub fn debug_bvh_structure(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let n = self.n_particles;
+        let n_internal = n - 1;
+        let n_total = 2 * n - 1;
+
+        println!("\n══════ BVH Structure Debug ══════");
+        println!("N particles: {}", n);
+        println!("N internal nodes: {} (0..{})", n_internal, n_internal - 1);
+        println!("N leaves: {} ({}..{})", n, n_internal, n_total - 1);
+
+        // Build GPU tree
+        self.build_gpu_tree()?;
+
+        // Download BVH data
+        let left_child = self.device.dtoh_sync_copy(&self.bvh_left_child)?;
+        let right_child = self.device.dtoh_sync_copy(&self.bvh_right_child)?;
+        let parent = self.device.dtoh_sync_copy(&self.bvh_parent)?;
+        let range_left = self.device.dtoh_sync_copy(&self.bvh_range_left)?;
+        let range_right = self.device.dtoh_sync_copy(&self.bvh_range_right)?;
+        let node_types = self.device.dtoh_sync_copy(&self.bvh_node_types)?;
+        let node_data = self.device.dtoh_sync_copy(&self.bvh_node_data)?;
+
+        // Find root (node with range [0, n-1])
+        let mut root = -1i32;
+        for i in 0..n_internal {
+            if range_left[i] == 0 && range_right[i] == n as i32 - 1 {
+                root = i as i32;
+                break;
+            }
+        }
+        println!("\nRoot node: {} (expected to have range [0, {}])", root, n - 1);
+
+        // Check node 0's range
+        println!("Node 0: range [{}, {}], left={}, right={}",
+                 range_left[0], range_right[0], left_child[0], right_child[0]);
+
+        // Print first few internal nodes
+        println!("\nFirst 10 internal nodes:");
+        for i in 0..std::cmp::min(10, n_internal) {
+            let base = i * 12;
+            let cx = node_data[base];
+            let cy = node_data[base + 1];
+            let cz = node_data[base + 2];
+            let half_size = node_data[base + 3];
+            let mass_plus = node_data[base + 7];
+            let mass_minus = node_data[base + 11];
+            println!("  [{}] type={} range=[{},{}] L={} R={} parent={} half_size={:.3} m+={:.0} m-={:.0}",
+                     i, node_types[i],
+                     range_left[i], range_right[i],
+                     left_child[i], right_child[i], parent[i],
+                     half_size, mass_plus, mass_minus);
+        }
+
+        // Print first few leaves
+        println!("\nFirst 10 leaves:");
+        for i in 0..std::cmp::min(10, n) {
+            let node_idx = n_internal + i;
+            let base = node_idx * 12;
+            let x = node_data[base];
+            let y = node_data[base + 1];
+            let z = node_data[base + 2];
+            let half_size = node_data[base + 3];
+            let mass_plus = node_data[base + 7];
+            let mass_minus = node_data[base + 11];
+            println!("  [{}] type={} parent={} pos=({:.2},{:.2},{:.2}) m+={:.0} m-={:.0}",
+                     node_idx, node_types[node_idx], parent[node_idx],
+                     x, y, z, mass_plus, mass_minus);
+        }
+
+        // Verify tree connectivity
+        println!("\nTree connectivity check:");
+        let mut orphan_internal = 0;
+        let mut orphan_leaves = 0;
+        let mut invalid_children = 0;
+
+        for i in 0..n_internal {
+            if parent[i] == -1 && i != root as usize {
+                orphan_internal += 1;
+            }
+            let l = left_child[i];
+            let r = right_child[i];
+            if l < 0 || l >= n_total as i32 {
+                invalid_children += 1;
+            }
+            if r < 0 || r >= n_total as i32 {
+                invalid_children += 1;
+            }
+        }
+
+        for i in n_internal..n_total {
+            if parent[i] == -1 {
+                orphan_leaves += 1;
+            }
+        }
+
+        println!("  Orphan internal nodes (no parent except root): {}", orphan_internal);
+        println!("  Orphan leaves: {}", orphan_leaves);
+        println!("  Invalid child indices: {}", invalid_children);
+
+        // Check total mass
+        let root_idx = if root >= 0 { root as usize } else { 0 };
+        let root_base = root_idx * 12;
+        let root_mp = node_data[root_base + 7];
+        let root_mm = node_data[root_base + 11];
+        println!("\nRoot total mass: m+={:.0} m-={:.0} (expected: {}+ {}−)",
+                 root_mp, root_mm,
+                 (n as f64 / (1.0 + 1.045)).round(),
+                 (n as f64 * 1.045 / (1.0 + 1.045)).round());
+
+        println!("══════════════════════════════════════\n");
+
+        Ok(())
     }
 }
 

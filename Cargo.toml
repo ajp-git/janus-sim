@@ -29,6 +29,66 @@ path = "src/bin/nbody_gpu_10m.rs"
 name = "nbody_gpu_prod"
 path = "src/bin/nbody_gpu_prod.rs"
 
+[[bin]]
+name = "test_gpu_tree"
+path = "src/bin/test_gpu_tree.rs"
+
+[[bin]]
+name = "compare_gpu_kdk"
+path = "src/bin/compare_gpu_kdk.rs"
+
+[[bin]]
+name = "compare_forces"
+path = "src/bin/compare_forces.rs"
+
+[[bin]]
+name = "debug_bvh"
+path = "src/bin/debug_bvh.rs"
+
+[[bin]]
+name = "profile_tree"
+path = "src/bin/profile_tree.rs"
+
+[[bin]]
+name = "test_incremental"
+path = "src/bin/test_incremental.rs"
+
+[[bin]]
+name = "profile_step"
+path = "src/bin/profile_step.rs"
+
+[[bin]]
+name = "test_async"
+path = "src/bin/test_async.rs"
+
+[[bin]]
+name = "profile_full_step"
+path = "src/bin/profile_full_step.rs"
+
+[[bin]]
+name = "profile_force"
+path = "src/bin/profile_force.rs"
+
+[[bin]]
+name = "compare_force_methods"
+path = "src/bin/compare_force_methods.rs"
+
+[[bin]]
+name = "test_virial_perf"
+path = "src/bin/test_virial_perf.rs"
+
+[[bin]]
+name = "test_theta"
+path = "src/bin/test_theta.rs"
+
+[[bin]]
+name = "test_theta_2m"
+path = "src/bin/test_theta_2m.rs"
+
+[[bin]]
+name = "final_benchmark"
+path = "src/bin/final_benchmark.rs"
+
 [lib]
 name = "janus"
 path = "src/lib.rs"

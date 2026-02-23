@@ -163,7 +163,8 @@ fn main() {
 
                     // Log cosmological params at key steps (moved after KE/Seg calculation below)
 
-                    if let Err(e) = gpu_sim.step_with_expansion(dt, a, h, dtau_per_dt) {
+                    // DKD integrator: 1 force calc per step (2x faster than KDK)
+                    if let Err(e) = gpu_sim.step_with_expansion_dkd(dt, a, h, dtau_per_dt) {
                         eprintln!("ERROR at step {}: {}", step, e);
                         stop_reason = Some(format!("Error: {}", e));
                         break;

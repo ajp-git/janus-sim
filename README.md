@@ -12,6 +12,7 @@ This project provides a full numerical validation pipeline for the Janus model:
 1. **Phase 1a** — Fit of 1590 Type Ia supernovae (Pantheon+ catalog) using the exact analytical formula from D'Agostini & Petit (2018)
 2. **Phase 1b** — CPU Barnes-Hut N-body simulation (1M particles, validated)
 3. **Phase 1c** — GPU CUDA Barnes-Hut N-body simulation with virialized initial conditions
+4. **Phase 2** — Filament formation analysis: linear theory + Yukawa screening tests
 
 The Janus model replaces dark matter and dark energy with a bimetric framework featuring two coupled metrics — one for positive masses, one for negative masses — with specific interaction rules in the Newtonian limit.
 
@@ -39,180 +40,178 @@ This eliminates the "runaway" problem present in earlier negative mass models (B
 
 ### Coupled Friedmann Equations
 
-From Petit & D'Agostini (2014), the acceleration equations are:
+From Petit & D'Agostini (2014):
 
 ```
 ä  = −1.5 · E / a²     (positive sector)
 ā̈  = +1.5 · E / ā²     (negative sector)
 ```
 
-where E = Ω₊ − Ω₋ is conserved (computed once at t=0).  
-When E < 0 (η > 1): positive sector accelerates, negative sector decelerates.
+where E = Ω₊ − Ω₋ is conserved. When E < 0 (η > 1): positive sector accelerates, negative sector decelerates.
 
 ---
 
 ## Phase 1a — Pantheon+ Fit Results
 
-**Dataset**: Pantheon+ SH0ES 2022 — 1590 Type Ia supernovae with full covariance matrix  
-**Method**: Exact analytical formula (D'Agostini & Petit 2018, eq.5):
+**Dataset**: 1590 Type Ia supernovae, Pantheon+ SH0ES 2022  
+**Formula** (D'Agostini & Petit 2018, eq. 5):
 
 ```
 μ = 5·log₁₀[z + z²·(1−q₀) / (1 + q₀·z + √(1 + 2·q₀·z))] + cst
 ```
 
-**Results**:
-
 | Parameter | Value | Note |
 |-----------|-------|------|
-| η (optimal) | **1.045** | Single free parameter |
+| η | **1.045** | Single free parameter |
 | q₀ | **−0.022 ± 0.015** | Near-flat acceleration |
-| χ²/dof | **0.914** | Excellent fit |
-| Dataset | Pantheon+ (1590 SNIa) | vs JLA (740 SNIa) in 2018 paper |
-
-**Comparison with D'Agostini & Petit (2018)**:
-
-| Paper | Dataset | N SNIa | q₀ | η |
-|-------|---------|--------|----|---|
-| D'Agostini 2018 | JLA | 740 | −0.087 | ~1.19 |
-| **This work** | **Pantheon+** | **1590** | **−0.022** | **1.045** |
-
-**4.4σ tension explained**: Lane et al. (2024) documented a ΛCDM calibration bias in the SALT2 parameters of Pantheon+. Since SALT2 standardization is performed assuming ΛCDM, any alternative model using these corrected magnitudes inherits a systematic offset. Our value η=1.045 is therefore a conservative lower bound.
+| χ²/dof | **0.607** | Excellent fit |
 
 ---
 
-## Phase 1b/1c — N-body Simulation
-
-### Algorithm
-
-- **Barnes-Hut** O(N log N) tree algorithm (Bédorf 2012 GPU implementation)
-- **Leapfrog integrator** (kick-drift-kick, symplectic)
-- **Plummer softening**: 1/(r² + ε²)^(3/2) for energy conservation
-- **Periodic boundary conditions** with minimum image convention
+## Phase 1c — N-body Simulation Results
 
 ### GPU Implementation
 
 | Feature | Detail |
 |---------|--------|
-| Language | Rust + CUDA (cudarc crate) |
+| Language | Rust + CUDA (cudarc) |
 | Precision | f64 throughout |
-| CPU/GPU validation | 0% difference (synchronized seeds) |
-| Tree structure | Linear octree (Bédorf-style) |
+| Tree | Linear octree, GPU Karras build |
 | Hardware | NVIDIA RTX 3060 12GB |
+| Speedup | **39.6×** vs CPU baseline |
 
-### Bugs Identified and Fixed
+**Performance** (RTX 3060, f64):
 
-During development, several critical bugs were identified and corrected:
+| N | θ | ms/step |
+|---|---|---------|
+| 2M | 0.7 | 2,370 |
+| 2M | 1.5 | 398 |
+| 8M | 1.5 | ~11,400 |
 
-| Bug | Root Cause | Impact |
-|-----|-----------|--------|
-| Wrong acceleration equations | Used local densities instead of conserved E | Incorrect Janus dynamics |
-| Analytical/numerical inconsistency | Mixed standard Friedmann H(z) with Janus accelerations | 0.4–0.8 mag systematic offset |
-| Particle-Mesh method failure | PM smooths short-range interactions | Zero segregation observed |
-| COM with periodic BC | Simple average ignores particle wrapping | Segregation metric invalid |
-| GPU rsqrt() in f64 | rsqrt() is float intrinsic — implicit promotion | Precision loss, CPU/GPU divergence |
-| Artificial initial segregation | Different reference particles for COM+ and COM− | Seg₀ ≈ 0.49 (150× overestimate) |
-| Virialization with total PE | Total PE > 0 for mixed Janus system | 2KE + PE = 0 impossible |
+### Production Runs
 
-### Key Insight: Janus Virialization
+| Run | N | θ | S_max | z(S_max) | Runtime |
+|-----|---|---|-------|----------|---------|
+| 500K | 500,000 | 0.7 | 0.513 | ~1.8 | 4h |
+| 2M | 2,000,000 | 0.7 | **0.694** | 1.8 | ~14h |
+| 8M | 8,000,000 | 1.5 | 0.459 | 2.07 | 3h |
 
-Standard virialization (2KE + PE_total = 0) fails for Janus systems because:
-- With η ≈ 1, repulsive +/− pairs dominate → PE_total > 0
-- KE_target = −PE_total/2 < 0 → impossible
+Spontaneous spatial segregation S_max = 0.694 at z=1.8 with 2M particles (+35% vs 500K).
 
-**Solution**: virialize using PE_binding (same-sign pairs only):
-```
-α = √(|PE_binding| / (2·KE))
-```
-PE_binding < 0 always (attractive interactions only), giving α ≈ 4.57 for our parameters.
-
-### Validation Results
-
-**Test: 500K particles, η=1.045, IC virialized**
-
-| Metric | Before fix | After fix |
-|--------|-----------|-----------|
-| Seg₀ | 0.49 (artificial) | 0.0024 ✅ |
-| KE/KE₀ at step 200 | ~50 | 1.0012 ✅ |
-| Segregation trend | −1.85% | +265% ✅ |
-| Virial error | N/A | 0.0000% ✅ |
-
-### Completed Run — Hubble Friction (2026-02-21)
-
-**Production run with cosmological expansion (z=5 → z=0):**
-
-| Parameter | Value |
-|-----------|-------|
-| N particles | 500,000 |
-| η | 1.045 |
-| Steps | 3,600 |
-| Runtime | 4h |
-| Initial KE | 3.44e8 |
-| Final KE | 2.07e9 |
-| **KE/KE₀** | **6.01** ✅ |
-| Initial Seg | 0.24% |
-| Final Seg | **14.5%** ✅ |
-
-**Key observations:**
-- KE increases due to gravitational collapse (structure formation)
-- Segregation grows from 0.24% to 14.5% — positive/negative mass separation
-- Hubble friction prevents runaway (KE/KE₀ stayed in range 0.1–20)
-- Oscillations observed: virialization dynamics as clusters form
+> Note: 8M run used θ=1.5 vs θ=0.7 for 2M — a matched comparison requires a θ=0.7 run at 8M.
 
 ---
 
-## Validation Framework
+## Phase 2 — Filament Formation Analysis
 
-All physics functions are tested before use. See `VALIDATION_RULES.md` for complete rules.
+### Problem Identified
 
-### Mandatory Tests
+All runs produce a **spherical blob** — not a cosmic filament network. Linear perturbation theory explains why.
 
-```rust
-// Segregation metric — trivial case
-// 4 particles+ at (10,0,0), 4 particles− at (−10,0,0) → distance = 20.0 exactly
+### Linear Theory
 
-// Periodic BC — minimum image convention
-// Particles at x=+49 and x=−49, box=100 → distance = 2, not 98
+Two-fluid coupling matrix with cross-repulsion α:
 
-// Janus forces — sign verification
-// Mass+ at origin, Mass− at (1,0,0) → repulsion (force toward −x)
+```
+M = [ ρ̄₊     −α·ρ̄₋ ]
+    [ −α·ρ̄₊   ρ̄₋   ]
 
-// Virialization — Janus mode
-// PE_binding < 0, virial error < 1% after rescaling
-
-// CosmoInterpolator — synchronization check
-// a(tau_start) = 1/(1+z_init), a(tau_end) = 1.0, H_end = √Ω₊
+λ₊ = ρ̄(1+α) > 0  →  segregation (blob)     ✅ observed
+λ₋ = ρ̄(1−α)      →  filament growth mode
 ```
 
-### Auto-Stop Conditions
+**With α=1 (current code): λ₋ = 0 exactly.**
 
-Simulations stop automatically if:
-- **KE/KE₀ > 50**: energy instability
-- **Segregation decreases for 500 consecutive steps**: unphysical behavior
+The filament mode is frozen — regardless of density asymmetry (ρ₋/ρ₊ = 2.23 for η=1.045), cosmological expansion H(t), or non-linear effects. This is a fundamental property of the α=1 model, not a numerical artifact.
+
+See `janus_linear_analysis.md` (769 lines, 22 sections) for the complete derivation, validated by 5 independent AI systems.
+
+### Experimental Validation — Anisotropic Mode Test
+
+Single-mode perturbation δ(x) = A·sin(kₓx):
+
+| Metric | Run A (α=0) | Run B (α=1) | Ratio |
+|--------|-------------|-------------|-------|
+| δk growth | +1047% | +262% | **4.0× suppressed** |
+| σx collapse | −7.35% | −3.35% | **2.2× suppressed** |
+
+α=1 suppresses ~75% of anisotropic growth. Consistent with λ₋ ≈ 0. The residual 25% growth comes from non-linear effects at A=10% amplitude.
+
+### Yukawa Screening Tests
+
+Proposed solution:
+
+```rust
+// Scale-dependent coupling — 3 lines in the CUDA kernel
+let alpha_r = 1.0 - epsilon * (-r / r_c).exp();
+let interaction = if sign_i == sign_j { 1.0 } else { -alpha_r };
+```
+
+This preserves Janus symmetry at large scales (r ≫ r_c) while restoring effective gravity at structural scales. Corresponds to a massive mediator — compatible with bimetric relativity.
+
+**Results** (6 parameter sets, N²-verified — not a Barnes-Hut artifact):
+
+| Run | ε | r_c | α(5 Mpc) | Δ vs Janus |
+|-----|---|-----|----------|------------|
+| C | 0.3 | 40 Mpc | 0.74 | ~0% |
+| D | 0.3 | 10 Mpc | 0.82 | ~0% |
+| E | 0.7 | 40 Mpc | 0.38 | ~0% |
+| F | 0.7 | 10 Mpc | 0.57 | ~0% |
+
+**Finding**: On a uniform grid, all ±pairs are at the same distance (~18 Mpc), so α(r) acts as a uniform scale factor — no differential effect on mode growth.
+
+**Conclusion**: Yukawa requires non-uniform ICs (Zel'dovich with anti-correlation δ₋ = −δ₊) to produce a measurable differential effect.
+
+### Open Question for J.-P. Petit
+
+Is α=1 a fundamental constraint of the Janus action? If so, the model cannot produce filaments via linear gravitational instability — a significant tension with observed large-scale structure (SDSS cosmic web). If a massive mediator between sectors is permitted, α(k) Yukawa is a natural extension.
+
+---
+
+## Key Bugs Fixed
+
+| Bug | Root Cause | Impact |
+|-----|-----------|--------|
+| Wrong acceleration equations | Local densities instead of conserved E | Incorrect dynamics |
+| Analytical/numerical inconsistency | Mixed ΛCDM H(z) with Janus accelerations | 0.4–0.8 mag offset |
+| Particle-Mesh failure | PM smooths short-range interactions | Zero segregation |
+| COM with periodic BC | Simple average ignores wrapping | Invalid metric |
+| GPU rsqrt() in f64 | Float intrinsic, implicit promotion | CPU/GPU divergence |
+| Artificial initial segregation | Different COM references | Seg₀ = 0.49 (150× too high) |
+| Janus virialization | Standard PE_total > 0 for mixed system | KE_target < 0 |
+
+### Janus Virialization
+
+Standard (2KE + PE_total = 0) fails: with η ≈ 1, repulsive +/− pairs dominate → PE_total > 0.
+
+**Solution**: virialize on PE_binding (same-sign pairs only):
+```
+α = √(|PE_binding| / (2·KE))   →   α = 4.57
+```
 
 ---
 
 ## Roadmap
 
 ### Completed ✅
-- Phase 1a: Pantheon+ fit (publishable)
-- Barnes-Hut CPU/GPU with 0% validation error
-- Bug fixes: rsqrt, COM periodic, acceleration equations
-- Virialized initial conditions (PE_binding method)
-- Corrected COM reference (common origin for both populations)
-- **Tâche 2: Hubble friction** — cosmological expansion z=5→z=0
-  - CosmoInterpolator for a(t) and H(t)
-  - Friction term: -H·v (Peebles 1980, physical coordinates)
-  - dtau_per_dt conversion factor calibrated
-  - Production run: 500K, 3600 steps, KE/KE₀=6.01, Seg=14.5%
-- **Video pipeline** — 3-panel visualization (1920×1080)
+- Phase 1a: Pantheon+ fit (η=1.045, χ²/dof=0.607)
+- GPU Barnes-Hut with 39.6× speedup (Karras tree build)
+- Virialized ICs (PE_binding method)
+- Hubble friction (z=5 → z=0)
+- Production runs: 500K, 2M, 8M particles
+- Video pipeline (3-panel, 1080p)
+- Linear analysis: α=1 → λ₋=0 → filaments impossible (`janus_linear_analysis.md`)
+- Anisotropic mode test: 4× suppression confirmed experimentally
+- Yukawa kernel implementation + N² diagnostic
 
 ### In Progress 🔄
-- Convergence study: 100K / 500K / 2M
+- Zel'dovich ICs with P(k) and anti-correlation δ₋ = −δ₊
+- Run 16–32M with Yukawa + Zel'dovich ICs
 
 ### Planned
-- **Tâche 3**: Full convergence study 100K → 2M, criterion < 10% between N and 2N
-- **Tâche 4**: Two-point correlation function ξ(r) via Corrfunc, qualitative comparison with SDSS DR7
-- **Tâche 5**: Test at η=1.0 (theoretical limit) to characterize the quasi-symmetric regime
+- Morphological analysis: ξ(r), Minkowski functionals
+- Contact J.-P. Petit with full experimental + theoretical results
+- η=1.0 edge case test
 
 ---
 
@@ -221,28 +220,27 @@ Simulations stop automatically if:
 ```
 janus-sim/
 ├── src/
-│   ├── lib.rs              # Constants and Janus interaction rules
-│   ├── friedmann.rs        # Coupled FLRW integration (RK4) + CosmoInterpolator
-│   ├── nbody.rs            # CPU N-body (Barnes-Hut, Rayon parallel)
-│   ├── nbody_gpu.rs        # GPU N-body (CUDA, f64, virialization, Hubble friction)
-│   ├── analysis.rs         # χ² fitting on Pantheon+ data
+│   ├── lib.rs                    # Constants, Janus interaction rules
+│   ├── friedmann.rs              # Coupled FLRW + CosmoInterpolator
+│   ├── nbody.rs                  # CPU N-body (Barnes-Hut, Rayon)
+│   ├── nbody_gpu.rs              # GPU N-body (CUDA, f64, Yukawa kernel)
+│   ├── analysis.rs               # χ² fitting on Pantheon+
 │   └── bin/
-│       ├── friedmann.rs    # Friedmann solver + SNIa fit binary
-│       ├── nbody.rs        # CPU N-body binary
-│       └── nbody_overnight.rs  # GPU production binary with expansion
+│       ├── friedmann.rs          # Friedmann solver + SNIa fit
+│       ├── nbody_overnight.rs    # GPU production binary
+│       ├── test_anisotropic.rs   # Day 1: anisotropic mode test
+│       ├── test_yukawa_n2.rs     # Day 2: Yukawa N² diagnostic
+│       └── ...
 ├── scripts/
-│   ├── render_overnight.py # 3-panel frame renderer (density + scatter)
-│   └── batch_render.py     # Parallel batch rendering
+│   ├── render_overnight.py       # 3-panel frame renderer
+│   └── batch_render.py           # Parallel batch rendering
 ├── data/
-│   └── Pantheon+SH0ES.dat  # SNIa data (not included, see Scolnic 2022)
-├── output/                 # Results (not tracked by git)
-│   └── YYYY-MM-DD_run_*/
-│       ├── snapshots/      # Binary particle data (.bin)
-│       ├── frames/         # 1080p PNG visualization
-│       ├── summary.json    # Final results
-│       └── *.mp4           # Rendered video
-├── VALIDATION_RULES.md     # Mandatory test rules for all physics functions
-├── janus_roadmap.md        # Detailed roadmap with code (Tâches 1–5)
+│   └── Pantheon+SH0ES.dat
+├── output/                       # Results (not tracked)
+├── VALIDATION_RULES.md
+├── KNOWN_FIXES.md
+├── janus_roadmap.md              # Full roadmap with results per day
+├── janus_linear_analysis.md      # Linear perturbation theory (769 lines)
 ├── Cargo.toml
 ├── docker-compose.yml
 └── README.md
@@ -254,14 +252,9 @@ janus-sim/
 
 ```bash
 # Prerequisites: Docker, NVIDIA driver, nvidia-container-toolkit
-
 git clone https://github.com/YOUR_USERNAME/janus-nbody.git
 cd janus-nbody
-
-# Verify CUDA
 nvidia-smi
-
-# Build
 docker compose build
 ```
 
@@ -269,91 +262,32 @@ docker compose build
 
 ## Usage
 
-### Phase 1a — Friedmann + Pantheon+ Fit
-
 ```bash
+# Pantheon+ fit
 docker compose run --rm dev cargo run --release --bin friedmann
-```
 
-### Phase 1c — GPU N-body Simulation
-
-```bash
-# Quick validation test (100K particles, 200 steps)
+# Production N-body (2M particles)
 docker compose run --rm dev cargo run --release --features cuda \
-  --bin nbody_overnight -- \
-  --n 100000 --eta 1.045 --dt 0.01 --steps 200 \
-  --output /app/output/test
+  --bin nbody_overnight -- --n 2000000 --eta 1.045 --dt 0.005 --steps 6000
 
-# Production run (500K particles, 10000 steps)
-docker compose run --rm dev cargo run --release --features cuda \
-  --bin nbody_overnight -- \
-  --n 500000 --eta 1.045 --dt 0.01 --steps 10000 \
-  --output /app/output/2026-02-21_run_mid
+# Anisotropic mode test
+docker compose run --rm dev cargo run --release --features cuda --bin test_anisotropic
+
+# Yukawa diagnostic (N² vs BH)
+docker compose run --rm dev cargo run --release --features cuda --bin test_yukawa_n2
 ```
-
-### Parameters
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--n` | Total number of particles | 100000 |
-| `--eta` | Density ratio ρ̄/ρ | 1.045 |
-| `--dt` | Time step (dimensionless) | 0.01 |
-| `--steps` | Number of integration steps | 1000 |
-| `--output` | Output directory | output/ |
-
-### Video Generation
-
-```bash
-# 1. Render frames (3-panel layout: density + scatter)
-python3 scripts/batch_render.py \
-  output/2026-02-21_run_hubble_mid/snapshots \
-  output/2026-02-21_run_hubble_mid/frames \
-  5  # render every 5th snapshot
-
-# 2. Assemble video
-ffmpeg -framerate 30 -i output/run/frames/frame_%05d.png \
-  -c:v libx264 -crf 18 -pix_fmt yuv420p \
-  output/run/janus_simulation.mp4
-```
-
-**3-Panel Layout:**
-- Left (2/3): Density map (histogram2d + gaussian blur)
-- Right top: Positive masses (blue scatter)
-- Right bottom: Negative masses (red scatter)
-
----
-
-## Hardware
-
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
-| GPU | NVIDIA CUDA | RTX 3060 12GB |
-| RAM | 16 GB | 32 GB |
-| Storage | 100 GB SSD | 1 TB NVMe |
-
-**Performance** (RTX 3060, f64):
-
-| N | Time/step | 10K steps |
-|---|-----------|-----------|
-| 100K | ~1.9s | ~5h |
-| 500K | ~1.9s | ~5h |
-| 2M | ~7.8s | ~22h |
 
 ---
 
 ## References
 
-1. **Petit, J.-P., Margnat, S. & Zejli, H.** (2024). *The Janus Cosmological Model*. Eur. Phys. J. C 84, 1226. [DOI:10.1140/epjc/s10052-024-13589-8](https://doi.org/10.1140/epjc/s10052-024-13589-8)
-
+1. **Petit, J.-P., Margnat, S. & Zejli, H.** (2024). *The Janus Cosmological Model*. Eur. Phys. J. C 84, 1226.
 2. **D'Agostini, G. & Petit, J.-P.** (2018). *Constraints on Janus Cosmological model from recent observations of supernovae type Ia*. Astrophys. Space Sci. 363, 139.
-
 3. **Petit, J.-P. & D'Agostini, G.** (2014). *Negative mass hypothesis in cosmology and the nature of dark energy*. Astrophys. Space Sci. 354, 611.
-
-4. **Scolnic, D. et al.** (2022). *The Pantheon+ Analysis: The Full Data Set and Light-Curve Release*. ApJ 938, 113.
-
+4. **Scolnic, D. et al.** (2022). *The Pantheon+ Analysis*. ApJ 938, 113.
 5. **Lane, Z.G. et al.** (2024). *ΛCDM calibration bias in Pantheon+*. MNRAS. arXiv:2311.01438.
-
 6. **Bédorf, J. et al.** (2012). *A sparse octree gravitational N-body code*. J. Comput. Phys. 231, 2825.
+7. **Peebles, P.J.E.** (1980). *The Large-Scale Structure of the Universe*. Princeton UP.
 
 ---
 
@@ -361,9 +295,7 @@ ffmpeg -framerate 30 -i output/run/frames/frame_%05d.png \
 
 MIT
 
----
-
 ## Contact
 
 - **Jean-Pierre Petit** (Janus model author): jean-pierre.petit@manaty.net
-- **Hicham Zejli** (co-author 2024 paper): hicham.zejli@manaty.net
+- **Hicham Zejli** (co-author 2024): hicham.zejli@manaty.net

@@ -59,6 +59,21 @@ let (step, n, ...) = ...
 // ❌ Ne pas passer kick_dt=0.0 pour "drift pur" sans vérifier les termes cosmo
 ```
 
+### [FIX-008] Positions centrées [-box/2, box/2] — OOM LinearOctree
+```rust
+// ✅ CORRECT : positions centrées (comme dans test_anisotropic.rs)
+let half_box = box_size / 2.0;
+let x0 = (ix as f64 + 0.5) * spacing - half_box;
+let y0 = (iy as f64 + 0.5) * spacing - half_box;
+let z0 = (iz as f64 + 0.5) * spacing - half_box;
+
+// ❌ INCORRECT : positions dans [0, box] → OOM lors du build LinearOctree
+// L'arbre octree s'attend à des positions centrées autour de l'origine.
+// Des positions [0, box] causent une allocation mémoire infinie (26+ GB)
+let x0 = (ix as f64 + 0.5) * spacing;  // FAUX!
+```
+**Symptôme :** Exit code 137 (OOM killer), même avec quelques milliers de particules.
+
 ---
 
 ## pm_kernels.cu / gpu_simulation.rs

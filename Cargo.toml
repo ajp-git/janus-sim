@@ -133,6 +133,7 @@ cudarc = { version = "0.12", features = ["cuda-12030", "nvrtc"], optional = true
 
 # Random number generation
 rand = "0.9"
+rand_distr = "0.5"
 
 # Sérialisation CSV
 csv = "1.3"
@@ -146,6 +147,10 @@ argmin-math = "0.4"
 log = "0.4"
 env_logger = "0.11"
 
+# FFT for Zel'dovich ICs
+rustfft = "6.2"
+num-complex = "0.4"
+
 [dev-dependencies]
 approx = "0.5"
 
@@ -156,3 +161,7 @@ codegen-units = 1
 [[bin]]
 name = "test_new"
 path = "src/bin/test_new.rs"
+
+[[bin]]
+name = "test_zeldovich"
+path = "src/bin/test_zeldovich.rs"

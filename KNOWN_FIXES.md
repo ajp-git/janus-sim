@@ -74,6 +74,20 @@ let x0 = (ix as f64 + 0.5) * spacing;  // FAUX!
 ```
 **Symptôme :** Exit code 137 (OOM killer), même avec quelques milliers de particules.
 
+### [FIX-008b] Conditions périodiques après déplacement Zel'dovich
+```rust
+// ✅ CORRECT : wrap APRÈS ajout du déplacement (amplitude_test.rs)
+let mut px = x0 + displacement_x;
+while px > half_box { px -= box_size; }
+while px < -half_box { px += box_size; }
+
+// ❌ INCORRECT : pas de wrap → positions hors [-L/2, L/2] si A grand
+// Avec A=10% (40 Mpc) dans boîte 400 Mpc, positions jusqu'à ±240 Mpc
+// → LinearOctree alloue arbre géant → OOM
+positions.push(x0 + displacement_x);  // FAUX si |displacement| > box/2 - |x0|
+```
+**Symptôme :** OOM uniquement avec grandes amplitudes (A≥10%), pas avec A≤5%.
+
 ---
 
 ## pm_kernels.cu / gpu_simulation.rs

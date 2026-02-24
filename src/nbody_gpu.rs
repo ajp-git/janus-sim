@@ -1656,6 +1656,11 @@ impl GpuNBodySimulation {
         self.theta = theta;
     }
 
+    /// Set softening length (default: 0.5 * mean_sep)
+    pub fn set_softening(&mut self, softening: f64) {
+        self.softening = softening;
+    }
+
     /// Get current theta value
     pub fn get_theta(&self) -> f64 {
         self.theta

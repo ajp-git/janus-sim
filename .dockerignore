@@ -1,5 +1,7 @@
 target/
 output/
+janus-pm/output/
+janus-pm/target/
 .git/
 *.md
 !CLAUDE.md

@@ -1,9 +1,13 @@
-//! Jour 4 — Production run: Filament formation
+//! Antisymmetric Mode Test — Pure λ₋ eigenmode excitation
 //!
-//! Grid: 128³ = 2M particles
-//! Full P(k) spectrum Zel'dovich ICs (NO anti-correlation)
-//! Random sign assignment to avoid initial spatial segregation
-//! Janus α=1, θ=0.7, dt=0.005, 3000+ steps
+//! Tests the stability of the antisymmetric mode in Janus cosmology.
+//! ICs: m+ gets +ψ displacement, m- gets -ψ displacement
+//! This directly excites the λ₋ eigenmode.
+//!
+//! Expected result for α=1: λ₋=0, so antisymmetric mode should be FROZEN
+//! (neither growing nor decaying).
+//!
+//! cargo run --release --features cuda --bin antisym_mode_test
 
 use rand::prelude::*;
 use rand_distr::Normal;
@@ -17,49 +21,47 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use janus::nbody_gpu::GpuNBodySimulation;
 
 // Physical parameters
-// 128³ = 2M particles (validated performance)
-const N_GRID: usize = 128;
+const N_GRID: usize = 128;     // 128³ = 2M particles
 const L_BOX: f64 = 400.0;      // Mpc
 const Z_INIT: f64 = 10.0;      // Initial redshift
 
 // Simulation parameters
 const DT: f64 = 0.005;
-// Note: boucle infinie, pas de limite de steps
 const SNAPSHOT_INTERVAL: usize = 100;
 const CSV_INTERVAL: usize = 10;
-const THETA: f64 = 0.7;  // Validated, accurate tree traversal
+const THETA: f64 = 0.7;
 
 // Power spectrum: P(k) ∝ k^0.96 / (1 + (k/k0)^4)
-const N_S: f64 = 0.96;         // Spectral index
-const K0: f64 = 0.02;          // Turnover scale (Mpc⁻¹)
+const N_S: f64 = 0.96;
+const K0: f64 = 0.02;
 
-/// Generate Zel'dovich ICs with full P(k) spectrum (no anti-correlation)
-/// Returns (positions, velocities, signs, n_positive)
-fn generate_zeldovich_ics_full(seed: u64) -> (Vec<f64>, Vec<f64>, Vec<i32>, usize) {
+/// Generate ANTISYMMETRIC Zel'dovich ICs
+/// m+ particles: position = q + ψ, velocity = +v
+/// m- particles: position = q - ψ, velocity = -v
+/// This directly excites the λ₋ eigenmode
+fn generate_antisym_ics(seed: u64) -> (Vec<f64>, Vec<f64>, Vec<i32>, usize) {
     let n3 = N_GRID * N_GRID * N_GRID;
     let mut rng = StdRng::seed_from_u64(seed);
 
-    println!("Generating Zel'dovich ICs with full P(k) spectrum...");
+    println!("Generating ANTISYMMETRIC Zel'dovich ICs...");
     println!("  Grid: {}³ = {} particles", N_GRID, n3);
     println!("  Box: {} Mpc", L_BOX);
     println!("  z_init = {}", Z_INIT);
-    println!("  P(k) ∝ k^{} / (1 + (k/{})⁴)", N_S, K0);
+    println!("  MODE: m+ gets +ψ, m- gets -ψ (pure antisymmetric)");
 
     let dk = 2.0 * PI / L_BOX;
     let half_n = N_GRID / 2;
     let spacing = L_BOX / N_GRID as f64;
     let half_box = L_BOX / 2.0;
 
-    // Growth factor at z_init (approximate for Janus)
+    // Growth factor at z_init
     let a_init = 1.0 / (1.0 + Z_INIT);
-    let d_growth = a_init;  // Linear approximation
+    let d_growth = a_init;
 
     // Generate Gaussian random field in Fourier space
     println!("  Generating Fourier modes...");
     let mut delta_k: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); n3];
     let normal = Normal::new(0.0, 1.0).unwrap();
-
-    // Amplitude normalization (arbitrary, will be rescaled)
     let amplitude = 0.01;
 
     for iz in 0..N_GRID {
@@ -67,7 +69,6 @@ fn generate_zeldovich_ics_full(seed: u64) -> (Vec<f64>, Vec<f64>, Vec<i32>, usiz
             for ix in 0..N_GRID {
                 let idx = iz * N_GRID * N_GRID + iy * N_GRID + ix;
 
-                // Wavenumbers (centered FFT convention)
                 let kx_idx = if ix <= half_n { ix as i32 } else { ix as i32 - N_GRID as i32 };
                 let ky_idx = if iy <= half_n { iy as i32 } else { iy as i32 - N_GRID as i32 };
                 let kz_idx = if iz <= half_n { iz as i32 } else { iz as i32 - N_GRID as i32 };
@@ -82,11 +83,9 @@ fn generate_zeldovich_ics_full(seed: u64) -> (Vec<f64>, Vec<f64>, Vec<i32>, usiz
                     continue;
                 }
 
-                // Power spectrum P(k) ∝ k^n_s / (1 + (k/k0)^4)
                 let pk = k.powf(N_S) / (1.0 + (k / K0).powi(4));
                 let sigma_k = (pk).sqrt() * amplitude * d_growth;
 
-                // Gaussian random field
                 let re: f64 = rng.sample(&normal) * sigma_k;
                 let im: f64 = rng.sample(&normal) * sigma_k;
                 delta_k[idx] = Complex::new(re, im);
@@ -94,11 +93,7 @@ fn generate_zeldovich_ics_full(seed: u64) -> (Vec<f64>, Vec<f64>, Vec<i32>, usiz
         }
     }
 
-    // DEBUG: print max(|delta_k|) before Hermitian enforcement
-    let max_delta_k_before = delta_k.iter().map(|c| c.norm()).fold(0.0f64, |a, b| a.max(b));
-    println!("  DEBUG: max(|delta_k|) before Hermitian = {:.6e}", max_delta_k_before);
-
-    // Enforce Hermitian symmetry for real field
+    // Enforce Hermitian symmetry
     for iz in 0..N_GRID {
         for iy in 0..N_GRID {
             for ix in 0..=half_n {
@@ -115,11 +110,7 @@ fn generate_zeldovich_ics_full(seed: u64) -> (Vec<f64>, Vec<f64>, Vec<i32>, usiz
         }
     }
 
-    // DEBUG: print max(|delta_k|) after Hermitian enforcement
-    let max_delta_k_after = delta_k.iter().map(|c| c.norm()).fold(0.0f64, |a, b| a.max(b));
-    println!("  DEBUG: max(|delta_k|) after Hermitian = {:.6e}", max_delta_k_after);
-
-    // Compute displacement field ψ_x = -i k_x δ_k / k²
+    // Compute displacement field ψ = -i k δ_k / k²
     println!("  Computing displacement fields...");
     let mut psi_x_k: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); n3];
     let mut psi_y_k: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); n3];
@@ -143,7 +134,6 @@ fn generate_zeldovich_ics_full(seed: u64) -> (Vec<f64>, Vec<f64>, Vec<i32>, usiz
                     continue;
                 }
 
-                // ψ = -i k δ_k / k²
                 let minus_i = Complex::new(0.0, -1.0);
                 psi_x_k[idx] = minus_i * kx * delta_k[idx] / k2;
                 psi_y_k[idx] = minus_i * ky * delta_k[idx] / k2;
@@ -152,31 +142,14 @@ fn generate_zeldovich_ics_full(seed: u64) -> (Vec<f64>, Vec<f64>, Vec<i32>, usiz
         }
     }
 
-    // DEBUG: print max(|psi_x_k|)
-    let max_psi_x_k = psi_x_k.iter().map(|c| c.norm()).fold(0.0f64, |a, b| a.max(b));
-    let max_psi_y_k = psi_y_k.iter().map(|c| c.norm()).fold(0.0f64, |a, b| a.max(b));
-    let max_psi_z_k = psi_z_k.iter().map(|c| c.norm()).fold(0.0f64, |a, b| a.max(b));
-    println!("  DEBUG: max(|psi_x_k|) = {:.6e}", max_psi_x_k);
-    println!("  DEBUG: max(|psi_y_k|) = {:.6e}", max_psi_y_k);
-    println!("  DEBUG: max(|psi_z_k|) = {:.6e}", max_psi_z_k);
-
-    // Inverse FFT to get displacement in real space
+    // Inverse FFT
     println!("  Performing inverse FFT...");
     let mut planner = FftPlanner::new();
     let ifft = planner.plan_fft_inverse(N_GRID);
 
-    // Process each dimension
     let psi_x = ifft_3d(&mut psi_x_k, &ifft, N_GRID);
     let psi_y = ifft_3d(&mut psi_y_k, &ifft, N_GRID);
     let psi_z = ifft_3d(&mut psi_z_k, &ifft, N_GRID);
-
-    // DEBUG: print max(|psi|) after IFFT
-    let max_psi_x = psi_x.iter().cloned().fold(0.0f64, |a, b| a.abs().max(b.abs()));
-    let max_psi_y = psi_y.iter().cloned().fold(0.0f64, |a, b| a.abs().max(b.abs()));
-    let max_psi_z = psi_z.iter().cloned().fold(0.0f64, |a, b| a.abs().max(b.abs()));
-    println!("  DEBUG: max(|psi_x|) after IFFT = {:.6e}", max_psi_x);
-    println!("  DEBUG: max(|psi_y|) after IFFT = {:.6e}", max_psi_y);
-    println!("  DEBUG: max(|psi_z|) after IFFT = {:.6e}", max_psi_z);
 
     // Compute max displacement for scaling
     let mut max_disp = 0.0f64;
@@ -184,53 +157,56 @@ fn generate_zeldovich_ics_full(seed: u64) -> (Vec<f64>, Vec<f64>, Vec<i32>, usiz
         let d = (psi_x[i]*psi_x[i] + psi_y[i]*psi_y[i] + psi_z[i]*psi_z[i]).sqrt();
         if d > max_disp { max_disp = d; }
     }
-    println!("  Max displacement: {:.6e} Mpc", max_disp);
 
-    // Scale to reasonable amplitude (10% of cell size)
+    // Scale to reasonable amplitude (30% of cell size)
     let target_disp = spacing * 0.3;
     let scale = target_disp / max_disp;
-    println!("  Scaling factor: {:.4} → target {:.4} Mpc", scale, target_disp);
+    println!("  Max displacement: {:.6e} Mpc → scaled to {:.4} Mpc", max_disp, target_disp);
 
     // Zel'dovich velocities: v = D_dot * psi
-    // D_dot = a * H(z) * f = (1+z)^0.5 in matter-dominated era
-    // For z_init=10: D_dot = sqrt(11) ≈ 3.32
-    let d_dot = (1.0 + Z_INIT).sqrt();  // sqrt(11) ≈ 3.32
-    let vel_scale = d_dot * scale;  // Same scale factor as positions
-    println!("  Zel'dovich velocities: D_dot = (1+z)^1.5 = {:.2}, vel_scale = {:.2e}",
-             d_dot, vel_scale);
+    let d_dot = (1.0 + Z_INIT).sqrt();
+    let vel_scale = d_dot * scale;
+    println!("  D_dot = sqrt(1+z) = {:.2}", d_dot);
 
-    // Generate particle positions and velocities
-    // Signs assigned randomly to avoid initial spatial segregation
-    println!("  Placing particles (no anti-correlation)...");
+    // FIRST: Assign signs (random 50/50)
+    println!("  Assigning signs (random 50/50)...");
+    let mut signs: Vec<i32> = Vec::with_capacity(n3);
     let mut n_positive = 0usize;
 
+    for _ in 0..n3 {
+        let sign = if rng.gen::<bool>() { 1 } else { -1 };
+        if sign > 0 { n_positive += 1; }
+        signs.push(sign);
+    }
+
+    // THEN: Place particles with antisymmetric displacements
+    // m+ gets +ψ, m- gets -ψ
+    println!("  Placing particles with ANTISYMMETRIC displacements...");
     let mut positions = Vec::with_capacity(n3 * 3);
     let mut velocities = Vec::with_capacity(n3 * 3);
-    let mut signs = Vec::with_capacity(n3);
 
     for iz in 0..N_GRID {
         for iy in 0..N_GRID {
             for ix in 0..N_GRID {
                 let idx = iz * N_GRID * N_GRID + iy * N_GRID + ix;
+                let sign = signs[idx];
 
-                // Grid position centered at [-box/2, box/2] (FIX-008)
+                // Grid position centered at [-box/2, box/2]
                 let x0 = (ix as f64 + 0.5) * spacing - half_box;
                 let y0 = (iy as f64 + 0.5) * spacing - half_box;
                 let z0 = (iz as f64 + 0.5) * spacing - half_box;
 
-                // SAME displacement for all particles (no anti-correlation)
-                let x = x0 + psi_x[idx] * scale;
-                let y = y0 + psi_y[idx] * scale;
-                let z = z0 + psi_z[idx] * scale;
+                // ANTISYMMETRIC: m+ gets +ψ, m- gets -ψ
+                let sign_factor = sign as f64;  // +1 or -1
 
-                // Zel'dovich velocities (same psi, no anti-correlation)
-                let vx = psi_x[idx] * vel_scale;
-                let vy = psi_y[idx] * vel_scale;
-                let vz = psi_z[idx] * vel_scale;
+                let x = x0 + psi_x[idx] * scale * sign_factor;
+                let y = y0 + psi_y[idx] * scale * sign_factor;
+                let z = z0 + psi_z[idx] * scale * sign_factor;
 
-                // Random sign assignment (50/50)
-                let sign = if rng.gen::<bool>() { 1 } else { -1 };
-                if sign > 0 { n_positive += 1; }
+                // ANTISYMMETRIC velocities
+                let vx = psi_x[idx] * vel_scale * sign_factor;
+                let vy = psi_y[idx] * vel_scale * sign_factor;
+                let vz = psi_z[idx] * vel_scale * sign_factor;
 
                 positions.push(x);
                 positions.push(y);
@@ -238,7 +214,6 @@ fn generate_zeldovich_ics_full(seed: u64) -> (Vec<f64>, Vec<f64>, Vec<i32>, usiz
                 velocities.push(vx);
                 velocities.push(vy);
                 velocities.push(vz);
-                signs.push(sign);
             }
         }
     }
@@ -246,12 +221,13 @@ fn generate_zeldovich_ics_full(seed: u64) -> (Vec<f64>, Vec<f64>, Vec<i32>, usiz
     let n_negative = n3 - n_positive;
     println!("  Total particles: {} ({}+ and {}-)", n3, n_positive, n_negative);
 
-    // Print max initial velocity for verification
-    let max_vx = velocities.chunks(3).map(|v| v[0].abs()).fold(0.0f64, |a, b| a.max(b));
-    let max_vy = velocities.chunks(3).map(|v| v[1].abs()).fold(0.0f64, |a, b| a.max(b));
-    let max_vz = velocities.chunks(3).map(|v| v[2].abs()).fold(0.0f64, |a, b| a.max(b));
-    println!("  Initial velocities: max(|vx|)={:.4}, max(|vy|)={:.4}, max(|vz|)={:.4}",
-             max_vx, max_vy, max_vz);
+    // Compute initial segregation S (should be >> 0 due to antisymmetric setup)
+    let seg = compute_segregation(&positions, &signs);
+    println!("  Initial segregation S₀ = {:.2} Mpc (expected >> 0)", seg);
+
+    // Verify antisymmetry: compute density correlation
+    println!("  Verifying antisymmetric ICs...");
+    // δ(m+) should anti-correlate with δ(m-) by construction
 
     (positions, velocities, signs, n_positive)
 }
@@ -298,12 +274,10 @@ fn ifft_3d(data: &mut Vec<Complex<f64>>, ifft: &std::sync::Arc<dyn rustfft::Fft<
         }
     }
 
-    // Extract real part and normalize
     let norm = 1.0 / (n3 as f64);
     data.iter().map(|c| c.re * norm).collect()
 }
 
-/// Compute σ_x, σ_y, σ_z separately
 fn compute_sigma_xyz(positions: &[f64]) -> (f64, f64, f64) {
     let n = positions.len() / 3;
     let mut sum_x = 0.0f64;
@@ -333,7 +307,6 @@ fn compute_sigma_xyz(positions: &[f64]) -> (f64, f64, f64) {
     (var_x.sqrt(), var_y.sqrt(), var_z.sqrt())
 }
 
-/// Compute segregation metric
 fn compute_segregation(positions: &[f64], signs: &[i32]) -> f64 {
     let n = positions.len() / 3;
     let n_positive = signs.iter().filter(|&&s| s > 0).count();
@@ -370,7 +343,47 @@ fn compute_segregation(positions: &[f64], signs: &[i32]) -> f64 {
     (dx*dx + dy*dy + dz*dz).sqrt()
 }
 
-/// Write lightweight snapshot (positions + signs only)
+/// Compute Delta(t) = sqrt(<(delta+ - delta-)^2>) using 32³ grid
+fn compute_delta_mode(positions: &[f64], signs: &[i32], box_size: f64) -> f64 {
+    let n_grid = 32;
+    let cell_size = box_size / n_grid as f64;
+    let n = positions.len() / 3;
+
+    let mut density_plus = vec![0.0f64; n_grid * n_grid * n_grid];
+    let mut density_minus = vec![0.0f64; n_grid * n_grid * n_grid];
+
+    for i in 0..n {
+        let x = positions[i * 3] + box_size / 2.0;
+        let y = positions[i * 3 + 1] + box_size / 2.0;
+        let z = positions[i * 3 + 2] + box_size / 2.0;
+
+        let ix = ((x / cell_size) as usize).min(n_grid - 1);
+        let iy = ((y / cell_size) as usize).min(n_grid - 1);
+        let iz = ((z / cell_size) as usize).min(n_grid - 1);
+
+        let idx = iz * n_grid * n_grid + iy * n_grid + ix;
+
+        if signs[i] > 0 {
+            density_plus[idx] += 1.0;
+        } else {
+            density_minus[idx] += 1.0;
+        }
+    }
+
+    // Compute overdensity
+    let mean_plus: f64 = density_plus.iter().sum::<f64>() / density_plus.len() as f64;
+    let mean_minus: f64 = density_minus.iter().sum::<f64>() / density_minus.len() as f64;
+
+    let mut delta_sq_sum = 0.0f64;
+    for i in 0..density_plus.len() {
+        let delta_plus = if mean_plus > 0.0 { (density_plus[i] - mean_plus) / mean_plus } else { 0.0 };
+        let delta_minus = if mean_minus > 0.0 { (density_minus[i] - mean_minus) / mean_minus } else { 0.0 };
+        delta_sq_sum += (delta_plus - delta_minus).powi(2);
+    }
+
+    (delta_sq_sum / density_plus.len() as f64).sqrt()
+}
+
 fn write_snapshot(
     path: &str,
     positions: &[f64],
@@ -382,13 +395,11 @@ fn write_snapshot(
     let n = positions.len() / 3;
     let mut file = BufWriter::new(File::create(path)?);
 
-    // Header: 32 bytes (FIX-003)
     file.write_all(&(n as u64).to_le_bytes())?;
     file.write_all(&(step as u64).to_le_bytes())?;
     file.write_all(&scale_factor.to_le_bytes())?;
     file.write_all(&segregation.to_le_bytes())?;
 
-    // Interleaved data: x, y, z (f32), sign (i8) per particle (FIX-002)
     for i in 0..n {
         let x = positions[i * 3] as f32;
         let y = positions[i * 3 + 1] as f32;
@@ -407,8 +418,8 @@ fn write_snapshot(
 #[cfg(feature = "cuda")]
 fn main() {
     println!("==============================================");
-    println!("Jour 4 — Production Run: Filament Formation");
-    println!("              256³ = 16.7M particles          ");
+    println!("ANTISYMMETRIC MODE TEST — λ₋ eigenmode");
+    println!("     128³ = 2M particles, α=1 (Janus)");
     println!("==============================================\n");
 
     let seed = 42u64;
@@ -417,17 +428,16 @@ fn main() {
         .unwrap()
         .as_secs();
 
-    // Create output directory
-    let output_dir = format!("/app/output/jour4_corrected_{}", timestamp);
+    let output_dir = format!("/app/output/antisym_mode_test_{}", timestamp);
     create_dir_all(&output_dir).expect("Failed to create output dir");
     let snap_dir = format!("{}/snapshots", output_dir);
     create_dir_all(&snap_dir).expect("Failed to create snapshots dir");
 
     println!("Output directory: {}", output_dir);
 
-    // Generate ICs (no anti-correlation - FIX for initial segregation bias)
+    // Generate ANTISYMMETRIC ICs
     let start_ic = Instant::now();
-    let (positions, velocities, signs, n_positive) = generate_zeldovich_ics_full(seed);
+    let (positions, velocities, signs, n_positive) = generate_antisym_ics(seed);
     println!("IC generation took {:.1}s\n", start_ic.elapsed().as_secs_f64());
 
     let n3 = N_GRID * N_GRID * N_GRID;
@@ -447,20 +457,25 @@ fn main() {
     sim.set_theta(THETA);
     println!("  θ = {}", THETA);
     println!("  dt = {}", DT);
-    println!("  N_steps = ∞ (illimité)");
     println!("  Snapshot interval = {}", SNAPSHOT_INTERVAL);
 
-    // Open CSV log
+    // CSV with Delta(t) column
     let csv_path = format!("{}/evolution.csv", output_dir);
     let mut csv = File::create(&csv_path).expect("Failed to create CSV");
-    writeln!(csv, "step,time,sigma_x,sigma_y,sigma_z,segregation,rate").unwrap();
+    writeln!(csv, "step,time,sigma_x,sigma_y,sigma_z,segregation,delta_mode,rate").unwrap();
 
     // Initial measurement
     let pos = sim.get_positions().expect("get_positions failed");
     let (sx, sy, sz) = compute_sigma_xyz(&pos);
     let seg = compute_segregation(&pos, &signs);
-    writeln!(csv, "0,0.0,{:.4},{:.4},{:.4},{:.6},0.0", sx, sy, sz, seg).unwrap();
-    println!("\nStep 0: σ = ({:.2}, {:.2}, {:.2}) Mpc, S = {:.6}", sx, sy, sz, seg);
+    let delta = compute_delta_mode(&pos, &signs, L_BOX);
+    writeln!(csv, "0,0.0,{:.4},{:.4},{:.4},{:.6},{:.6},0.0", sx, sy, sz, seg, delta).unwrap();
+
+    println!("\n=== INITIAL STATE ===");
+    println!("  σ = ({:.2}, {:.2}, {:.2}) Mpc", sx, sy, sz);
+    println!("  S = {:.4} Mpc (COM distance)", seg);
+    println!("  Δ = {:.4} (antisymmetric mode amplitude)", delta);
+    println!("  EXPECTED: Δ >> 0 (antisymmetric ICs)");
 
     // Write initial snapshot
     let snap_path = format!("{}/snap_{:05}.bin", snap_dir, 0);
@@ -469,61 +484,55 @@ fn main() {
 
     // Main loop
     let start = Instant::now();
-    let (sx0, sy0, sz0) = (sx, sy, sz);  // Save initial sigma
+    let delta_0 = delta;
 
     let mut step = 0usize;
     loop {
         step += 1;
         sim.step_with_cross_factor(DT, -1.0).expect("Step failed");
 
-        // CSV logging every 10 steps
         if step % CSV_INTERVAL == 0 {
             let pos = sim.get_positions().expect("get_positions failed");
             let (sx, sy, sz) = compute_sigma_xyz(&pos);
             let seg = compute_segregation(&pos, &signs);
+            let delta = compute_delta_mode(&pos, &signs, L_BOX);
 
             let elapsed = start.elapsed().as_secs_f64();
             let rate = step as f64 / elapsed;
 
-            writeln!(csv, "{},{:.2},{:.4},{:.4},{:.4},{:.6},{:.1}",
-                     step, elapsed, sx, sy, sz, seg, rate).unwrap();
+            writeln!(csv, "{},{:.2},{:.4},{:.4},{:.4},{:.6},{:.6},{:.1}",
+                     step, elapsed, sx, sy, sz, seg, delta, rate).unwrap();
             csv.flush().unwrap();
 
-            // Diagnostic at step 10: verify sigma changes
-            if step == 10 {
-                let dsx = (sx - sx0) / sx0 * 100.0;
-                let dsy = (sy - sy0) / sy0 * 100.0;
-                let dsz = (sz - sz0) / sz0 * 100.0;
-                println!("\n=== DIAGNOSTIC Step 10 ===");
-                println!("  σ₀ = ({:.4}, {:.4}, {:.4})", sx0, sy0, sz0);
-                println!("  σ₁₀ = ({:.4}, {:.4}, {:.4})", sx, sy, sz);
-                println!("  Δσ/σ₀ = ({:+.4}%, {:+.4}%, {:+.4}%)", dsx, dsy, dsz);
-                if dsx.abs() < 0.001 && dsy.abs() < 0.001 && dsz.abs() < 0.001 {
-                    println!("  ⚠️  SIGMA FIGÉ — vitesses Zel'dovich pas appliquées?");
-                } else {
-                    println!("  ✓ Sigma change — particules en mouvement");
-                }
-            }
-
-            // Print every 100 steps
             if step % SNAPSHOT_INTERVAL == 0 {
-                println!("Step {}: σ = ({:.2}, {:.2}, {:.2}) Mpc, S = {:.2} ({:.1} steps/s)",
-                         step, sx, sy, sz, seg, rate);
+                let delta_ratio = delta / delta_0;
+                println!("Step {}: S={:.2} Mpc, Δ={:.4} (Δ/Δ₀={:.3}) [{:.1} steps/s]",
+                         step, seg, delta, delta_ratio, rate);
 
-                // Write snapshot
                 let a = 1.0 / (1.0 + Z_INIT) + step as f64 * DT * 0.01;
                 let snap_path = format!("{}/snap_{:05}.bin", snap_dir, step);
                 write_snapshot(&snap_path, &pos, &signs, step, a, seg)
                     .expect("Failed to write snapshot");
+
+                // Report status every 1000 steps
+                if step % 1000 == 0 {
+                    println!("\n=== STATUS at step {} ===", step);
+                    println!("  Δ(t)/Δ(0) = {:.4}", delta_ratio);
+                    if delta_ratio > 1.1 {
+                        println!("  → GROWING: λ₋ > 0 (unexpected for α=1)");
+                    } else if delta_ratio < 0.9 {
+                        println!("  → DECAYING: amortissement (expansion)");
+                    } else {
+                        println!("  → FROZEN: λ₋ ≈ 0 (expected for α=1)");
+                    }
+                }
             }
         }
     }
-
-    // Infinite loop - will be stopped manually
 }
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
     eprintln!("This binary requires the 'cuda' feature. Compile with:");
-    eprintln!("  cargo build --release --features cuda --bin jour4_filaments");
+    eprintln!("  cargo build --release --features cuda --bin antisym_mode_test");
 }

@@ -169,3 +169,7 @@ path = "src/bin/test_zeldovich.rs"
 [[bin]]
 name = "jour4_filaments"
 path = "src/bin/jour4_filaments.rs"
+
+[[bin]]
+name = "segregation_z1000"
+path = "src/bin/segregation_z1000.rs"

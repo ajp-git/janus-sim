@@ -477,7 +477,8 @@ pub fn mu_janus_exact(z: f64, eta: f64) -> f64 {
     // d_L = (c/H₀) × (1+z) × χ(z), where χ comes from integrating 1/E(z)
     // For Janus: the "arg" in eq.(5) encapsulates this
     //
-    // Using d_L = arg × (c/H₀) directly (as in the paper's derivation):
+    // For the Janus analytical formula, d_L = arg × (c/H₀)
+    // where arg already encapsulates the complete distance integral
     let d_l_m = arg * C / H0;  // in meters
     distance_modulus(d_l_m)
 }

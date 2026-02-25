@@ -1550,6 +1550,150 @@ impl GpuNBodySimulation {
         })
     }
 
+    /// Create simulation optimized for BVH-only mode (no CPU LinearOctree)
+    /// Saves ~3-4 GB VRAM by not allocating the legacy tree structures
+    pub fn new_bvh_only(n_positive: usize, n_negative: usize, box_size: f64) -> Result<Self, Box<dyn std::error::Error>> {
+        let device = CudaDevice::new(0)?;
+
+        let ptx = cudarc::nvrtc::compile_ptx(CUDA_KERNEL_SRC)?;
+        device.load_ptx(ptx, "nbody", &[
+            "compute_forces_simple", "leapfrog_kick_drift", "drift_only", "kick_only",
+            "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs",
+            "build_bvh_internal", "init_leaves", "reduce_com", "compute_forces_bvh",
+            "compute_forces_bvh_cross", "compute_forces_bvh_yukawa", "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
+        ])?;
+
+        let n_total = n_positive + n_negative;
+
+        use rand::{Rng, SeedableRng};
+        use rand::rngs::StdRng;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Initial velocity scale (will be adjusted by analytical virialization)
+        let v_init = 1.0;
+
+        // Generate particles with initial random velocities
+        let mut pos_data = Vec::with_capacity(n_total * 3);
+        let mut vel_data = Vec::with_capacity(n_total * 3);
+        let mut signs_data = Vec::with_capacity(n_total);
+        let mut particles_cpu = Vec::with_capacity(n_total);
+
+        for _ in 0..n_positive {
+            let x = (rng.random::<f64>() - 0.5) * box_size;
+            let y = (rng.random::<f64>() - 0.5) * box_size;
+            let z = (rng.random::<f64>() - 0.5) * box_size;
+            let vx = (rng.random::<f64>() - 0.5) * v_init;
+            let vy = (rng.random::<f64>() - 0.5) * v_init;
+            let vz = (rng.random::<f64>() - 0.5) * v_init;
+            pos_data.extend_from_slice(&[x, y, z]);
+            vel_data.extend_from_slice(&[vx, vy, vz]);
+            signs_data.push(1);
+            particles_cpu.push(GpuParticle { x, y, z, vx, vy, vz, mass: 1.0, sign: 1 });
+        }
+
+        for _ in 0..n_negative {
+            let x = (rng.random::<f64>() - 0.5) * box_size;
+            let y = (rng.random::<f64>() - 0.5) * box_size;
+            let z = (rng.random::<f64>() - 0.5) * box_size;
+            let vx = (rng.random::<f64>() - 0.5) * v_init;
+            let vy = (rng.random::<f64>() - 0.5) * v_init;
+            let vz = (rng.random::<f64>() - 0.5) * v_init;
+            pos_data.extend_from_slice(&[x, y, z]);
+            vel_data.extend_from_slice(&[vx, vy, vz]);
+            signs_data.push(-1);
+            particles_cpu.push(GpuParticle { x, y, z, vx, vy, vz, mass: 1.0, sign: -1 });
+        }
+
+        // Analytical virialization (mean-field approximation) - O(1) instead of O(N²)
+        // PE_binding ≈ -G * m² * N_same * (N_same - 1) / (2 * mean_separation)
+        // where mean_separation ≈ 0.554 * L / N^(1/3) for uniform distribution
+        let mass = 1.0;
+        let g_code = 1.0;  // G in code units
+        let mean_sep_plus = 0.554 * box_size / (n_positive as f64).cbrt();
+        let mean_sep_minus = 0.554 * box_size / (n_negative as f64).cbrt();
+
+        let pe_plus = -g_code * mass * mass * (n_positive * (n_positive.saturating_sub(1)) / 2) as f64 / mean_sep_plus;
+        let pe_minus = -g_code * mass * mass * (n_negative * (n_negative.saturating_sub(1)) / 2) as f64 / mean_sep_minus;
+        let pe_binding = pe_plus + pe_minus;
+
+        // Current KE = 0.5 * m * sum(v²)
+        let ke_current: f64 = vel_data.chunks(3)
+            .map(|v| 0.5 * mass * (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]))
+            .sum();
+
+        // Virial: 2*KE + PE_binding = 0 → KE_target = |PE_binding| / 2
+        let ke_target = pe_binding.abs() / 2.0;
+        let alpha = if ke_current > 1e-20 { (ke_target / ke_current).sqrt() } else { 1.0 };
+
+        // Scale velocities
+        for v in vel_data.iter_mut() {
+            *v *= alpha;
+        }
+        for p in particles_cpu.iter_mut() {
+            p.vx *= alpha;
+            p.vy *= alpha;
+            p.vz *= alpha;
+        }
+
+        println!("Analytical virialization (mean-field):");
+        println!("  PE_binding = {:.4e}", pe_binding);
+        println!("  KE_initial = {:.4e}", ke_current);
+        println!("  KE_target  = {:.4e}", ke_target);
+        println!("  alpha      = {:.6}", alpha);
+
+        let pos = device.htod_sync_copy(&pos_data)?;
+        let vel = device.htod_sync_copy(&vel_data)?;
+        let signs = device.htod_sync_copy(&signs_data)?;
+        let acc = device.alloc_zeros::<f64>(n_total * 3)?;
+
+        // SKIP LinearOctree - use minimal placeholder buffers instead
+        // This saves ~3-4 GB for large N
+        let node_data = device.alloc_zeros::<f64>(1)?;  // Minimal placeholder
+        let node_children = device.alloc_zeros::<i32>(1)?;
+        let node_types = device.alloc_zeros::<i32>(1)?;
+        let n_nodes = 1;
+
+        // Morton sorting buffers
+        let morton_codes = device.alloc_zeros::<u64>(n_total)?;
+        let sorted_indices = device.alloc_zeros::<i32>(n_total)?;
+        let pos_tmp = device.alloc_zeros::<f64>(n_total * 3)?;
+        let vel_tmp = device.alloc_zeros::<f64>(n_total * 3)?;
+        let signs_tmp = device.alloc_zeros::<i32>(n_total)?;
+
+        // GPU BVH buffers (Karras 2012)
+        let n_bvh_nodes = 2 * n_total - 1;
+        let bvh_left_child = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_right_child = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_parent = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_range_left = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_range_right = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_node_data = device.alloc_zeros::<f64>(n_bvh_nodes * 12)?;
+        let bvh_node_types = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_atomic_counter = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+
+        let mean_sep = box_size / (n_total as f64).powf(1.0/3.0);
+        let softening = 0.5 * mean_sep;
+
+        Ok(Self {
+            device,
+            pos, vel, signs, acc,
+            node_data, node_children, node_types,
+            morton_codes, sorted_indices, pos_tmp, vel_tmp, signs_tmp,
+            bvh_left_child, bvh_right_child, bvh_parent,
+            bvh_range_left, bvh_range_right,
+            bvh_node_data, bvh_node_types, bvh_atomic_counter,
+            bvh_buffers: None,
+            current_bvh: 0,
+            n_particles: n_total,
+            n_nodes,
+            theta: 2.0,
+            softening,
+            box_size,
+            time: 0.0,
+            particles_cpu,
+        })
+    }
+
     /// Create simulation with specific initial state (for comparison tests)
     pub fn new_with_state(
         n_positive: usize, n_negative: usize, box_size: f64,

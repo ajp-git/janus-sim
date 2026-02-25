@@ -21,8 +21,8 @@ pub mod constants {
     pub const G: f64 = 6.674_30e-11;
     
     /// Hubble constant — Janus value (km/s/Mpc)
-    /// Note: Janus is consistent with H0=70, not 67 (ΛCDM)
-    pub const H0_KM_S_MPC: f64 = 70.0;
+    /// Note: Janus prefers H0=76 (Petit 2014), higher than ΛCDM's 67
+    pub const H0_KM_S_MPC: f64 = 76.0;
     
     /// H0 in SI (s⁻¹)
     pub const H0: f64 = H0_KM_S_MPC * 1e3 / MPC_M;

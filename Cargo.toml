@@ -317,3 +317,8 @@ required-features = ["cuda"]
 name = "test_warpcoherent_scaling"
 path = "src/bin/test_warpcoherent_scaling.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "test_80m_quick"
+path = "src/bin/test_80m_quick.rs"
+required-features = ["cuda"]

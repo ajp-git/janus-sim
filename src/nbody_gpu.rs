@@ -257,14 +257,13 @@ extern "C" __global__ void kick_only(
 
 // Morton code computation for spatial sorting
 // Maps 3D position to 1D Morton code (Z-order curve) for cache locality
-__device__ unsigned long long expand_bits_21(unsigned int v) {
-    // Expand 21-bit integer to 63 bits with 2 zeros between each bit
-    unsigned long long x = v & 0x1fffff;  // 21 bits
-    x = (x | (x << 32)) & 0x1f00000000ffffULL;
-    x = (x | (x << 16)) & 0x1f0000ff0000ffULL;
-    x = (x | (x << 8))  & 0x100f00f00f00f00fULL;
-    x = (x | (x << 4))  & 0x10c30c30c30c30c3ULL;
-    x = (x | (x << 2))  & 0x1249249249249249ULL;
+// Expand 10-bit integer to 30 bits with 2 zeros between each bit
+__device__ unsigned long long expand_bits_10(unsigned int v) {
+    unsigned long long x = v & 0x3ff;  // 10 bits
+    x = (x | (x << 16)) & 0x30000ffULL;
+    x = (x | (x << 8))  & 0x300f00fULL;
+    x = (x | (x << 4))  & 0x30c30c3ULL;
+    x = (x | (x << 2))  & 0x9249249ULL;
     return x;
 }
 
@@ -279,18 +278,21 @@ extern "C" __global__ void compute_morton_codes(
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n) return;
 
-    // Read position and normalize to [0, 2^21) range
-    double x = (pos[tid * 3]     + box_half) * inv_cell_size;
-    double y = (pos[tid * 3 + 1] + box_half) * inv_cell_size;
-    double z = (pos[tid * 3 + 2] + box_half) * inv_cell_size;
+    // Read position and normalize to [0, 1024) range (10 bits per axis)
+    double scale = 1024.0 / (2.0 * box_half);
+    double x = (pos[tid * 3]     + box_half) * scale;
+    double y = (pos[tid * 3 + 1] + box_half) * scale;
+    double z = (pos[tid * 3 + 2] + box_half) * scale;
 
-    // Clamp to valid range
-    unsigned int ix = min(max((unsigned int)x, 0u), 0x1fffffu);
-    unsigned int iy = min(max((unsigned int)y, 0u), 0x1fffffu);
-    unsigned int iz = min(max((unsigned int)z, 0u), 0x1fffffu);
+    // Clamp to valid range (10 bits = 0..1023)
+    unsigned int ix = min(max((unsigned int)x, 0u), 0x3ffu);
+    unsigned int iy = min(max((unsigned int)y, 0u), 0x3ffu);
+    unsigned int iz = min(max((unsigned int)z, 0u), 0x3ffu);
 
-    // Interleave bits to form Morton code
-    morton_codes[tid] = expand_bits_21(ix) | (expand_bits_21(iy) << 1) | (expand_bits_21(iz) << 2);
+    // Morton code = (30-bit spatial << 32) | particle_index
+    // Unique keys guarantee correct Karras tree construction
+    unsigned long long mc = expand_bits_10(ix) | (expand_bits_10(iy) << 1) | (expand_bits_10(iz) << 2);
+    morton_codes[tid] = (mc << 32) | ((unsigned long long)tid);
     indices[tid] = tid;
 }
 

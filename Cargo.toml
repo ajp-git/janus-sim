@@ -252,3 +252,23 @@ required-features = ["cuda"]
 name = "test_8m_debug"
 path = "src/bin/test_8m_debug.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "test_twopass_8m"
+path = "src/bin/test_twopass_8m.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_morton_fix"
+path = "src/bin/test_morton_fix.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_slowdown"
+path = "src/bin/test_slowdown.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "profile_twopass"
+path = "src/bin/profile_twopass.rs"
+required-features = ["cuda"]

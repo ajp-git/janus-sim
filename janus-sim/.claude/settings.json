@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo:*)",
+      "Bash(docker compose:*)",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(mkdir:*)",
+      "Bash(cp:*)",
+      "Bash(mv:*)",
+      "Bash(rm:*)",
+      "Bash(unzip:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(python3:*)",
+      "Bash(grep:*)",
+      "Bash(wc:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Edit(*)",
+      "Write(*)"
+    ],
+    "deny": [
+      "Bash(docker stop:*)",
+      "Bash(docker rm:*)",
+      "Bash(docker rmi:*)",
+      "Bash(docker system:*)",
+      "Bash(docker network:*)",
+      "Bash(docker volume:*)",
+      "Bash(sudo:*)",
+      "Bash(reboot:*)",
+      "Bash(shutdown:*)",
+      "Bash(kill:*)",
+      "Bash(pkill:*)"
+    ]
+  }
+}

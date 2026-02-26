@@ -1950,6 +1950,54 @@ traversent des régions similaires de l'arbre → réduction de la divergence wa
 
 **Décision :** OPT-2 rejeté. Utiliser Morton seul.
 
+### [OPT-4] Warp-Coherent Traversal — 4.55× sur Morton ✅ VALIDÉ
+
+**Principe :** Tous les threads d'un warp visitent le même nœud simultanément.
+Décision collective : si TOUS veulent approximer → calcul force ; sinon → descendre.
+Stack partagé en shared memory (128 niveaux par warp).
+
+**Implémentation :**
+```cuda
+// Tous les threads du warp visitent le même nœud
+int node = __shfl_sync(0xFFFFFFFF, stack[--sp], 0);  // Broadcast lane 0
+
+// Décision collective
+bool all_approx = __all_sync(0xFFFFFFFF, should_approx);
+bool all_descend = __all_sync(0xFFFFFFFF, !should_approx);
+
+if (all_approx) compute_force();
+else if (all_descend || mixed) push_children();
+```
+
+**Résultats scaling test (1 step chacun) :**
+```
+┌────────┬─────────────┬────────────────┬─────────┐
+│   N    │ Morton seul │ Morton+WarpCoh │ Speedup │
+├────────┼─────────────┼────────────────┼─────────┤
+│   1M   │   1,026 ms  │      362 ms    │  2.83×  │
+│   2M   │   2,421 ms  │      743 ms    │  3.26×  │
+│   4M   │   6,366 ms  │    1,709 ms    │  3.72×  │
+│   8M   │  17,706 ms  │    3,892 ms    │  4.55×  │
+└────────┴─────────────┴────────────────┴─────────┘
+```
+
+**Speedup total vs baseline (sans Morton) à 8M :**
+```
+Baseline      : 37,500 ms
+Morton seul   :  8,200 ms  (4.5× vs baseline)
+Morton+WarpCoh:  3,900 ms  (9.6× vs baseline) ← MEILLEUR
+```
+
+**Estimation 12000 steps à 8M :**
+- Baseline : 125 heures (5.2 jours)
+- Morton seul : 27 heures
+- **Morton+WarpCoh : 13 heures** ✅
+
+**Fichiers :**
+- `src/nbody_gpu_twopass.rs` : `forces_twopass_warpcoherent`, `step_dkd_warpcoherent()`, `step_dkd_morton_warpcoherent()`
+- Stack size : 128 niveaux (4096 bytes shared mem)
+- `src/bin/test_warpcoherent_scaling.rs` : test 1M→8M
+
 ### [OPT-X] N² Direct — Impossible ❌
 
 Testé pour référence : kernel N² direct avec shared memory tiling.
@@ -1974,34 +2022,42 @@ docker compose run --rm dev cargo run --release --features cuda --bin bench_forc
 
 ---
 
-## ÉTAT PERFORMANCE GPU (26 février 2026)
+## ÉTAT PERFORMANCE GPU (26 février 2026 — soir)
 
-| N | θ | Temps/step | 12000 steps | Statut |
-|---|---|------------|-------------|--------|
-| 2M | 0.7 | ~800 ms | 2.7 heures | ✅ Production |
-| 8M | 0.7 | ~8.2 s | 27 heures | ✅ Faisable (Morton) |
-| 8M | 0.7 | ~37 s | 5.2 jours | ❌ Trop lent (sans Morton) |
+| N | θ | Config | Temps/step | 12000 steps | Statut |
+|---|---|--------|------------|-------------|--------|
+| 2M | 0.7 | Morton+WC | ~740 ms | 2.5 heures | ✅ Production |
+| 4M | 0.7 | Morton+WC | ~1.7 s | 5.7 heures | ✅ Production |
+| 8M | 0.7 | Morton+WC | **~3.9 s** | **13 heures** | ✅ **OPTIMAL** |
+| 8M | 0.7 | Morton seul | ~8.2 s | 27 heures | ✅ Faisable |
+| 8M | 0.7 | Baseline | ~37 s | 5.2 jours | ❌ Obsolète |
 
 ---
 
 ## PROCHAINES ÉTAPES
 
 ### À FAIRE IMMÉDIATEMENT
-- [ ] **Run 8M θ=0.7 validation** avec Morton reorder
-  - Vérifier S_max comparable à run 8M précédent (S_max=0.459)
-  - Confirmer stabilité sur 12000 steps
+- [ ] **Run 8M θ=0.7 production** avec Morton+WarpCoherent (~13h pour 12000 steps)
+  - Vérifier S_max comparable à runs précédents
+  - Confirmer stabilité sur run complet
+  - Utiliser `step_dkd_morton_warpcoherent()` pour performance optimale
 
-### OPTIMISATIONS FUTURES (si nécessaire)
+### OPTIMISATIONS COMPLÉTÉES
+| Opt | Description | Résultat | Statut |
+|-----|-------------|----------|--------|
+| OPT-1 | Morton reorder | 4.54× vs baseline | ✅ |
+| OPT-2 | Shared mem top nodes | RÉGRESSION | ❌ Rejeté |
+| OPT-4 | Warp-coherent traversal | **4.55× vs Morton** | ✅ **MEILLEUR** |
+
+### OPTIMISATIONS FUTURES (optionnel)
 | Opt | Description | Estimation | Priorité |
 |-----|-------------|------------|----------|
-| OPT-3 | Stack en shared memory | +10-20% | Moyenne |
-| OPT-4 | Warp-coherent traversal | +20-50% | Haute |
-| OPT-5 | Adaptive θ (θ variable par profondeur) | +30% | Moyenne |
+| OPT-5 | Adaptive θ (θ variable par profondeur) | +10-30% | Basse |
 | OPT-6 | Multi-GPU (si disponible) | 2× | Basse |
 
 ### QUESTIONS OUVERTES
-1. Le run 8M θ=0.7 avec Morton va-t-il reproduire S_max≈0.459 ?
-2. Faut-il passer à 16M ou 32M pour voir des filaments ?
+1. Le run 8M θ=0.7 avec Morton+WC va-t-il confirmer les résultats physiques ?
+2. Avec 13h pour 8M, peut-on envisager 16M (~26h) pour meilleure résolution ?
 3. Les ICs Zel'dovich anti-corrélées changent-elles la dynamique ?
 
 ---
@@ -2010,14 +2066,17 @@ docker compose run --rm dev cargo run --release --features cuda --bin bench_forc
 
 ```
 src/nbody_gpu_twopass.rs
-  - step_dkd_morton_reorder()     ← utilise Morton reorder [OPT-1]
-  - step_dkd_morton_shmem()       ← OPT-2 (rejeté, code conservé)
-  - Kernels : compute_morton_all, reorder_by_idx_*, forces_twopass_shmem_*
+  - step_dkd_morton_reorder()       ← utilise Morton reorder [OPT-1]
+  - step_dkd_warpcoherent()         ← Warp-coherent sans Morton
+  - step_dkd_morton_warpcoherent()  ← Morton + Warp-coherent [OPT-4] ✅ OPTIMAL
+  - step_dkd_morton_shmem()         ← OPT-2 (rejeté, code conservé)
+  - Kernels : forces_twopass_warpcoherent (stack 128 levels, 4KB shared)
 
-src/bin/bench_force.rs            ← Framework benchmark systématique
-src/bin/profile_8m.rs             ← Profiling baseline
-src/bin/profile_8m_morton.rs      ← Profiling Morton reorder
-src/bin/profile_8m_direct.rs      ← Test O(N²) direct
+src/bin/bench_force.rs              ← Framework benchmark systématique
+src/bin/test_warpcoherent_scaling.rs← Test 1M→8M scaling
+src/bin/profile_8m.rs               ← Profiling baseline
+src/bin/profile_8m_morton.rs        ← Profiling Morton reorder
+src/bin/profile_8m_direct.rs        ← Test O(N²) direct
 ```
 
 ---

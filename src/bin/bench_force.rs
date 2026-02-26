@@ -19,6 +19,8 @@ enum StepVariant {
     Baseline,
     Morton,
     MortonShmem,
+    WarpCoherent,
+    MortonWarpCoherent,
 }
 
 #[cfg(feature = "cuda")]
@@ -63,18 +65,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
 
     // =========================================================================
-    // OPT-2: Morton + Shared Memory (Top-1024 nodes cached)
+    // OPT-4a: Warp-coherent traversal (without Morton)
     // =========================================================================
-    eprintln!(">>> OPT-2: step_dkd_morton_shmem (top 1024 nodes in shared mem)");
-    let shmem_times = benchmark_step(&mut sim, WARMUP, MEASURED, StepVariant::MortonShmem)?;
-    let shmem_median = median(&shmem_times);
-    let shmem_stddev = stddev(&shmem_times);
-    let shmem_speedup = baseline_median / shmem_median;
-    let shmem_vs_morton = morton_median / shmem_median;
-    eprintln!("    Times: {:?}", shmem_times.iter().map(|t| format!("{:.0}", t)).collect::<Vec<_>>());
-    eprintln!("    Median: {:.0} ms ± {:.0} ms", shmem_median, shmem_stddev);
-    eprintln!("    Speedup vs baseline: {:.2}×", shmem_speedup);
-    eprintln!("    Speedup vs OPT-1:    {:.2}×", shmem_vs_morton);
+    eprintln!(">>> OPT-4a: step_dkd_warpcoherent (warp-coherent, no Morton)");
+    let wc_times = benchmark_step(&mut sim, WARMUP, MEASURED, StepVariant::WarpCoherent)?;
+    let wc_median = median(&wc_times);
+    let wc_stddev = stddev(&wc_times);
+    let wc_speedup = baseline_median / wc_median;
+    eprintln!("    Times: {:?}", wc_times.iter().map(|t| format!("{:.0}", t)).collect::<Vec<_>>());
+    eprintln!("    Median: {:.0} ms ± {:.0} ms", wc_median, wc_stddev);
+    eprintln!("    Speedup vs baseline: {:.2}×", wc_speedup);
+    eprintln!();
+
+    // =========================================================================
+    // OPT-4b: Morton + Warp-coherent traversal
+    // =========================================================================
+    eprintln!(">>> OPT-4b: step_dkd_morton_warpcoherent (Morton + warp-coherent)");
+    let mwc_times = benchmark_step(&mut sim, WARMUP, MEASURED, StepVariant::MortonWarpCoherent)?;
+    let mwc_median = median(&mwc_times);
+    let mwc_stddev = stddev(&mwc_times);
+    let mwc_speedup = baseline_median / mwc_median;
+    let mwc_vs_morton = morton_median / mwc_median;
+    let mwc_vs_wc = wc_median / mwc_median;
+    eprintln!("    Times: {:?}", mwc_times.iter().map(|t| format!("{:.0}", t)).collect::<Vec<_>>());
+    eprintln!("    Median: {:.0} ms ± {:.0} ms", mwc_median, mwc_stddev);
+    eprintln!("    Speedup vs baseline: {:.2}×", mwc_speedup);
+    eprintln!("    Speedup vs OPT-1:    {:.2}×", mwc_vs_morton);
+    eprintln!("    Speedup vs OPT-4a:   {:.2}×", mwc_vs_wc);
     eprintln!();
 
     // =========================================================================
@@ -88,20 +105,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  {:35} {:>10} {:>10}", "─".repeat(35), "─".repeat(10), "─".repeat(10));
     eprintln!("  {:35} {:>10.0} {:>10}", "Baseline (no optim)", baseline_median, "1.00×");
     eprintln!("  {:35} {:>10.0} {:>10.2}×", "+ Morton reorder [OPT-1]", morton_median, morton_speedup);
-    eprintln!("  {:35} {:>10.0} {:>10.2}×", "+ Shared mem top-1024 [OPT-2]", shmem_median, shmem_speedup);
+    eprintln!("  {:35} {:>10.0} {:>10.2}×", "+ Warp-coherent [OPT-4a]", wc_median, wc_speedup);
+    eprintln!("  {:35} {:>10.0} {:>10.2}×", "+ Morton+WarpCoh [OPT-4b]", mwc_median, mwc_speedup);
     eprintln!();
-    eprintln!("  Remaining optimizations to test:");
-    eprintln!("  [OPT-3] Stack in shared memory");
-    eprintln!("  [OPT-4] Warp-coherent traversal");
-    eprintln!("  [OPT-5] Adaptive θ");
-    eprintln!();
+
+    // Find best time among all optimizations
+    let best_median = mwc_median.min(wc_median).min(morton_median);
+    let best_name = if best_median == mwc_median { "Morton+WarpCoh" }
+                    else if best_median == wc_median { "WarpCoherent" }
+                    else { "Morton" };
 
     // Estimate full run time
     let hours_baseline = (baseline_median * 12000.0) / 3600000.0;
-    let hours_best = (shmem_median * 12000.0) / 3600000.0;
+    let hours_best = (best_median * 12000.0) / 3600000.0;
     eprintln!("  Full run (12000 steps) estimate:");
     eprintln!("    Baseline:     {:.1} hours ({:.1} days)", hours_baseline, hours_baseline / 24.0);
-    eprintln!("    With OPT-1+2: {:.1} hours ({:.1} days)", hours_best, hours_best / 24.0);
+    eprintln!("    Best ({}): {:.1} hours ({:.1} days)", best_name, hours_best, hours_best / 24.0);
     eprintln!();
 
     Ok(())
@@ -116,6 +135,8 @@ fn benchmark_step(sim: &mut GpuNBodyTwoPass, warmup: usize, measured: usize, var
             StepVariant::Baseline => sim.step_dkd(DT, 0.0, 0.0)?,
             StepVariant::Morton => sim.step_dkd_morton_reorder(DT, 0.0, 0.0)?,
             StepVariant::MortonShmem => sim.step_dkd_morton_shmem(DT, 0.0, 0.0)?,
+            StepVariant::WarpCoherent => sim.step_dkd_warpcoherent(DT, 0.0, 0.0)?,
+            StepVariant::MortonWarpCoherent => sim.step_dkd_morton_warpcoherent(DT, 0.0, 0.0)?,
         }
     }
 
@@ -128,6 +149,8 @@ fn benchmark_step(sim: &mut GpuNBodyTwoPass, warmup: usize, measured: usize, var
             StepVariant::Baseline => sim.step_dkd(DT, 0.0, 0.0)?,
             StepVariant::Morton => sim.step_dkd_morton_reorder(DT, 0.0, 0.0)?,
             StepVariant::MortonShmem => sim.step_dkd_morton_shmem(DT, 0.0, 0.0)?,
+            StepVariant::WarpCoherent => sim.step_dkd_warpcoherent(DT, 0.0, 0.0)?,
+            StepVariant::MortonWarpCoherent => sim.step_dkd_morton_warpcoherent(DT, 0.0, 0.0)?,
         }
         times.push(t0.elapsed().as_secs_f64() * 1000.0);
     }

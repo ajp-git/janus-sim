@@ -511,6 +511,122 @@ extern "C" __global__ void forces_twopass_accumulate(
 }
 
 // ============================================================================
+// [OPT-4] WARP-COHERENT TRAVERSAL
+// ============================================================================
+// All threads in a warp process the same tree node together.
+// Uses warp-level primitives: __shfl_sync, __any_sync, __all_sync
+// Stack is in shared memory (64 ints per warp = 256 bytes)
+// Launch with shared_mem_bytes = 8 warps × 64 × 4 = 2048 bytes per block
+
+extern "C" __global__ void forces_twopass_warpcoherent(
+    const float* __restrict__ pos_all,
+    const signed char* __restrict__ signs_all,
+    const float* __restrict__ node_pos,   // 7×f32 per node
+    const float* __restrict__ node_mass,
+    const int* __restrict__ left,
+    const int* __restrict__ right,
+    const int* __restrict__ node_types,
+    float* __restrict__ acc,
+    int n_all, int tree_sign, float theta, float softening
+    // accumulate derived from tree_sign: +1=overwrite, -1=accumulate
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // CRITICAL: All threads in warp must participate in sync operations
+    // Invalid threads will compute but not write results
+    bool valid = (tid < n_all);
+
+    // Derive accumulate from tree_sign (cudarc 12-param limit workaround)
+    int accumulate = (tree_sign < 0) ? 1 : 0;
+
+    extern __shared__ int shared_stack[];
+    int warp_id_in_block = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int* stack = shared_stack + warp_id_in_block * 128;  // 128 levels per warp
+
+    // Use tid=0 data for invalid threads to avoid out-of-bounds reads
+    int safe_tid = valid ? tid : 0;
+    float px = pos_all[safe_tid*3], py = pos_all[safe_tid*3+1], pz = pos_all[safe_tid*3+2];
+    int my_sign = signs_all[safe_tid];
+    float sign_factor = (my_sign == tree_sign) ? 1.0f : -1.0f;
+
+    float ax=0, ay=0, az=0;
+    float eps2 = softening*softening;
+    float theta2 = theta*theta;
+
+    int sp = 0;
+    if (lane == 0) stack[sp++] = 0;
+    __syncwarp(0xFFFFFFFF);
+
+    while (true) {
+        // Lane 0 broadcasts whether stack is empty
+        int stack_empty = (lane == 0 && sp <= 0) ? 1 : 0;
+        stack_empty = __shfl_sync(0xFFFFFFFF, stack_empty, 0);
+        if (stack_empty) break;
+
+        int node;
+        if (lane == 0) node = stack[--sp];
+        node = __shfl_sync(0xFFFFFFFF, node, 0);
+
+        if (node < 0) continue;
+        int nt = node_types[node];
+        if (nt == 0) continue;
+
+        int pb = node * 7;
+        float cx = node_pos[pb], cy = node_pos[pb+1], cz = node_pos[pb+2];
+        float hs = node_pos[pb+3];
+        float comx = node_pos[pb+4], comy = node_pos[pb+5], comz = node_pos[pb+6];
+        float m = node_mass[node];
+
+        float dx = cx-px, dy = cy-py, dz = cz-pz;
+        float r2 = dx*dx + dy*dy + dz*dz + 1e-20f;
+
+        // Opening criterion: leaf OR node far enough to approximate
+        bool should_approx = (nt == 1) || ((4.0f*hs*hs) < (theta2*r2));
+
+        // Warp-coherent decision making
+        bool all_approx = __all_sync(0xFFFFFFFF, should_approx);
+        bool all_descend = __all_sync(0xFFFFFFFF, !should_approx);
+
+        if (all_approx) {
+            // ALL threads agree to approximate - compute force
+            if (valid) {
+                float ddx = comx-px, ddy = comy-py, ddz = comz-pz;
+                float rp2 = ddx*ddx + ddy*ddy + ddz*ddz + eps2;
+                float irp3 = rsqrtf(rp2) / rp2;
+                float f = sign_factor * m * irp3;
+                ax += f*ddx; ay += f*ddy; az += f*ddz;
+            }
+        } else if (all_descend) {
+            // ALL threads agree to descend - push children
+            if (lane == 0) {
+                int lc = left[node], rc = right[node];
+                if (rc >= 0 && sp < 127) stack[sp++] = rc;
+                if (lc >= 0 && sp < 127) stack[sp++] = lc;
+            }
+        } else {
+            // MIXED decisions - conservative: descend (more accurate)
+            // This sacrifices some speed for correctness
+            if (lane == 0) {
+                int lc = left[node], rc = right[node];
+                if (rc >= 0 && sp < 127) stack[sp++] = rc;
+                if (lc >= 0 && sp < 127) stack[sp++] = lc;
+            }
+        }
+        __syncwarp();
+    }
+
+    // Only valid threads write results
+    if (valid) {
+        if (accumulate) {
+            acc[tid*3] += ax; acc[tid*3+1] += ay; acc[tid*3+2] += az;
+        } else {
+            acc[tid*3] = ax; acc[tid*3+1] = ay; acc[tid*3+2] = az;
+        }
+    }
+}
+
+// ============================================================================
 // [OPT-2] SHARED MEMORY CACHED TOP NODES
 // ============================================================================
 // Cache the top 1024 BVH nodes in shared memory (~44KB)
@@ -1170,6 +1286,7 @@ impl GpuNBodyTwoPass {
             "compute_morton_f32", "reorder_f32x3", "reorder_i32",
             "build_bvh_tp", "init_leaves_tp", "reduce_tp",
             "forces_twopass_overwrite", "forces_twopass_accumulate",
+            "forces_twopass_warpcoherent",
             "forces_twopass_shmem_overwrite", "forces_twopass_shmem_accumulate",
             "forces_direct_n2",
             "compute_morton_all", "reorder_by_idx_f32x3", "reorder_by_idx_i8",
@@ -2407,6 +2524,404 @@ impl GpuNBodyTwoPass {
         eprintln!("  --- PASS - ---");
         eprintln!("    tree build          : {:>6} ms", tree_neg.morton_ms + tree_neg.sort_ms + tree_neg.bvh_karras_ms + tree_neg.reduce_ms);
         eprintln!("    force- (shmem)      : {:>6} ms  <<<", t_force_neg_ms - (tree_neg.morton_ms + tree_neg.sort_ms + tree_neg.bvh_karras_ms + tree_neg.reduce_ms + tree_neg.reorder_ms + tree_neg.reset_ms + tree_neg.init_leaves_ms));
+        eprintln!("  kick                  : {:>6} ms", t_kick_ms);
+        eprintln!("  drift (2nd)           : {:>6} ms", t_drift2_ms);
+        eprintln!("  ─────────────────────────────────");
+        eprintln!("  TOTAL                 : {:>6} ms", total);
+        eprintln!();
+
+        Ok(())
+    }
+
+    /// [OPT-4] Warp-coherent traversal WITHOUT Morton reorder
+    pub fn step_dkd_warpcoherent(&mut self, dt: f64, hubble: f64, dtau_per_dt: f64) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Instant;
+
+        self.step_count += 1;
+        let step_num = self.step_count;
+
+        let half_dt = dt * 0.5;
+        let box_half = (self.box_size / 2.0) as f32;
+        let n = self.n_particles;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Warp-coherent config: 8 warps × 64 ints × 4 bytes = 2048 bytes
+        let warp_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 4096,  // 8 warps × 128 ints × 4 bytes
+        };
+
+        // ===== DRIFT (dt/2) =====
+        let t0 = Instant::now();
+        let drift_k = self.device.get_func("twopass", "drift_f32")
+            .ok_or("drift_f32 not found")?;
+        unsafe {
+            drift_k.clone().launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt as f32, box_half, n as i32,
+            ))?;
+        }
+        // Reset acceleration
+        let reset_f32_k = self.device.get_func("twopass", "reset_f32")
+            .ok_or("reset_f32 not found")?;
+        let acc_blocks = (n * 3 + 255) / 256;
+        let acc_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (acc_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            reset_f32_k.launch(acc_cfg, (&mut self.acc, (n * 3) as i32))?;
+        }
+        self.device.synchronize()?;
+        let t_drift_ms = t0.elapsed().as_millis();
+
+        // ===== PASS 1: Positive particles tree =====
+        let t0 = Instant::now();
+        let extract_k = self.device.get_func("twopass", "extract_by_sign")
+            .ok_or("extract_by_sign not found")?;
+        let reset_i32_k = self.device.get_func("twopass", "reset_i32")
+            .ok_or("reset_i32 not found")?;
+
+        unsafe {
+            reset_i32_k.clone().launch(LaunchConfig {
+                block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+            }, (&mut self.extract_count, 1))?;
+            extract_k.clone().launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.pos_sign, &mut self.idx_map,
+                n as i32, 1i32, &mut self.extract_count,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let tree_pos = self.build_single_sign_tree(1, self.n_positive)?;
+
+        // Force + (overwrite: tree_sign=+1) with warp-coherent
+        let forces_wc_k = self.device.get_func("twopass", "forces_twopass_warpcoherent")
+            .ok_or("forces_twopass_warpcoherent not found")?;
+        unsafe {
+            forces_wc_k.clone().launch(warp_cfg, (
+                &self.pos, &self.signs,
+                &self.bvh_node_pos, &self.bvh_node_mass,
+                &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                &mut self.acc,
+                n as i32, 1i32, self.theta as f32, self.softening as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_force_pos_ms = t0.elapsed().as_millis();
+
+        // ===== PASS 2: Negative particles tree =====
+        let t0 = Instant::now();
+        unsafe {
+            reset_i32_k.launch(LaunchConfig {
+                block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+            }, (&mut self.extract_count, 1))?;
+            extract_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.pos_sign, &mut self.idx_map,
+                n as i32, -1i32, &mut self.extract_count,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let tree_neg = self.build_single_sign_tree(-1, self.n_negative)?;
+
+        // Force - (accumulate: tree_sign=-1) with warp-coherent
+        unsafe {
+            forces_wc_k.launch(warp_cfg, (
+                &self.pos, &self.signs,
+                &self.bvh_node_pos, &self.bvh_node_mass,
+                &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                &mut self.acc,
+                n as i32, -1i32, self.theta as f32, self.softening as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_force_neg_ms = t0.elapsed().as_millis();
+
+        // ===== KICK (dt) =====
+        let t0 = Instant::now();
+        let kick_k = self.device.get_func("twopass", "kick_f32")
+            .ok_or("kick_f32 not found")?;
+        unsafe {
+            kick_k.launch(cfg, (
+                &mut self.vel, &self.acc,
+                dt as f32, n as i32,
+                hubble as f32, dtau_per_dt as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_kick_ms = t0.elapsed().as_millis();
+
+        // ===== DRIFT (dt/2) =====
+        let t0 = Instant::now();
+        unsafe {
+            drift_k.launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt as f32, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_drift2_ms = t0.elapsed().as_millis();
+
+        self.time += dt;
+
+        // Print timing
+        let total = t_drift_ms + t_force_pos_ms + t_force_neg_ms + t_kick_ms + t_drift2_ms;
+        eprintln!("[step {:03}] WARP-COHERENT TIMING (ms):", step_num);
+        eprintln!("  drift (1st)           : {:>6} ms", t_drift_ms);
+        eprintln!("  --- PASS + ---");
+        eprintln!("    tree build          : {:>6} ms", tree_pos.morton_ms + tree_pos.sort_ms + tree_pos.bvh_karras_ms + tree_pos.reduce_ms);
+        eprintln!("    force+ (warp-coh)   : {:>6} ms  <<<", t_force_pos_ms - (tree_pos.morton_ms + tree_pos.sort_ms + tree_pos.bvh_karras_ms + tree_pos.reduce_ms + tree_pos.reorder_ms + tree_pos.reset_ms + tree_pos.init_leaves_ms));
+        eprintln!("  --- PASS - ---");
+        eprintln!("    tree build          : {:>6} ms", tree_neg.morton_ms + tree_neg.sort_ms + tree_neg.bvh_karras_ms + tree_neg.reduce_ms);
+        eprintln!("    force- (warp-coh)   : {:>6} ms  <<<", t_force_neg_ms - (tree_neg.morton_ms + tree_neg.sort_ms + tree_neg.bvh_karras_ms + tree_neg.reduce_ms + tree_neg.reorder_ms + tree_neg.reset_ms + tree_neg.init_leaves_ms));
+        eprintln!("  kick                  : {:>6} ms", t_kick_ms);
+        eprintln!("  drift (2nd)           : {:>6} ms", t_drift2_ms);
+        eprintln!("  ─────────────────────────────────");
+        eprintln!("  TOTAL                 : {:>6} ms", total);
+        eprintln!();
+
+        Ok(())
+    }
+
+    /// [OPT-4] Warp-coherent traversal WITH Morton reorder
+    pub fn step_dkd_morton_warpcoherent(&mut self, dt: f64, hubble: f64, dtau_per_dt: f64) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Instant;
+
+        self.step_count += 1;
+        let step_num = self.step_count;
+
+        let half_dt = dt * 0.5;
+        let box_half = (self.box_size / 2.0) as f32;
+        let inv_cell_size = (2097152.0 / self.box_size) as f32;
+        let n = self.n_particles;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Warp-coherent config: 8 warps × 64 ints × 4 bytes = 2048 bytes
+        let warp_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 4096,  // 8 warps × 128 ints × 4 bytes
+        };
+
+        // ===== DRIFT (dt/2) =====
+        let t0 = Instant::now();
+        let drift_k = self.device.get_func("twopass", "drift_f32")
+            .ok_or("drift_f32 not found")?;
+        unsafe {
+            drift_k.clone().launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt as f32, box_half, n as i32,
+            ))?;
+        }
+        // Reset acceleration
+        let reset_f32_k = self.device.get_func("twopass", "reset_f32")
+            .ok_or("reset_f32 not found")?;
+        let acc_blocks = (n * 3 + 255) / 256;
+        let acc_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (acc_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            reset_f32_k.launch(acc_cfg, (&mut self.acc, (n * 3) as i32))?;
+        }
+        self.device.synchronize()?;
+        let t_drift_ms = t0.elapsed().as_millis();
+
+        // ===== MORTON REORDER ALL PARTICLES =====
+        let t0 = Instant::now();
+
+        let morton_k = self.device.get_func("twopass", "compute_morton_all")
+            .ok_or("compute_morton_all not found")?;
+        unsafe {
+            morton_k.launch(cfg, (
+                &self.pos, &mut self.morton_all, &mut self.sorted_all,
+                n as i32, box_half, inv_cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Radix sort Morton codes
+        let hist_k = self.device.get_func("twopass", "radix_histogram")
+            .ok_or("radix_histogram not found")?;
+        let prefix_k = self.device.get_func("twopass", "radix_prefix_sum")
+            .ok_or("radix_prefix_sum not found")?;
+        let scatter_k = self.device.get_func("twopass", "radix_scatter")
+            .ok_or("radix_scatter not found")?;
+
+        let n_blocks_all = blocks;
+        let hist_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (n_blocks_all as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let prefix_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        for pass in 0..8 {
+            let bit_shift = pass * 8;
+            let (keys_in, keys_out, vals_in, vals_out) = if pass % 2 == 0 {
+                (&self.morton_all, &mut self.morton_all_tmp,
+                 &self.sorted_all, &mut self.sorted_all_tmp)
+            } else {
+                (&self.morton_all_tmp, &mut self.morton_all,
+                 &self.sorted_all_tmp, &mut self.sorted_all)
+            };
+
+            unsafe {
+                hist_k.clone().launch(hist_cfg, (
+                    keys_in, &mut self.radix_hist_all, n as i32, bit_shift as i32
+                ))?;
+                prefix_k.clone().launch(prefix_cfg, (
+                    &mut self.radix_hist_all, &mut self.radix_global, n_blocks_all as i32
+                ))?;
+                scatter_k.clone().launch(hist_cfg, (
+                    keys_in, keys_out, vals_in, vals_out,
+                    &self.radix_hist_all, &self.radix_global,
+                    n as i32, bit_shift as i32
+                ))?;
+            }
+        }
+        self.device.synchronize()?;
+
+        // Reorder positions and signs
+        let reorder_pos_k = self.device.get_func("twopass", "reorder_by_idx_f32x3")
+            .ok_or("reorder_by_idx_f32x3 not found")?;
+        let reorder_sign_k = self.device.get_func("twopass", "reorder_by_idx_i8")
+            .ok_or("reorder_by_idx_i8 not found")?;
+
+        unsafe {
+            reorder_pos_k.clone().launch(cfg, (
+                &self.pos, &mut self.pos_sorted, &self.sorted_all, n as i32
+            ))?;
+            reorder_sign_k.launch(cfg, (
+                &self.signs, &mut self.signs_sorted, &self.sorted_all, n as i32
+            ))?;
+        }
+        std::mem::swap(&mut self.pos, &mut self.pos_sorted);
+        std::mem::swap(&mut self.signs, &mut self.signs_sorted);
+        self.device.synchronize()?;
+        let t_reorder_ms = t0.elapsed().as_millis();
+
+        // ===== PASS 1: Positive particles tree =====
+        let t0 = Instant::now();
+        let extract_k = self.device.get_func("twopass", "extract_by_sign")
+            .ok_or("extract_by_sign not found")?;
+        let reset_i32_k = self.device.get_func("twopass", "reset_i32")
+            .ok_or("reset_i32 not found")?;
+
+        unsafe {
+            reset_i32_k.clone().launch(LaunchConfig {
+                block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+            }, (&mut self.extract_count, 1))?;
+            extract_k.clone().launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.pos_sign, &mut self.idx_map,
+                n as i32, 1i32, &mut self.extract_count,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let tree_pos = self.build_single_sign_tree(1, self.n_positive)?;
+
+        // Force + (overwrite: tree_sign=+1) with warp-coherent
+        let forces_wc_k = self.device.get_func("twopass", "forces_twopass_warpcoherent")
+            .ok_or("forces_twopass_warpcoherent not found")?;
+        unsafe {
+            forces_wc_k.clone().launch(warp_cfg, (
+                &self.pos, &self.signs,
+                &self.bvh_node_pos, &self.bvh_node_mass,
+                &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                &mut self.acc,
+                n as i32, 1i32, self.theta as f32, self.softening as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_force_pos_ms = t0.elapsed().as_millis();
+
+        // ===== PASS 2: Negative particles tree =====
+        let t0 = Instant::now();
+        unsafe {
+            reset_i32_k.launch(LaunchConfig {
+                block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+            }, (&mut self.extract_count, 1))?;
+            extract_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.pos_sign, &mut self.idx_map,
+                n as i32, -1i32, &mut self.extract_count,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let tree_neg = self.build_single_sign_tree(-1, self.n_negative)?;
+
+        // Force - (accumulate: tree_sign=-1) with warp-coherent
+        unsafe {
+            forces_wc_k.launch(warp_cfg, (
+                &self.pos, &self.signs,
+                &self.bvh_node_pos, &self.bvh_node_mass,
+                &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                &mut self.acc,
+                n as i32, -1i32, self.theta as f32, self.softening as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_force_neg_ms = t0.elapsed().as_millis();
+
+        // ===== KICK (dt) =====
+        let t0 = Instant::now();
+        let kick_k = self.device.get_func("twopass", "kick_f32")
+            .ok_or("kick_f32 not found")?;
+        unsafe {
+            kick_k.launch(cfg, (
+                &mut self.vel, &self.acc,
+                dt as f32, n as i32,
+                hubble as f32, dtau_per_dt as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_kick_ms = t0.elapsed().as_millis();
+
+        // ===== DRIFT (dt/2) =====
+        let t0 = Instant::now();
+        unsafe {
+            drift_k.launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt as f32, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_drift2_ms = t0.elapsed().as_millis();
+
+        self.time += dt;
+
+        // Print timing
+        let total = t_drift_ms + t_reorder_ms + t_force_pos_ms + t_force_neg_ms + t_kick_ms + t_drift2_ms;
+        eprintln!("[step {:03}] MORTON+WARP-COHERENT TIMING (ms):", step_num);
+        eprintln!("  drift (1st)           : {:>6} ms", t_drift_ms);
+        eprintln!("  morton sort+reorder   : {:>6} ms", t_reorder_ms);
+        eprintln!("  --- PASS + ---");
+        eprintln!("    tree build          : {:>6} ms", tree_pos.morton_ms + tree_pos.sort_ms + tree_pos.bvh_karras_ms + tree_pos.reduce_ms);
+        eprintln!("    force+ (warp-coh)   : {:>6} ms  <<<", t_force_pos_ms - (tree_pos.morton_ms + tree_pos.sort_ms + tree_pos.bvh_karras_ms + tree_pos.reduce_ms + tree_pos.reorder_ms + tree_pos.reset_ms + tree_pos.init_leaves_ms));
+        eprintln!("  --- PASS - ---");
+        eprintln!("    tree build          : {:>6} ms", tree_neg.morton_ms + tree_neg.sort_ms + tree_neg.bvh_karras_ms + tree_neg.reduce_ms);
+        eprintln!("    force- (warp-coh)   : {:>6} ms  <<<", t_force_neg_ms - (tree_neg.morton_ms + tree_neg.sort_ms + tree_neg.bvh_karras_ms + tree_neg.reduce_ms + tree_neg.reorder_ms + tree_neg.reset_ms + tree_neg.init_leaves_ms));
         eprintln!("  kick                  : {:>6} ms", t_kick_ms);
         eprintln!("  drift (2nd)           : {:>6} ms", t_drift2_ms);
         eprintln!("  ─────────────────────────────────");

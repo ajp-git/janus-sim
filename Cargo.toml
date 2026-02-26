@@ -307,3 +307,13 @@ required-features = ["cuda"]
 name = "bench_force"
 path = "src/bin/bench_force.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "quick_warpcoherent_test"
+path = "src/bin/quick_warpcoherent_test.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_warpcoherent_scaling"
+path = "src/bin/test_warpcoherent_scaling.rs"
+required-features = ["cuda"]

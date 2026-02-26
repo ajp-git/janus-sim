@@ -510,6 +510,88 @@ extern "C" __global__ void forces_twopass_accumulate(
     acc[tid * 3 + 2] += az;
 }
 
+// ============================================================================
+// DIRECT N² KERNEL: Shared memory tiling (CUDA SDK particles.cu style)
+// ============================================================================
+// O(N²) exact computation - no tree, no approximation
+// Uses shared memory to maximize arithmetic intensity
+
+extern "C" __global__ void forces_direct_n2(
+    const float* __restrict__ pos,      // [n×3] SoA
+    const signed char* __restrict__ signs,
+    float* __restrict__ acc,            // [n×3] output
+    int n, float eta, float eps2
+) {
+    extern __shared__ float sh_data[];  // 256 × 4 floats = 4KB
+    float* sh_x = sh_data;              // [256]
+    float* sh_y = sh_data + 256;        // [256]
+    float* sh_z = sh_data + 512;        // [256]
+    signed char* sh_sign = (signed char*)(sh_data + 768);  // [256]
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load my particle
+    float px = 0, py = 0, pz = 0;
+    int my_sign = 0;
+    if (i < n) {
+        px = pos[i * 3];
+        py = pos[i * 3 + 1];
+        pz = pos[i * 3 + 2];
+        my_sign = (int)signs[i];
+    }
+
+    float ax = 0.0f, ay = 0.0f, az = 0.0f;
+
+    // Process all tiles
+    int n_tiles = (n + blockDim.x - 1) / blockDim.x;
+    for (int tile = 0; tile < n_tiles; tile++) {
+        // Cooperative load: each thread loads one particle to shared memory
+        int j_load = tile * blockDim.x + threadIdx.x;
+        if (j_load < n) {
+            sh_x[threadIdx.x] = pos[j_load * 3];
+            sh_y[threadIdx.x] = pos[j_load * 3 + 1];
+            sh_z[threadIdx.x] = pos[j_load * 3 + 2];
+            sh_sign[threadIdx.x] = signs[j_load];
+        } else {
+            sh_x[threadIdx.x] = 0;
+            sh_y[threadIdx.x] = 0;
+            sh_z[threadIdx.x] = 0;
+            sh_sign[threadIdx.x] = 0;
+        }
+        __syncthreads();
+
+        // Each thread computes against all 256 particles in tile
+        if (i < n) {
+            int tile_end = min(blockDim.x, n - tile * blockDim.x);
+            #pragma unroll 8
+            for (int j = 0; j < tile_end; j++) {
+                float dx = sh_x[j] - px;
+                float dy = sh_y[j] - py;
+                float dz = sh_z[j] - pz;
+                float r2 = dx*dx + dy*dy + dz*dz + eps2;
+                float inv_r3 = rsqrtf(r2) / r2;
+
+                // Janus physics: same sign attracts, opposite repels
+                int other_sign = (int)sh_sign[j];
+                float interaction = (my_sign == other_sign) ? 1.0f : -eta;
+                float f = interaction * inv_r3;  // mass = 1
+
+                ax += f * dx;
+                ay += f * dy;
+                az += f * dz;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Write result
+    if (i < n) {
+        acc[i * 3]     = ax;
+        acc[i * 3 + 1] = ay;
+        acc[i * 3 + 2] = az;
+    }
+}
+
 extern "C" __global__ void reset_i32(int* __restrict__ buf, int n) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < n) buf[tid] = 0;
@@ -528,6 +610,80 @@ extern "C" __global__ void reset_f64(double* __restrict__ buf, int n) {
 extern "C" __global__ void reset_f32(float* __restrict__ buf, int n) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < n) buf[tid] = 0.0f;
+}
+
+// ============================================================================
+// MORTON REORDER: Sort ALL particles by space-filling curve to reduce warp divergence
+// ============================================================================
+
+// Compute Morton codes for ALL particles (not just one sign)
+extern "C" __global__ void compute_morton_all(
+    const float* __restrict__ pos,
+    unsigned long long* __restrict__ morton,
+    int* __restrict__ indices,
+    int n, float box_half, float inv_cell_size
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    float px = pos[tid * 3];
+    float py = pos[tid * 3 + 1];
+    float pz = pos[tid * 3 + 2];
+
+    // Normalize to [0, 2^21-1] for 21-bit Morton per axis
+    unsigned int ix = (unsigned int)fminf(fmaxf((px + box_half) * inv_cell_size, 0.0f), 2097151.0f);
+    unsigned int iy = (unsigned int)fminf(fmaxf((py + box_half) * inv_cell_size, 0.0f), 2097151.0f);
+    unsigned int iz = (unsigned int)fminf(fmaxf((pz + box_half) * inv_cell_size, 0.0f), 2097151.0f);
+
+    // Expand to 63 bits total (21 bits × 3)
+    unsigned long long mx = ix, my = iy, mz = iz;
+    mx = (mx | (mx << 32)) & 0x1f00000000ffffULL;
+    mx = (mx | (mx << 16)) & 0x1f0000ff0000ffULL;
+    mx = (mx | (mx << 8))  & 0x100f00f00f00f00fULL;
+    mx = (mx | (mx << 4))  & 0x10c30c30c30c30c3ULL;
+    mx = (mx | (mx << 2))  & 0x1249249249249249ULL;
+
+    my = (my | (my << 32)) & 0x1f00000000ffffULL;
+    my = (my | (my << 16)) & 0x1f0000ff0000ffULL;
+    my = (my | (my << 8))  & 0x100f00f00f00f00fULL;
+    my = (my | (my << 4))  & 0x10c30c30c30c30c3ULL;
+    my = (my | (my << 2))  & 0x1249249249249249ULL;
+
+    mz = (mz | (mz << 32)) & 0x1f00000000ffffULL;
+    mz = (mz | (mz << 16)) & 0x1f0000ff0000ffULL;
+    mz = (mz | (mz << 8))  & 0x100f00f00f00f00fULL;
+    mz = (mz | (mz << 4))  & 0x10c30c30c30c30c3ULL;
+    mz = (mz | (mz << 2))  & 0x1249249249249249ULL;
+
+    morton[tid] = mx | (my << 1) | (mz << 2);
+    indices[tid] = tid;
+}
+
+// Reorder float3 array by sorted indices
+extern "C" __global__ void reorder_by_idx_f32x3(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    const int* __restrict__ idx,
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    int src_idx = idx[tid];
+    dst[tid * 3]     = src[src_idx * 3];
+    dst[tid * 3 + 1] = src[src_idx * 3 + 1];
+    dst[tid * 3 + 2] = src[src_idx * 3 + 2];
+}
+
+// Reorder signed char array by sorted indices
+extern "C" __global__ void reorder_by_idx_i8(
+    const signed char* __restrict__ src,
+    signed char* __restrict__ dst,
+    const int* __restrict__ idx,
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    dst[tid] = src[idx[tid]];
 }
 
 // ============================================================================
@@ -698,6 +854,14 @@ pub struct GpuNBodyTwoPass {
     sorted_indices_tmp: CudaSlice<i32>,
     radix_hist: CudaSlice<u32>,      // [n_blocks × 256]
     radix_global: CudaSlice<u32>,    // [256]
+    // Global Morton reorder buffers (sized for N_total = N+ + N-)
+    morton_all: CudaSlice<u64>,
+    morton_all_tmp: CudaSlice<u64>,
+    sorted_all: CudaSlice<i32>,
+    sorted_all_tmp: CudaSlice<i32>,
+    pos_sorted: CudaSlice<f32>,      // [n_total × 3]
+    signs_sorted: CudaSlice<i8>,     // [n_total]
+    radix_hist_all: CudaSlice<u32>,  // for n_total radix sort
     // BVH for single-sign tree (sized for max(N+, N-))
     bvh_left: CudaSlice<i32>,
     bvh_right: CudaSlice<i32>,
@@ -750,6 +914,8 @@ impl GpuNBodyTwoPass {
             "compute_morton_f32", "reorder_f32x3", "reorder_i32",
             "build_bvh_tp", "init_leaves_tp", "reduce_tp",
             "forces_twopass_overwrite", "forces_twopass_accumulate",
+            "forces_direct_n2",
+            "compute_morton_all", "reorder_by_idx_f32x3", "reorder_by_idx_i8",
             "reset_i32", "reset_f64", "reset_f32", "set_i32",
             "radix_histogram", "radix_prefix_sum", "radix_scatter"
         ])?;
@@ -858,7 +1024,7 @@ impl GpuNBodyTwoPass {
         let idx_map_tmp = device.alloc_zeros::<i32>(n_max_sign)?;
         let extract_count = device.alloc_zeros::<i32>(1)?;
 
-        // Morton sorting + radix sort buffers
+        // Morton sorting + radix sort buffers (for single-sign)
         let n_blocks = (n_max_sign + 255) / 256;
         let morton_codes = device.alloc_zeros::<u64>(n_max_sign)?;
         let morton_codes_tmp = device.alloc_zeros::<u64>(n_max_sign)?;
@@ -866,6 +1032,16 @@ impl GpuNBodyTwoPass {
         let sorted_indices_tmp = device.alloc_zeros::<i32>(n_max_sign)?;
         let radix_hist = device.alloc_zeros::<u32>(n_blocks * 256)?;
         let radix_global = device.alloc_zeros::<u32>(256)?;
+
+        // Global Morton reorder buffers (for ALL particles = n_total)
+        let n_blocks_all = (n_total + 255) / 256;
+        let morton_all = device.alloc_zeros::<u64>(n_total)?;
+        let morton_all_tmp = device.alloc_zeros::<u64>(n_total)?;
+        let sorted_all = device.alloc_zeros::<i32>(n_total)?;
+        let sorted_all_tmp = device.alloc_zeros::<i32>(n_total)?;
+        let pos_sorted = device.alloc_zeros::<f32>(n_total * 3)?;
+        let signs_sorted = device.alloc_zeros::<i8>(n_total)?;
+        let radix_hist_all = device.alloc_zeros::<u32>(n_blocks_all * 256)?;
 
         // BVH for single-sign (7×f32 + 1×f64 per node = 36 bytes vs 56)
         let bvh_left = device.alloc_zeros::<i32>(n_bvh)?;
@@ -900,6 +1076,8 @@ impl GpuNBodyTwoPass {
             pos_sign, pos_sign_tmp, idx_map, idx_map_tmp, extract_count,
             morton_codes, morton_codes_tmp, sorted_indices, sorted_indices_tmp,
             radix_hist, radix_global,
+            morton_all, morton_all_tmp, sorted_all, sorted_all_tmp,
+            pos_sorted, signs_sorted, radix_hist_all,
             bvh_left, bvh_right, bvh_parent, bvh_rl, bvh_rr,
             bvh_node_pos, bvh_node_mass, bvh_node_types, bvh_atomic,
             n_particles: n_total,
@@ -1408,6 +1586,338 @@ impl GpuNBodyTwoPass {
         eprintln!("    force- (accumulate) : {:>6} ms  <<<", t_force_neg_ms);
         eprintln!("  kick                  : {:>6} ms", t_kick_ms);
         eprintln!("  drift (2nd half)      : {:>6} ms", t_drift2_ms);
+        eprintln!("  ─────────────────────────────────");
+        eprintln!("  TOTAL                 : {:>6} ms", total);
+        eprintln!();
+
+        Ok(())
+    }
+
+    /// Direct N² force computation - O(N²) exact, no tree approximation
+    /// Uses shared memory tiling for maximum GPU efficiency
+    pub fn step_dkd_direct(&mut self, dt: f64, hubble: f64, dtau_per_dt: f64) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Instant;
+
+        self.step_count += 1;
+        let step_num = self.step_count;
+
+        let half_dt = dt * 0.5;
+        let box_half = (self.box_size / 2.0) as f32;
+        let n = self.n_particles;
+        let eta = 1.045f32;  // Janus parameter
+        let eps2 = (self.softening * self.softening) as f32;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Shared memory config for N² kernel: 256 × (3 floats + 1 byte) aligned
+        let cfg_n2 = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 256 * 4 * 4,  // 256 × 4 floats = 4KB
+        };
+
+        // ===== DRIFT (dt/2) =====
+        let t_drift = Instant::now();
+        let drift_k = self.device.get_func("twopass", "drift_f32")
+            .ok_or("drift_f32 not found")?;
+        unsafe {
+            drift_k.clone().launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt as f32, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_drift_ms = t_drift.elapsed().as_millis();
+
+        // ===== FORCE (N² direct) =====
+        let t_force = Instant::now();
+        let force_k = self.device.get_func("twopass", "forces_direct_n2")
+            .ok_or("forces_direct_n2 not found")?;
+        unsafe {
+            force_k.launch(cfg_n2, (
+                &self.pos, &self.signs, &mut self.acc,
+                n as i32, eta, eps2,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_force_ms = t_force.elapsed().as_millis();
+
+        // ===== KICK (dt) =====
+        let t_kick = Instant::now();
+        let kick_k = self.device.get_func("twopass", "kick_f32")
+            .ok_or("kick_f32 not found")?;
+        unsafe {
+            kick_k.launch(cfg, (
+                &mut self.vel, &self.acc,
+                dt as f32, n as i32,
+                hubble as f32, dtau_per_dt as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_kick_ms = t_kick.elapsed().as_millis();
+
+        // ===== DRIFT (dt/2) =====
+        let t_drift2 = Instant::now();
+        unsafe {
+            drift_k.launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt as f32, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_drift2_ms = t_drift2.elapsed().as_millis();
+
+        self.time += dt;
+
+        // Print timing
+        let total = t_drift_ms + t_force_ms + t_kick_ms + t_drift2_ms;
+        eprintln!("[step {:03}] N² DIRECT TIMING (ms):", step_num);
+        eprintln!("  drift (1st)  : {:>8} ms", t_drift_ms);
+        eprintln!("  force N²     : {:>8} ms  <<< O(N²) = {}×{}", t_force_ms, n, n);
+        eprintln!("  kick         : {:>8} ms", t_kick_ms);
+        eprintln!("  drift (2nd)  : {:>8} ms", t_drift2_ms);
+        eprintln!("  ─────────────────────────");
+        eprintln!("  TOTAL        : {:>8} ms", total);
+        eprintln!();
+
+        Ok(())
+    }
+
+    /// Morton-reorder step: Sort all particles by Morton code to reduce warp divergence
+    /// Spatially nearby particles get consecutive thread IDs → coherent tree traversal
+    pub fn step_dkd_morton_reorder(&mut self, dt: f64, hubble: f64, dtau_per_dt: f64) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Instant;
+
+        self.step_count += 1;
+        let step_num = self.step_count;
+
+        let half_dt = dt * 0.5;
+        let box_half = (self.box_size / 2.0) as f32;
+        let inv_cell_size = (2097152.0 / self.box_size) as f32;
+        let n = self.n_particles;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // ===== DRIFT (dt/2) =====
+        let t0 = Instant::now();
+        let drift_k = self.device.get_func("twopass", "drift_f32")
+            .ok_or("drift_f32 not found")?;
+        unsafe {
+            drift_k.clone().launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt as f32, box_half, n as i32,
+            ))?;
+        }
+        // Reset acceleration
+        let reset_f32_k = self.device.get_func("twopass", "reset_f32")
+            .ok_or("reset_f32 not found")?;
+        let acc_blocks = (n * 3 + 255) / 256;
+        let acc_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (acc_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            reset_f32_k.launch(acc_cfg, (&mut self.acc, (n * 3) as i32))?;
+        }
+        self.device.synchronize()?;
+        let t_drift_ms = t0.elapsed().as_millis();
+
+        // ===== MORTON REORDER ALL PARTICLES =====
+        let t0 = Instant::now();
+
+        // Compute Morton codes for all particles
+        let morton_k = self.device.get_func("twopass", "compute_morton_all")
+            .ok_or("compute_morton_all not found")?;
+        unsafe {
+            morton_k.launch(cfg, (
+                &self.pos, &mut self.morton_all, &mut self.sorted_all,
+                n as i32, box_half, inv_cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Radix sort Morton codes (8 passes)
+        let hist_k = self.device.get_func("twopass", "radix_histogram")
+            .ok_or("radix_histogram not found")?;
+        let prefix_k = self.device.get_func("twopass", "radix_prefix_sum")
+            .ok_or("radix_prefix_sum not found")?;
+        let scatter_k = self.device.get_func("twopass", "radix_scatter")
+            .ok_or("radix_scatter not found")?;
+
+        let n_blocks_all = blocks;
+        let hist_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (n_blocks_all as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let prefix_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        for pass in 0..8 {
+            let bit_shift = pass * 8;
+            let (keys_in, keys_out, vals_in, vals_out) = if pass % 2 == 0 {
+                (&self.morton_all, &mut self.morton_all_tmp,
+                 &self.sorted_all, &mut self.sorted_all_tmp)
+            } else {
+                (&self.morton_all_tmp, &mut self.morton_all,
+                 &self.sorted_all_tmp, &mut self.sorted_all)
+            };
+
+            unsafe {
+                hist_k.clone().launch(hist_cfg, (
+                    keys_in, &mut self.radix_hist_all, n as i32, bit_shift as i32
+                ))?;
+                prefix_k.clone().launch(prefix_cfg, (
+                    &mut self.radix_hist_all, &mut self.radix_global, n_blocks_all as i32
+                ))?;
+                scatter_k.clone().launch(hist_cfg, (
+                    keys_in, keys_out, vals_in, vals_out,
+                    &self.radix_hist_all, &self.radix_global,
+                    n as i32, bit_shift as i32
+                ))?;
+            }
+        }
+        self.device.synchronize()?;
+
+        // Reorder positions and signs by sorted indices
+        let reorder_pos_k = self.device.get_func("twopass", "reorder_by_idx_f32x3")
+            .ok_or("reorder_by_idx_f32x3 not found")?;
+        let reorder_sign_k = self.device.get_func("twopass", "reorder_by_idx_i8")
+            .ok_or("reorder_by_idx_i8 not found")?;
+
+        unsafe {
+            reorder_pos_k.clone().launch(cfg, (
+                &self.pos, &mut self.pos_sorted, &self.sorted_all, n as i32
+            ))?;
+            reorder_sign_k.launch(cfg, (
+                &self.signs, &mut self.signs_sorted, &self.sorted_all, n as i32
+            ))?;
+        }
+        // Swap buffers: sorted becomes main
+        std::mem::swap(&mut self.pos, &mut self.pos_sorted);
+        std::mem::swap(&mut self.signs, &mut self.signs_sorted);
+        self.device.synchronize()?;
+        let t_reorder_ms = t0.elapsed().as_millis();
+
+        // ===== PASS 1: Positive particles tree =====
+        let t0 = Instant::now();
+        let extract_k = self.device.get_func("twopass", "extract_by_sign")
+            .ok_or("extract_by_sign not found")?;
+        let reset_i32_k = self.device.get_func("twopass", "reset_i32")
+            .ok_or("reset_i32 not found")?;
+
+        unsafe {
+            reset_i32_k.clone().launch(LaunchConfig {
+                block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+            }, (&mut self.extract_count, 1))?;
+            extract_k.clone().launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.pos_sign, &mut self.idx_map,
+                n as i32, 1i32, &mut self.extract_count,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let tree_pos = self.build_single_sign_tree(1, self.n_positive)?;
+
+        // Force + (overwrite)
+        let forces_ow_k = self.device.get_func("twopass", "forces_twopass_overwrite")
+            .ok_or("forces_twopass_overwrite not found")?;
+        unsafe {
+            forces_ow_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &self.bvh_node_pos, &self.bvh_node_mass,
+                &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                &mut self.acc,
+                n as i32, 1i32, self.theta as f32, self.softening as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_force_pos_ms = t0.elapsed().as_millis();
+
+        // ===== PASS 2: Negative particles tree =====
+        let t0 = Instant::now();
+        unsafe {
+            reset_i32_k.launch(LaunchConfig {
+                block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+            }, (&mut self.extract_count, 1))?;
+            extract_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.pos_sign, &mut self.idx_map,
+                n as i32, -1i32, &mut self.extract_count,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let tree_neg = self.build_single_sign_tree(-1, self.n_negative)?;
+
+        // Force - (accumulate)
+        let forces_acc_k = self.device.get_func("twopass", "forces_twopass_accumulate")
+            .ok_or("forces_twopass_accumulate not found")?;
+        unsafe {
+            forces_acc_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &self.bvh_node_pos, &self.bvh_node_mass,
+                &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                &mut self.acc,
+                n as i32, -1i32, self.theta as f32, self.softening as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_force_neg_ms = t0.elapsed().as_millis();
+
+        // ===== KICK (dt) =====
+        let t0 = Instant::now();
+        let kick_k = self.device.get_func("twopass", "kick_f32")
+            .ok_or("kick_f32 not found")?;
+        unsafe {
+            kick_k.launch(cfg, (
+                &mut self.vel, &self.acc,
+                dt as f32, n as i32,
+                hubble as f32, dtau_per_dt as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_kick_ms = t0.elapsed().as_millis();
+
+        // ===== DRIFT (dt/2) =====
+        let t0 = Instant::now();
+        unsafe {
+            drift_k.launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt as f32, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let t_drift2_ms = t0.elapsed().as_millis();
+
+        self.time += dt;
+
+        // Print timing
+        let total = t_drift_ms + t_reorder_ms + t_force_pos_ms + t_force_neg_ms + t_kick_ms + t_drift2_ms;
+        eprintln!("[step {:03}] MORTON-REORDER TIMING (ms):", step_num);
+        eprintln!("  drift (1st)           : {:>6} ms", t_drift_ms);
+        eprintln!("  morton sort+reorder   : {:>6} ms", t_reorder_ms);
+        eprintln!("  --- PASS + ---");
+        eprintln!("    tree build          : {:>6} ms", tree_pos.morton_ms + tree_pos.sort_ms + tree_pos.bvh_karras_ms + tree_pos.reduce_ms);
+        eprintln!("    force+ (overwrite)  : {:>6} ms  <<<", t_force_pos_ms - (tree_pos.morton_ms + tree_pos.sort_ms + tree_pos.bvh_karras_ms + tree_pos.reduce_ms + tree_pos.reorder_ms + tree_pos.reset_ms + tree_pos.init_leaves_ms));
+        eprintln!("  --- PASS - ---");
+        eprintln!("    tree build          : {:>6} ms", tree_neg.morton_ms + tree_neg.sort_ms + tree_neg.bvh_karras_ms + tree_neg.reduce_ms);
+        eprintln!("    force- (accumulate) : {:>6} ms  <<<", t_force_neg_ms - (tree_neg.morton_ms + tree_neg.sort_ms + tree_neg.bvh_karras_ms + tree_neg.reduce_ms + tree_neg.reorder_ms + tree_neg.reset_ms + tree_neg.init_leaves_ms));
+        eprintln!("  kick                  : {:>6} ms", t_kick_ms);
+        eprintln!("  drift (2nd)           : {:>6} ms", t_drift2_ms);
         eprintln!("  ─────────────────────────────────");
         eprintln!("  TOTAL                 : {:>6} ms", total);
         eprintln!();

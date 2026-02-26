@@ -151,6 +151,9 @@ env_logger = "0.11"
 rustfft = "6.2"
 num-complex = "0.4"
 
+# Date/time for output directories
+chrono = "0.4"
+
 [dev-dependencies]
 approx = "0.5"
 
@@ -173,3 +176,79 @@ path = "src/bin/jour4_filaments.rs"
 [[bin]]
 name = "segregation_z1000"
 path = "src/bin/segregation_z1000.rs"
+
+[[bin]]
+name = "test_twopass"
+path = "src/bin/test_twopass.rs"
+
+[[bin]]
+name = "janus_85m"
+path = "src/bin/janus_85m.rs"
+
+[[bin]]
+name = "test_tree_small"
+path = "src/bin/test_tree_small.rs"
+
+[[bin]]
+name = "janus_10m"
+path = "src/bin/janus_10m.rs"
+
+[[bin]]
+name = "test_small"
+path = "src/bin/test_small.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_theta08"
+path = "src/bin/test_theta08.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_5m_theta"
+path = "src/bin/test_5m_theta.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_gpu_bvh"
+path = "src/bin/test_gpu_bvh.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_force_scaling"
+path = "src/bin/test_scaling.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "verify_sort"
+path = "src/bin/verify_sort.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "scaling_quick"
+path = "src/bin/scaling_quick.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_original"
+path = "src/bin/test_original.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_theta_twopass"
+path = "src/bin/test_theta_twopass.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "run_8m_zeldovich"
+path = "src/bin/run_8m_zeldovich.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "run_8m_virialized"
+path = "src/bin/run_8m_virialized.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_8m_debug"
+path = "src/bin/test_8m_debug.rs"
+required-features = ["cuda"]

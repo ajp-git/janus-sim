@@ -12,6 +12,12 @@ pub mod analysis;
 #[cfg(feature = "cuda")]
 pub mod nbody_gpu;
 
+#[cfg(feature = "cuda")]
+pub mod nbody_gpu_mixed;
+
+#[cfg(feature = "cuda")]
+pub mod nbody_gpu_twopass;
+
 /// Physical constants (SI units)
 pub mod constants {
     /// Speed of light (m/s)

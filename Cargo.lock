@@ -359,6 +359,7 @@ dependencies = [
  "approx",
  "argmin",
  "argmin-math",
+ "chrono",
  "csv",
  "cudarc",
  "env_logger",

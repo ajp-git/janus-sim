@@ -1,91 +1,181 @@
 #!/usr/bin/env python3
-"""Visualize Janus snapshot with 3 projections (xy, xz, yz)"""
+"""
+Visualize Janus snapshot with 3 projections (XY, XZ, YZ)
+Uses numpy accumulator for 85M+ particles (fast raster rendering)
+
+New snapshot format (janus_85m.rs):
+  Header: 128 bytes text "step=X time=X.XXX eta=X n=XXXXXXXX\n" + padding
+  pos:    N × 3 × f32
+  vel:    N × 3 × f32
+  signs:  N × i8
+"""
 
 import numpy as np
-import matplotlib.pyplot as plt
-import struct
+from PIL import Image, ImageDraw, ImageFont
 import sys
+from pathlib import Path
+
+# Image dimensions
+VIEW_SIZE = 1280
+IMG_WIDTH = 3840
+IMG_HEIGHT = 1280
+
+# Colors (RGB, 0-1 range)
+COLOR_POS = np.array([0.27, 0.53, 1.0], dtype=np.float32)   # #4488FF (blue)
+COLOR_NEG = np.array([1.0, 0.27, 0.13], dtype=np.float32)   # #FF4422 (red)
+ALPHA = 0.15
+
 
 def read_snapshot(path):
-    """Read snapshot binary file"""
+    """Read new-format snapshot binary file"""
     with open(path, 'rb') as f:
-        # Header: 32 bytes
-        n = struct.unpack('<Q', f.read(8))[0]
-        step = struct.unpack('<Q', f.read(8))[0]
-        scale_factor = struct.unpack('<d', f.read(8))[0]
-        segregation = struct.unpack('<d', f.read(8))[0]
+        # Header: 128 bytes text
+        header = f.read(128).decode('utf-8', errors='ignore').strip()
 
-        # Particle data: x,y,z (f32), sign (i8) per particle
-        positions = np.zeros((n, 3), dtype=np.float32)
-        signs = np.zeros(n, dtype=np.int8)
+        # Parse header: "step=X time=X.XXX eta=X n=XXXXXXXX"
+        parts = {}
+        for part in header.split():
+            if '=' in part:
+                k, v = part.split('=', 1)
+                parts[k] = v
 
-        for i in range(n):
-            x, y, z = struct.unpack('<fff', f.read(12))
-            sign = struct.unpack('<b', f.read(1))[0]
-            positions[i] = [x, y, z]
-            signs[i] = sign
+        n = int(parts.get('n', 0))
+        step = int(parts.get('step', 0))
+        eta = float(parts.get('eta', 1.045))
+        time = float(parts.get('time', 0))
 
-    return positions, signs, step, scale_factor, segregation
+        print(f"  Header: step={step}, time={time:.3f}, eta={eta}, n={n:,}")
 
-def visualize_3panel(path, output_path, subsample=10):
-    """Create 3-panel projection visualization"""
-    print(f"Reading {path}...")
-    pos, signs, step, a, seg = read_snapshot(path)
+        # pos: N × 3 × f32
+        pos = np.frombuffer(f.read(n * 3 * 4), dtype=np.float32).reshape(n, 3)
+
+        # vel: N × 3 × f32 (skip for visualization)
+        f.seek(n * 3 * 4, 1)
+
+        # signs: N × i8
+        signs = np.frombuffer(f.read(n), dtype=np.int8)
+
+    return pos, signs, step, time, eta
+
+
+def render_particles(buf, pos, color, box_min, scale, x_offset):
+    """Render XY projection using numpy accumulator"""
+    x = pos[:, 0]
+    y = pos[:, 1]
+
+    ix = ((x - box_min) * scale).clip(0, VIEW_SIZE - 1).astype(np.int32) + x_offset
+    iy = ((y - box_min) * scale).clip(0, VIEW_SIZE - 1).astype(np.int32)
+    iy_flip = VIEW_SIZE - 1 - iy
+
+    np.add.at(buf, (iy_flip, ix, 0), color[0] * ALPHA)
+    np.add.at(buf, (iy_flip, ix, 1), color[1] * ALPHA)
+    np.add.at(buf, (iy_flip, ix, 2), color[2] * ALPHA)
+
+
+def render_particles_xz(buf, pos, color, box_min, scale, x_offset):
+    """Render XZ projection"""
+    x = pos[:, 0]
+    z = pos[:, 2]
+
+    ix = ((x - box_min) * scale).clip(0, VIEW_SIZE - 1).astype(np.int32) + x_offset
+    iz = ((z - box_min) * scale).clip(0, VIEW_SIZE - 1).astype(np.int32)
+    iz_flip = VIEW_SIZE - 1 - iz
+
+    np.add.at(buf, (iz_flip, ix, 0), color[0] * ALPHA)
+    np.add.at(buf, (iz_flip, ix, 1), color[1] * ALPHA)
+    np.add.at(buf, (iz_flip, ix, 2), color[2] * ALPHA)
+
+
+def render_particles_yz(buf, pos, color, box_min, scale, x_offset):
+    """Render YZ projection"""
+    y = pos[:, 1]
+    z = pos[:, 2]
+
+    iy = ((y - box_min) * scale).clip(0, VIEW_SIZE - 1).astype(np.int32) + x_offset
+    iz = ((z - box_min) * scale).clip(0, VIEW_SIZE - 1).astype(np.int32)
+    iz_flip = VIEW_SIZE - 1 - iz
+
+    np.add.at(buf, (iz_flip, iy, 0), color[0] * ALPHA)
+    np.add.at(buf, (iz_flip, iy, 1), color[1] * ALPHA)
+    np.add.at(buf, (iz_flip, iy, 2), color[2] * ALPHA)
+
+
+def visualize_snapshot(snap_path, output_path, box_size=None):
+    """Create 3-panel projection visualization using fast raster rendering"""
+    print(f"Reading {snap_path}...")
+    pos, signs, step, time, eta = read_snapshot(snap_path)
     n = len(signs)
 
-    print(f"  N={n}, step={step}, a={a:.4f}, S={seg:.4f}")
+    # Auto-detect box size from positions
+    if box_size is None:
+        box_size = (pos.max() - pos.min()) * 1.05
 
-    # Subsample for faster plotting
-    idx = np.arange(0, n, subsample)
-    pos_sub = pos[idx]
-    signs_sub = signs[idx]
+    print(f"  N={n:,}, box={box_size:.2f}")
 
-    # Separate + and - particles
-    mask_plus = signs_sub > 0
-    mask_minus = signs_sub < 0
+    # Calculate segregation
+    pos_plus = pos[signs > 0]
+    pos_minus = pos[signs <= 0]
 
-    pos_plus = pos_sub[mask_plus]
-    pos_minus = pos_sub[mask_minus]
+    com_plus = pos_plus.mean(axis=0) if len(pos_plus) > 0 else np.zeros(3)
+    com_minus = pos_minus.mean(axis=0) if len(pos_minus) > 0 else np.zeros(3)
+    seg = np.linalg.norm(com_plus - com_minus) / box_size
 
-    print(f"  Plotting {len(pos_plus)} m+ (blue), {len(pos_minus)} m- (red)")
+    print(f"  N+={len(pos_plus):,}, N-={len(pos_minus):,}, S={seg:.6f}")
 
-    # Create figure with 3 panels
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6), facecolor='white')
+    # Create RGBA buffer (black background)
+    buf = np.zeros((IMG_HEIGHT, IMG_WIDTH, 4), dtype=np.float32)
+    buf[:, :, 3] = 1.0  # Opaque black background
 
-    projections = [
-        (0, 1, 'X', 'Y', 'XY projection'),
-        (0, 2, 'X', 'Z', 'XZ projection'),
-        (1, 2, 'Y', 'Z', 'YZ projection'),
-    ]
+    # Coordinate mapping
+    box_min = -box_size / 2.0
+    scale = (VIEW_SIZE - 1) / box_size
 
-    for ax, (ix, iy, xlabel, ylabel, title) in zip(axes, projections):
-        ax.set_facecolor('white')
+    # Render positive particles (blue)
+    if len(pos_plus) > 0:
+        render_particles(buf, pos_plus, COLOR_POS, box_min, scale, 0)
+        render_particles_xz(buf, pos_plus, COLOR_POS, box_min, scale, VIEW_SIZE)
+        render_particles_yz(buf, pos_plus, COLOR_POS, box_min, scale, 2*VIEW_SIZE)
 
-        # Plot m- (red) first, then m+ (blue) on top
-        ax.scatter(pos_minus[:, ix], pos_minus[:, iy],
-                   c='red', s=0.1, alpha=0.3, rasterized=True)
-        ax.scatter(pos_plus[:, ix], pos_plus[:, iy],
-                   c='blue', s=0.1, alpha=0.3, rasterized=True)
+    # Render negative particles (red)
+    if len(pos_minus) > 0:
+        render_particles(buf, pos_minus, COLOR_NEG, box_min, scale, 0)
+        render_particles_xz(buf, pos_minus, COLOR_NEG, box_min, scale, VIEW_SIZE)
+        render_particles_yz(buf, pos_minus, COLOR_NEG, box_min, scale, 2*VIEW_SIZE)
 
-        ax.set_xlabel(f'{xlabel} [Mpc]', fontsize=12)
-        ax.set_ylabel(f'{ylabel} [Mpc]', fontsize=12)
-        ax.set_title(title, fontsize=14)
-        ax.set_aspect('equal')
-        ax.grid(True, alpha=0.3)
+    # Convert to uint8
+    img_data = (buf * 255).clip(0, 255).astype(np.uint8)
+    img = Image.fromarray(img_data, mode='RGBA')
 
-    fig.suptitle(f'Step {step} | S = {seg:.4f} | N = {n:,}', fontsize=16, y=1.02)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close()
+    # Draw title
+    draw = ImageDraw.Draw(img)
+    title = f"Step {step:06d}  |  t = {time:.3f}  |  S = {seg:.3e}  |  N = {n:,}"
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 32)
+    except:
+        font = ImageFont.load_default()
+
+    # Black background for title
+    draw.rectangle([0, 0, 850, 45], fill=(0, 0, 0, 220))
+    draw.text((20, 8), title, fill=(255, 255, 255, 255), font=font)
+
+    # Panel labels
+    labels = [("XY", 640), ("XZ", 1920), ("YZ", 3200)]
+    for label, x_center in labels:
+        draw.text((x_center - 20, IMG_HEIGHT - 40), label, fill=(255, 255, 255, 200), font=font)
+
+    # Save PNG
+    img.save(output_path)
     print(f"  Saved: {output_path}")
+
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:
-        print("Usage: python visualize_snapshot.py <snapshot.bin> <output.png> [subsample]")
+        print("Usage: python visualize_snapshot.py <snapshot.bin> <output.png> [box_size]")
+        print("  box_size: optional, auto-detected if not specified")
         sys.exit(1)
 
     snap_path = sys.argv[1]
     out_path = sys.argv[2]
-    subsample = int(sys.argv[3]) if len(sys.argv) > 3 else 10
+    box_size = float(sys.argv[3]) if len(sys.argv) > 3 else None
 
-    visualize_3panel(snap_path, out_path, subsample)
+    visualize_snapshot(snap_path, out_path, box_size)

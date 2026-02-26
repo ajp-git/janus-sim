@@ -3260,6 +3260,8 @@ impl GpuNBodySimulation {
 
     /// Compute binding potential energy (same-sign pairs only, always negative)
     /// Uses Barnes-Hut tree for O(N log N) complexity.
+    /// WARNING: For large N (>1M), this builds a LinearOctree which may OOM.
+    /// Use potential_energy_binding_sampled() for large N instead.
     pub fn potential_energy_binding(&self) -> Result<f64, Box<dyn std::error::Error>> {
         use rayon::prelude::*;
 
@@ -3286,6 +3288,106 @@ impl GpuNBodySimulation {
 
         // Divide by 2 to avoid double counting (each pair counted twice)
         Ok(pe_bind / 2.0)
+    }
+
+    /// Compute binding PE using sampling (for large N where full calculation would OOM)
+    /// Samples n_sample particles from each sign, computes PE directly, then extrapolates.
+    /// Accuracy improves with larger n_sample (recommend 5000-10000 for α estimation).
+    pub fn potential_energy_binding_sampled(&self, n_sample: usize) -> Result<f64, Box<dyn std::error::Error>> {
+        use rayon::prelude::*;
+
+        // Separate particles by sign
+        let positive: Vec<usize> = (0..self.n_particles)
+            .filter(|&i| self.particles_cpu[i].sign == 1)
+            .collect();
+        let negative: Vec<usize> = (0..self.n_particles)
+            .filter(|&i| self.particles_cpu[i].sign == -1)
+            .collect();
+
+        let n_pos = positive.len();
+        let n_neg = negative.len();
+
+        // Sample from each population using stride sampling (uniform distribution assumed)
+        let sample_pos: Vec<usize> = if n_pos <= n_sample {
+            positive.clone()
+        } else {
+            // Use stride sampling for speed (approximate uniform sampling)
+            let stride = n_pos / n_sample;
+            (0..n_sample).map(|i| positive[i * stride]).collect()
+        };
+        let sample_neg: Vec<usize> = if n_neg <= n_sample {
+            negative.clone()
+        } else {
+            let stride = n_neg / n_sample;
+            (0..n_sample).map(|i| negative[i * stride]).collect()
+        };
+
+        let ns_pos = sample_pos.len();
+        let ns_neg = sample_neg.len();
+
+        println!("  PE sampling: {} of {} positive, {} of {} negative",
+            ns_pos, n_pos, ns_neg, n_neg);
+
+        // Compute PE for positive sample (direct N² with parallelization)
+        let pe_pos_sample: f64 = sample_pos.par_iter()
+            .enumerate()
+            .map(|(idx_i, &i)| {
+                let pi = &self.particles_cpu[i];
+                let mut pe_i = 0.0;
+                for (idx_j, &j) in sample_pos.iter().enumerate() {
+                    if idx_j <= idx_i { continue; } // Only count each pair once
+                    let pj = &self.particles_cpu[j];
+                    let dx = pi.x - pj.x;
+                    let dy = pi.y - pj.y;
+                    let dz = pi.z - pj.z;
+                    let r2 = dx*dx + dy*dy + dz*dz + self.softening * self.softening;
+                    pe_i -= 1.0 / r2.sqrt(); // -G*m*m/r with G=m=1
+                }
+                pe_i
+            })
+            .sum();
+
+        // Compute PE for negative sample
+        let pe_neg_sample: f64 = sample_neg.par_iter()
+            .enumerate()
+            .map(|(idx_i, &i)| {
+                let pi = &self.particles_cpu[i];
+                let mut pe_i = 0.0;
+                for (idx_j, &j) in sample_neg.iter().enumerate() {
+                    if idx_j <= idx_i { continue; }
+                    let pj = &self.particles_cpu[j];
+                    let dx = pi.x - pj.x;
+                    let dy = pi.y - pj.y;
+                    let dz = pi.z - pj.z;
+                    let r2 = dx*dx + dy*dy + dz*dz + self.softening * self.softening;
+                    pe_i -= 1.0 / r2.sqrt();
+                }
+                pe_i
+            })
+            .sum();
+
+        // Extrapolate to full system
+        // PE_sample has ns*(ns-1)/2 pairs, PE_full has N*(N-1)/2 pairs
+        // Assuming uniform distribution, PE_full ≈ PE_sample * [N*(N-1)] / [ns*(ns-1)]
+        let pairs_pos_sample = (ns_pos * ns_pos.saturating_sub(1)) as f64 / 2.0;
+        let pairs_pos_full = (n_pos * n_pos.saturating_sub(1)) as f64 / 2.0;
+        let pairs_neg_sample = (ns_neg * ns_neg.saturating_sub(1)) as f64 / 2.0;
+        let pairs_neg_full = (n_neg * n_neg.saturating_sub(1)) as f64 / 2.0;
+
+        let pe_pos_full = if pairs_pos_sample > 0.0 {
+            pe_pos_sample * pairs_pos_full / pairs_pos_sample
+        } else { 0.0 };
+        let pe_neg_full = if pairs_neg_sample > 0.0 {
+            pe_neg_sample * pairs_neg_full / pairs_neg_sample
+        } else { 0.0 };
+
+        let pe_total = pe_pos_full + pe_neg_full;
+
+        println!("  PE_+ sample = {:.4e}, extrapolated = {:.4e}", pe_pos_sample, pe_pos_full);
+        println!("  PE_- sample = {:.4e}, extrapolated = {:.4e}", pe_neg_sample, pe_neg_full);
+        println!("  PE_binding  = {:.4e}", pe_total);
+
+        Ok(pe_total)
     }
 
     /// Virialize velocities to satisfy 2KE + PE_binding = 0
@@ -3337,6 +3439,55 @@ impl GpuNBodySimulation {
         println!("  KE after      = {:.4e}", ke_after);
         println!("  2KE + PE_bind = {:.4e}", virial_ratio);
         println!("  Virial error  = {:.4}%", virial_error * 100.0);
+
+        Ok(())
+    }
+
+    /// Virialize using sampled PE calculation (for large N where full calculation would OOM)
+    /// n_sample: number of particles to sample from each sign (recommend 5000-10000)
+    pub fn virialize_sampled(&mut self, n_sample: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let ke = self.kinetic_energy()?;
+
+        println!("Virialization (sampled, Janus mode):");
+        println!("  KE initial    = {:.4e}", ke);
+
+        if ke < 1e-20 {
+            println!("  WARNING: KE too small, skipping virialization");
+            return Ok(());
+        }
+
+        let pe_bind = self.potential_energy_binding_sampled(n_sample)?;
+
+        if pe_bind >= 0.0 {
+            println!("  WARNING: PE_binding >= 0, no bound system to virialize");
+            return Ok(());
+        }
+
+        // Virial condition: 2KE + PE_bind = 0 → KE_target = |PE_bind|/2
+        let ke_target = pe_bind.abs() / 2.0;
+        let alpha = (ke_target / ke).sqrt();
+
+        println!("  KE target     = {:.4e}", ke_target);
+        println!("  Alpha (α)     = {:.6}", alpha);
+
+        // Scale velocities on GPU
+        let mut vel = self.device.dtoh_sync_copy(&self.vel)?;
+        for v in vel.iter_mut() {
+            *v *= alpha;
+        }
+        self.vel = self.device.htod_sync_copy(&vel)?;
+
+        // Also update CPU copy
+        for p in self.particles_cpu.iter_mut() {
+            p.vx *= alpha;
+            p.vy *= alpha;
+            p.vz *= alpha;
+        }
+
+        // Verify
+        let ke_after = self.kinetic_energy()?;
+        println!("  KE after      = {:.4e}", ke_after);
+        println!("  Expected α    ≈ 4-5 for proper Janus virialization");
 
         Ok(())
     }

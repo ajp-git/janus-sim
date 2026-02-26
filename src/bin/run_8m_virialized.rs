@@ -1,8 +1,9 @@
-/// Janus 8M Run — Virialized ICs (α=4.57)
+/// Janus 8M Run — Virialized ICs (correct α from sampled PE_binding)
 /// Compare with Zel'dovich v=0 run on same codebase
 ///
 /// Parameters:
-///   - Virialization: α ≈ 4.57 (from PE_binding)
+///   - Virialization: α computed from sampled PE_binding (same-sign pairs only)
+///   - Expected α ≈ 4-5 (NOT the wrong α=2307 from mean-field approximation)
 ///   - η=1.045, θ=0.5, dt=0.01, z_init=5
 
 #[cfg(feature = "cuda")]
@@ -67,17 +68,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&output_dir)?;
     println!("Output directory: {}\n", output_dir);
 
-    // Create simulation with virialization (new_bvh_only does analytical virialization)
-    println!("Creating simulation with analytical virialization...");
+    // Create simulation (new_bvh_only does initial analytical virialization)
+    println!("Creating simulation...");
     let t0 = Instant::now();
     let mut sim = GpuNBodySimulation::new_bvh_only(n_positive, n_negative, box_size)?;
     sim.set_theta(THETA);
     println!("  Created in {:.2}s\n", t0.elapsed().as_secs_f64());
 
-    // Initial state
+    // Correct virialization using sampled PE (10K samples per sign)
+    // This replaces the incorrect mean-field analytical virialization
+    println!("Applying correct virialization (sampled PE_binding)...");
+    let t0 = Instant::now();
+    sim.virialize_sampled(10000)?;
+    println!("  Virialized in {:.2}s\n", t0.elapsed().as_secs_f64());
+
+    // Initial state after correct virialization
     let ke_init = sim.kinetic_energy()?;
     let seg_init = sim.segregation_distance()?;
-    println!("Initial state:");
+    println!("Initial state (after correct virialization):");
     println!("  KE₀ = {:.4e}", ke_init);
     println!("  S₀ = {:.6}", seg_init);
     println!();

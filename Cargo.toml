@@ -302,3 +302,8 @@ required-features = ["cuda"]
 name = "profile_8m_morton"
 path = "src/bin/profile_8m_morton.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "bench_force"
+path = "src/bin/bench_force.rs"
+required-features = ["cuda"]

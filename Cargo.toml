@@ -272,3 +272,23 @@ required-features = ["cuda"]
 name = "profile_twopass"
 path = "src/bin/profile_twopass.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "run_8m_theta07"
+path = "src/bin/run_8m_theta07.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_theta_scaling"
+path = "src/bin/test_theta_scaling.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_nbody_gpu_theta"
+path = "src/bin/test_nbody_gpu_theta.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "profile_8m"
+path = "src/bin/profile_8m.rs"
+required-features = ["cuda"]

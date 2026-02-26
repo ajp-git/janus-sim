@@ -395,10 +395,13 @@ extern "C" __global__ void forces_twopass_overwrite(
         float dx = cx - px;
         float dy = cy - py;
         float dz = cz - pz;
-        float r2 = dx*dx + dy*dy + dz*dz;
-        float r = sqrtf(r2 + 1e-20f);
+        float r2 = dx*dx + dy*dy + dz*dz + 1e-20f;
 
-        if (nt == 1 || (2.0f * hs / r) < theta) {
+        // MAC without sqrt: (2*hs/r < theta) ↔ (4*hs² < theta²*r²)
+        float hs4 = 4.0f * hs * hs;
+        float theta2_r2 = theta * theta * r2;
+
+        if (nt == 1 || hs4 < theta2_r2) {
             float mass = node_mass[node];
             float comx = node_pos[pb + 4];
             float comy = node_pos[pb + 5];
@@ -472,10 +475,13 @@ extern "C" __global__ void forces_twopass_accumulate(
         float dx = cx - px;
         float dy = cy - py;
         float dz = cz - pz;
-        float r2 = dx*dx + dy*dy + dz*dz;
-        float r = sqrtf(r2 + 1e-20f);
+        float r2 = dx*dx + dy*dy + dz*dz + 1e-20f;
 
-        if (nt == 1 || (2.0f * hs / r) < theta) {
+        // MAC without sqrt: (2*hs/r < theta) ↔ (4*hs² < theta²*r²)
+        float hs4 = 4.0f * hs * hs;
+        float theta2_r2 = theta * theta * r2;
+
+        if (nt == 1 || hs4 < theta2_r2) {
             float mass = node_mass[node];
             float comx = node_pos[pb + 4];
             float comy = node_pos[pb + 5];
@@ -710,6 +716,20 @@ pub struct GpuNBodyTwoPass {
     softening: f64,
     box_size: f64,
     time: f64,
+    step_count: usize,
+}
+
+/// Timing breakdown for tree build phases (in milliseconds)
+#[cfg(feature = "cuda")]
+#[derive(Default, Clone)]
+pub struct TreeBuildTiming {
+    pub morton_ms: u128,
+    pub sort_ms: u128,
+    pub reorder_ms: u128,
+    pub reset_ms: u128,
+    pub bvh_karras_ms: u128,
+    pub init_leaves_ms: u128,
+    pub reduce_ms: u128,
 }
 
 #[cfg(feature = "cuda")]
@@ -889,17 +909,18 @@ impl GpuNBodyTwoPass {
             softening: 0.1,
             box_size,
             time: 0.0,
+            step_count: 0,
         })
     }
 
     pub fn set_theta(&mut self, theta: f64) { self.theta = theta; }
 
-    /// Build tree for particles of given sign
-    fn build_single_sign_tree(&mut self, sign: i32, n_sign: usize) -> Result<(), Box<dyn std::error::Error>> {
-        use std::io::Write;
+    /// Build tree for particles of given sign, returning timing breakdown
+    fn build_single_sign_tree(&mut self, _sign: i32, n_sign: usize) -> Result<TreeBuildTiming, Box<dyn std::error::Error>> {
+        use std::time::Instant;
+        let mut timing = TreeBuildTiming::default();
+
         self.device.synchronize()?;  // Ensure previous kernels completed
-        eprintln!("[tree_build n={}]", n_sign);
-        std::io::stderr().flush().ok();
 
         let n = n_sign;
         let n_internal = n.saturating_sub(1);
@@ -915,6 +936,7 @@ impl GpuNBodyTwoPass {
         };
 
         // Morton codes
+        let t_morton = Instant::now();
         let morton_k = self.device.get_func("twopass", "compute_morton_f32")
             .ok_or("compute_morton_f32 not found")?;
         unsafe {
@@ -923,12 +945,11 @@ impl GpuNBodyTwoPass {
                 n as i32, box_half, inv_cell_size,
             ))?;
         }
-
-        eprintln!("  morton...");
-        std::io::stderr().flush().ok();
         self.device.synchronize()?;
+        timing.morton_ms = t_morton.elapsed().as_millis();
 
         // GPU Radix Sort: 8 passes × 8 bits, fully on-device
+        let t_sort = Instant::now();
         let hist_k = self.device.get_func("twopass", "radix_histogram")
             .ok_or("radix_histogram not found")?;
         let prefix_k = self.device.get_func("twopass", "radix_prefix_sum")
@@ -944,8 +965,6 @@ impl GpuNBodyTwoPass {
 
         // GPU radix sort: 8 passes × 8 bits, fully on-device
         // Uses stable warp-voting scatter for Karras algorithm correctness
-        eprintln!("  sort (gpu)...");
-
         let n_blocks = blocks;
         let hist_cfg = LaunchConfig {
             block_dim: (256, 1, 1),
@@ -997,32 +1016,10 @@ impl GpuNBodyTwoPass {
 
         // After 8 passes (even number), result is in morton_codes/sorted_indices
         self.device.synchronize()?;
-
-        // Verify sort correctness (only downloads if check fails or first run)
-        if n < 200_000 {  // Only check for small runs to avoid overhead
-            let mc_cpu: Vec<u64> = self.device.dtoh_sync_copy(&self.morton_codes)?;
-            let mut unsorted = 0;
-            // Only check the first n elements (buffer may be larger)
-            for (i, w) in mc_cpu[..n].windows(2).enumerate() {
-                if w[0] > w[1] {
-                    unsorted += 1;
-                    if unsorted <= 3 {
-                        eprintln!("  unsorted at {}: {:016x} > {:016x}", i, w[0], w[1]);
-                    }
-                }
-            }
-            if unsorted > 0 {
-                eprintln!("  WARNING: {} unsorted pairs in GPU sort!", unsorted);
-            } else {
-                eprintln!("  sort verified: 0 unsorted pairs");
-            }
-        }
-
-        eprintln!("  sort done");
+        timing.sort_ms = t_sort.elapsed().as_millis();
 
         // Reorder positions
-        eprint!("reorder ");
-        std::io::stderr().flush().ok();
+        let t_reorder = Instant::now();
         let reorder_f32 = self.device.get_func("twopass", "reorder_f32x3")
             .ok_or("reorder_f32x3 not found")?;
         unsafe {
@@ -1042,10 +1039,10 @@ impl GpuNBodyTwoPass {
         }
         std::mem::swap(&mut self.idx_map, &mut self.idx_map_tmp);
         self.device.synchronize()?;
+        timing.reorder_ms = t_reorder.elapsed().as_millis();
 
         // Reset BVH buffers - CRITICAL: parent must be -1 for root termination
-        eprint!("reset ");
-        std::io::stderr().flush().ok();
+        let t_reset = Instant::now();
         let reset_blocks = (n_nodes + 255) / 256;
         let reset_cfg = LaunchConfig {
             block_dim: (256, 1, 1),
@@ -1063,11 +1060,11 @@ impl GpuNBodyTwoPass {
             set_k.launch(reset_cfg, (&mut self.bvh_parent, n_nodes as i32, -1i32))?;
         }
         self.device.synchronize()?;
+        timing.reset_ms = t_reset.elapsed().as_millis();
 
         // Build BVH on GPU using Karras algorithm
         // Morton keys now include particle index → unique keys → correct tree
-        eprint!("bvh ");
-        std::io::stderr().flush().ok();
+        let t_bvh = Instant::now();
         if n_internal > 0 {
             let internal_blocks = (n_internal + 255) / 256;
             let internal_cfg = LaunchConfig {
@@ -1087,10 +1084,10 @@ impl GpuNBodyTwoPass {
             }
         }
         self.device.synchronize()?;
+        timing.bvh_karras_ms = t_bvh.elapsed().as_millis();
 
         // Initialize leaves
-        eprint!("leaves ");
-        std::io::stderr().flush().ok();
+        let t_leaves = Instant::now();
         let init_k = self.device.get_func("twopass", "init_leaves_tp")
             .ok_or("init_leaves_tp not found")?;
         unsafe {
@@ -1102,10 +1099,10 @@ impl GpuNBodyTwoPass {
             ))?;
         }
         self.device.synchronize()?;
+        timing.init_leaves_ms = t_leaves.elapsed().as_millis();
 
         // Bottom-up reduction
-        eprint!("reduce ");
-        std::io::stderr().flush().ok();
+        let t_reduce = Instant::now();
         let reduce_k = self.device.get_func("twopass", "reduce_tp")
             .ok_or("reduce_tp not found")?;
         unsafe {
@@ -1118,45 +1115,13 @@ impl GpuNBodyTwoPass {
             ))?;
         }
         self.device.synchronize()?;
+        timing.reduce_ms = t_reduce.elapsed().as_millis();
 
-        // DEBUG: check tree
-        let parent_cpu: Vec<i32> = self.device.dtoh_sync_copy(&self.bvh_parent)?;
-        let left_cpu: Vec<i32> = self.device.dtoh_sync_copy(&self.bvh_left)?;
-        let right_cpu: Vec<i32> = self.device.dtoh_sync_copy(&self.bvh_right)?;
-
-        let mut covered = vec![false; n];
-        let rl_cpu: Vec<i32> = self.device.dtoh_sync_copy(&self.bvh_rl)?;
-        let rr_cpu: Vec<i32> = self.device.dtoh_sync_copy(&self.bvh_rr)?;
-
-        for i in 0..n.saturating_sub(1) {
-            let lc = left_cpu[i] as usize;
-            let rc = right_cpu[i] as usize;
-            if lc >= n - 1 && lc < 2 * n - 1 { covered[lc - (n - 1)] = true; }
-            if rc >= n - 1 && rc < 2 * n - 1 { covered[rc - (n - 1)] = true; }
-        }
-        let uncovered = covered.iter().filter(|&&x| !x).count();
-
-        let mut invalid = 0;
-        for i in 0..n {
-            let leaf = n - 1 + i;
-            if parent_cpu[leaf] < 0 || parent_cpu[leaf] >= n as i32 - 1 { invalid += 1; }
-        }
-
-        // Debug: for first few uncovered, find which internal node SHOULD cover it
-        if uncovered > 0 {
-            eprintln!("  WARNING: {} uncovered leaves!", uncovered);
-        }
-        eprintln!("OK");
-        std::io::stderr().flush().ok();
-        Ok(())
+        Ok(timing)
     }
 
     /// Compute forces on all particles (needed for initializing DKD with cold ICs)
     pub fn compute_forces(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        use std::io::Write;
-        eprintln!("  [compute_forces] Computing initial forces...");
-        std::io::stderr().flush().ok();
-
         let n = self.n_particles;
         let blocks = (n + 255) / 256;
         let cfg = LaunchConfig {
@@ -1199,7 +1164,7 @@ impl GpuNBodyTwoPass {
             ))?;
         }
         self.device.synchronize()?;
-        self.build_single_sign_tree(1, self.n_positive)?;
+        let _ = self.build_single_sign_tree(1, self.n_positive)?;
 
         // Compute forces from positive tree (OVERWRITE)
         let forces_ow_k = self.device.get_func("twopass", "forces_twopass_overwrite")
@@ -1231,7 +1196,7 @@ impl GpuNBodyTwoPass {
             ))?;
         }
         self.device.synchronize()?;
-        self.build_single_sign_tree(-1, self.n_negative)?;
+        let _ = self.build_single_sign_tree(-1, self.n_negative)?;
 
         // Compute forces from negative tree (ACCUMULATE)
         let forces_acc_k = self.device.get_func("twopass", "forces_twopass_accumulate")
@@ -1246,18 +1211,25 @@ impl GpuNBodyTwoPass {
             ))?;
         }
         self.device.synchronize()?;
-
-        eprintln!("  [compute_forces] Done");
-        std::io::stderr().flush().ok();
         Ok(())
     }
 
     pub fn step_dkd(&mut self, dt: f64, hubble: f64, dtau_per_dt: f64) -> Result<(), Box<dyn std::error::Error>> {
         use std::time::Instant;
-        use std::io::Write;
-        let t0 = Instant::now();
-        eprintln!("  [DEBUG] step_dkd start");
-        std::io::stderr().flush().ok();
+
+        self.step_count += 1;
+        let step_num = self.step_count;
+
+        // Timing accumulators
+        let mut t_drift1_ms = 0u128;
+        let mut t_extract_pos_ms = 0u128;
+        let mut t_extract_neg_ms = 0u128;
+        let mut t_force_pos_ms = 0u128;
+        let mut t_force_neg_ms = 0u128;
+        let mut t_kick_ms = 0u128;
+        let mut t_drift2_ms = 0u128;
+        let mut tree_pos = TreeBuildTiming::default();
+        let mut tree_neg = TreeBuildTiming::default();
 
         let half_dt = dt * 0.5;
         let box_half = (self.box_size / 2.0) as f32;
@@ -1270,7 +1242,8 @@ impl GpuNBodyTwoPass {
             shared_mem_bytes: 0,
         };
 
-        // Drift(dt/2)
+        // ===== DRIFT (dt/2) =====
+        let t0 = Instant::now();
         let drift_k = self.device.get_func("twopass", "drift_f32")
             .ok_or("drift_f32 not found")?;
         unsafe {
@@ -1279,7 +1252,6 @@ impl GpuNBodyTwoPass {
                 half_dt as f32, box_half, n as i32,
             ))?;
         }
-
         // Reset acceleration to zero (f32 buffer)
         let reset_f32_k = self.device.get_func("twopass", "reset_f32")
             .ok_or("reset_f32 not found")?;
@@ -1292,22 +1264,14 @@ impl GpuNBodyTwoPass {
         unsafe {
             reset_f32_k.launch(acc_cfg, (&mut self.acc, (n * 3) as i32))?;
         }
-
-        eprintln!("  [DEBUG] drift... ");
-        std::io::stderr().flush().ok();
         self.device.synchronize()?;
-        eprintln!("  [DEBUG] drift done: {:.0}ms", t0.elapsed().as_millis());
-        std::io::stderr().flush().ok();
+        t_drift1_ms = t0.elapsed().as_millis();
 
-        // === PASS 1: Positive particles tree ===
-        // Extract positive particles
-        eprintln!("  [DEBUG] extract+...");
-        std::io::stderr().flush().ok();
-        let t1 = Instant::now();
+        // ===== PASS 1: Positive particles =====
+        // Extract
+        let t0 = Instant::now();
         let extract_k = self.device.get_func("twopass", "extract_by_sign")
             .ok_or("extract_by_sign not found")?;
-
-        // Reset counter
         let reset_i32_k = self.device.get_func("twopass", "reset_i32")
             .ok_or("reset_i32 not found")?;
         unsafe {
@@ -1317,7 +1281,6 @@ impl GpuNBodyTwoPass {
                 shared_mem_bytes: 0,
             }, (&mut self.extract_count, 1))?;
         }
-
         unsafe {
             extract_k.clone().launch(cfg, (
                 &self.pos, &self.signs,
@@ -1326,21 +1289,13 @@ impl GpuNBodyTwoPass {
             ))?;
         }
         self.device.synchronize()?;
-        eprintln!("  [DEBUG] extract+ done: {:.0}ms", t1.elapsed().as_millis());
-        std::io::stderr().flush().ok();
+        t_extract_pos_ms = t0.elapsed().as_millis();
 
-        // Build tree for positive particles
-        eprintln!("  [DEBUG] tree+...");
-        std::io::stderr().flush().ok();
-        let t1 = Instant::now();
-        self.build_single_sign_tree(1, self.n_positive)?;
-        eprintln!("  [DEBUG] tree+ done: {:.0}ms", t1.elapsed().as_millis());
-        std::io::stderr().flush().ok();
+        // Build tree +
+        tree_pos = self.build_single_sign_tree(1, self.n_positive)?;
 
-        // Compute forces from positive tree onto ALL particles (OVERWRITE)
-        eprintln!("  [DEBUG] force+...");
-        std::io::stderr().flush().ok();
-        let t1 = Instant::now();
+        // Force + (overwrite)
+        let t0 = Instant::now();
         let forces_ow_k = self.device.get_func("twopass", "forces_twopass_overwrite")
             .ok_or("forces_twopass_overwrite not found")?;
         unsafe {
@@ -1353,14 +1308,11 @@ impl GpuNBodyTwoPass {
             ))?;
         }
         self.device.synchronize()?;
-        eprintln!("  [DEBUG] force+ done: {:.0}ms", t1.elapsed().as_millis());
-        std::io::stderr().flush().ok();
+        t_force_pos_ms = t0.elapsed().as_millis();
 
-        // === PASS 2: Negative particles tree ===
-        eprintln!("  [DEBUG] extract-...");
-        std::io::stderr().flush().ok();
-        let t1 = Instant::now();
-        // Reset counter
+        // ===== PASS 2: Negative particles =====
+        // Extract
+        let t0 = Instant::now();
         unsafe {
             reset_i32_k.launch(LaunchConfig {
                 block_dim: (1, 1, 1),
@@ -1368,7 +1320,6 @@ impl GpuNBodyTwoPass {
                 shared_mem_bytes: 0,
             }, (&mut self.extract_count, 1))?;
         }
-
         unsafe {
             extract_k.launch(cfg, (
                 &self.pos, &self.signs,
@@ -1377,21 +1328,13 @@ impl GpuNBodyTwoPass {
             ))?;
         }
         self.device.synchronize()?;
-        eprintln!("  [DEBUG] extract- done: {:.0}ms", t1.elapsed().as_millis());
-        std::io::stderr().flush().ok();
+        t_extract_neg_ms = t0.elapsed().as_millis();
 
-        // Build tree for negative particles
-        eprintln!("  [DEBUG] tree-...");
-        std::io::stderr().flush().ok();
-        let t1 = Instant::now();
-        self.build_single_sign_tree(-1, self.n_negative)?;
-        eprintln!("  [DEBUG] tree- done: {:.0}ms", t1.elapsed().as_millis());
-        std::io::stderr().flush().ok();
+        // Build tree -
+        tree_neg = self.build_single_sign_tree(-1, self.n_negative)?;
 
-        // Compute forces from negative tree onto ALL particles (ACCUMULATE)
-        eprintln!("  [DEBUG] force-...");
-        std::io::stderr().flush().ok();
-        let t1 = Instant::now();
+        // Force - (accumulate)
+        let t0 = Instant::now();
         let forces_acc_k = self.device.get_func("twopass", "forces_twopass_accumulate")
             .ok_or("forces_twopass_accumulate not found")?;
         unsafe {
@@ -1404,32 +1347,71 @@ impl GpuNBodyTwoPass {
             ))?;
         }
         self.device.synchronize()?;
-        eprintln!("  [DEBUG] force- done: {:.0}ms", t1.elapsed().as_millis());
-        std::io::stderr().flush().ok();
+        t_force_neg_ms = t0.elapsed().as_millis();
 
-        // Kick(dt)
-        eprintln!("  [DEBUG] kick...");
-        std::io::stderr().flush().ok();
+        // ===== KICK (dt) =====
+        let t0 = Instant::now();
         let kick_k = self.device.get_func("twopass", "kick_f32")
             .ok_or("kick_f32 not found")?;
         unsafe {
             kick_k.launch(cfg, (
                 &mut self.vel, &self.acc,
                 dt as f32, n as i32,
-                hubble as f32, dtau_per_dt as f32,  // Cast to f32
+                hubble as f32, dtau_per_dt as f32,
             ))?;
         }
+        self.device.synchronize()?;
+        t_kick_ms = t0.elapsed().as_millis();
 
-        // Drift(dt/2)
+        // ===== DRIFT (dt/2) =====
+        let t0 = Instant::now();
         unsafe {
             drift_k.launch(cfg, (
                 &mut self.pos, &self.vel,
                 half_dt as f32, box_half, n as i32,
             ))?;
         }
-
         self.device.synchronize()?;
+        t_drift2_ms = t0.elapsed().as_millis();
+
         self.time += dt;
+
+        // ===== PRINT TIMING BREAKDOWN =====
+        let tree_pos_total = tree_pos.morton_ms + tree_pos.sort_ms + tree_pos.reorder_ms
+            + tree_pos.reset_ms + tree_pos.bvh_karras_ms + tree_pos.init_leaves_ms + tree_pos.reduce_ms;
+        let tree_neg_total = tree_neg.morton_ms + tree_neg.sort_ms + tree_neg.reorder_ms
+            + tree_neg.reset_ms + tree_neg.bvh_karras_ms + tree_neg.init_leaves_ms + tree_neg.reduce_ms;
+        let total = t_drift1_ms + t_extract_pos_ms + tree_pos_total + t_force_pos_ms
+            + t_extract_neg_ms + tree_neg_total + t_force_neg_ms + t_kick_ms + t_drift2_ms;
+
+        eprintln!("[step {:03}] TIMING BREAKDOWN (ms):", step_num);
+        eprintln!("  drift (1st half)      : {:>6} ms", t_drift1_ms);
+        eprintln!("  --- PASS + (N={}) ---", self.n_positive);
+        eprintln!("    extract+            : {:>6} ms", t_extract_pos_ms);
+        eprintln!("    morton codes        : {:>6} ms", tree_pos.morton_ms);
+        eprintln!("    radix sort          : {:>6} ms", tree_pos.sort_ms);
+        eprintln!("    reorder             : {:>6} ms", tree_pos.reorder_ms);
+        eprintln!("    reset buffers       : {:>6} ms", tree_pos.reset_ms);
+        eprintln!("    build_bvh (karras)  : {:>6} ms", tree_pos.bvh_karras_ms);
+        eprintln!("    init_leaves         : {:>6} ms", tree_pos.init_leaves_ms);
+        eprintln!("    reduce_tp           : {:>6} ms", tree_pos.reduce_ms);
+        eprintln!("    force+ (overwrite)  : {:>6} ms  <<<", t_force_pos_ms);
+        eprintln!("  --- PASS - (N={}) ---", self.n_negative);
+        eprintln!("    extract-            : {:>6} ms", t_extract_neg_ms);
+        eprintln!("    morton codes        : {:>6} ms", tree_neg.morton_ms);
+        eprintln!("    radix sort          : {:>6} ms", tree_neg.sort_ms);
+        eprintln!("    reorder             : {:>6} ms", tree_neg.reorder_ms);
+        eprintln!("    reset buffers       : {:>6} ms", tree_neg.reset_ms);
+        eprintln!("    build_bvh (karras)  : {:>6} ms", tree_neg.bvh_karras_ms);
+        eprintln!("    init_leaves         : {:>6} ms", tree_neg.init_leaves_ms);
+        eprintln!("    reduce_tp           : {:>6} ms", tree_neg.reduce_ms);
+        eprintln!("    force- (accumulate) : {:>6} ms  <<<", t_force_neg_ms);
+        eprintln!("  kick                  : {:>6} ms", t_kick_ms);
+        eprintln!("  drift (2nd half)      : {:>6} ms", t_drift2_ms);
+        eprintln!("  ─────────────────────────────────");
+        eprintln!("  TOTAL                 : {:>6} ms", total);
+        eprintln!();
+
         Ok(())
     }
 

@@ -1868,3 +1868,172 @@ Envoyer les deux CSV complets à o3 pour ajustement τ_relax exponentiel précis
 via couplage quadratique δ₊δ₋ → δ₊, transférant le pouvoir vers le mode
 corrélé (δ₊ = δ₋). C'est une propriété intrinsèque de la dynamique Janus
 à α ≈ 1, pas un artefact numérique.
+
+---
+
+## ══════════════════════════════════════════════
+## MISE À JOUR 26 FÉVRIER 2026
+## Optimisations GPU Barnes-Hut — TwoPass θ=0.7
+## ══════════════════════════════════════════════
+
+## CONTEXTE
+
+Le run 8M à θ=0.7 était trop lent : ~38 secondes/step (5.2 jours pour 12000 steps).
+Objectif : réduire à <10 secondes/step pour runs faisables (~27 heures).
+
+### Architecture actuelle — GpuNBodyTwoPass
+
+L'algorithme twopass construit **deux arbres séparés** (un pour m+, un pour m−) :
+
+```
+--- PASS + (N=3.9M) ---
+  extract m+ → tree build → force+ (overwrite)
+--- PASS - (N=4.1M) ---
+  extract m- → tree build → force- (accumulate)
+```
+
+Chaque pass construit un arbre BVH avec Karras 2012, puis calcule les forces
+de cet arbre sur TOUTES les 8M particules.
+
+---
+
+## OPTIMISATIONS TESTÉES (26 février 2026)
+
+### [OPT-1] Morton Reorder — 4.54× speedup ✅ VALIDÉ
+
+**Principe :** Trier TOUTES les particules par code Morton (courbe de Hilbert 3D)
+avant de calculer les forces. Cela garantit que les threads voisins dans un warp
+traversent des régions similaires de l'arbre → réduction de la divergence warp.
+
+**Implémentation :**
+```
+1. Calculer codes Morton 64-bit pour toutes les 8M particules
+2. Tri radix GPU (8 passes, 256 buckets)
+3. Réordonner positions et signes selon l'ordre trié
+4. Puis : PASS+ et PASS- comme avant
+```
+
+**Résultats benchmark (8M, θ=0.7, 7 runs mesurés) :**
+```
+┌─────────────────────────────────────┬───────────┬─────────┐
+│ Configuration                       │ Time (ms) │ Speedup │
+├─────────────────────────────────────┼───────────┼─────────┤
+│ Baseline (sans Morton)              │    37,467 │   1.00× │
+│ + Morton reorder [OPT-1]            │     8,247 │   4.54× │
+└─────────────────────────────────────┴───────────┴─────────┘
+```
+
+**Fichiers modifiés :**
+- `src/nbody_gpu_twopass.rs` : `step_dkd_morton_reorder()`
+- Kernels : `compute_morton_all`, `reorder_by_idx_f32x3`, `reorder_by_idx_i8`
+
+### [OPT-2] Shared Memory Top-1024 — RÉGRESSION ❌ REJETÉ
+
+**Principe :** Charger les 1024 premiers nœuds de l'arbre BVH en shared memory
+(~44KB) pour éviter les lectures global memory répétées.
+
+**Résultats :**
+```
+┌─────────────────────────────────────┬───────────┬─────────┐
+│ Configuration                       │ Time (ms) │ Speedup │
+├─────────────────────────────────────┼───────────┼─────────┤
+│ Morton seul [OPT-1]                 │     8,247 │   4.54× │
+│ + Shared mem [OPT-2]                │    23,335 │   1.61× │ ← PIRE
+└─────────────────────────────────────┴───────────┴─────────┘
+```
+
+**Analyse de l'échec :**
+- Charger 44KB/block crée une pression registres excessive
+- Réduit l'occupancy (moins de warps actifs)
+- Le if/else (shared vs global) ajoute de la divergence
+- Avec Morton reorder, les threads sont déjà cohérents → bénéfice cache L2 suffisant
+
+**Décision :** OPT-2 rejeté. Utiliser Morton seul.
+
+### [OPT-X] N² Direct — Impossible ❌
+
+Testé pour référence : kernel N² direct avec shared memory tiling.
+```
+N² direct (8M) : 363 secondes/step
+Barnes-Hut θ=0.7 : 37 secondes/step
+```
+→ O(N²) est 10× plus lent que BH à 8M. Impraticable.
+
+---
+
+## BENCHMARK FRAMEWORK
+
+Créé `src/bin/bench_force.rs` pour mesurer systématiquement chaque optimisation :
+- 3 warmup + 7 measured runs
+- Rapport médiane ± stddev
+- Comparaison vs baseline
+
+```bash
+docker compose run --rm dev cargo run --release --features cuda --bin bench_force
+```
+
+---
+
+## ÉTAT PERFORMANCE GPU (26 février 2026)
+
+| N | θ | Temps/step | 12000 steps | Statut |
+|---|---|------------|-------------|--------|
+| 2M | 0.7 | ~800 ms | 2.7 heures | ✅ Production |
+| 8M | 0.7 | ~8.2 s | 27 heures | ✅ Faisable (Morton) |
+| 8M | 0.7 | ~37 s | 5.2 jours | ❌ Trop lent (sans Morton) |
+
+---
+
+## PROCHAINES ÉTAPES
+
+### À FAIRE IMMÉDIATEMENT
+- [ ] **Run 8M θ=0.7 validation** avec Morton reorder
+  - Vérifier S_max comparable à run 8M précédent (S_max=0.459)
+  - Confirmer stabilité sur 12000 steps
+
+### OPTIMISATIONS FUTURES (si nécessaire)
+| Opt | Description | Estimation | Priorité |
+|-----|-------------|------------|----------|
+| OPT-3 | Stack en shared memory | +10-20% | Moyenne |
+| OPT-4 | Warp-coherent traversal | +20-50% | Haute |
+| OPT-5 | Adaptive θ (θ variable par profondeur) | +30% | Moyenne |
+| OPT-6 | Multi-GPU (si disponible) | 2× | Basse |
+
+### QUESTIONS OUVERTES
+1. Le run 8M θ=0.7 avec Morton va-t-il reproduire S_max≈0.459 ?
+2. Faut-il passer à 16M ou 32M pour voir des filaments ?
+3. Les ICs Zel'dovich anti-corrélées changent-elles la dynamique ?
+
+---
+
+## FICHIERS CRÉÉS/MODIFIÉS (26 février 2026)
+
+```
+src/nbody_gpu_twopass.rs
+  - step_dkd_morton_reorder()     ← utilise Morton reorder [OPT-1]
+  - step_dkd_morton_shmem()       ← OPT-2 (rejeté, code conservé)
+  - Kernels : compute_morton_all, reorder_by_idx_*, forces_twopass_shmem_*
+
+src/bin/bench_force.rs            ← Framework benchmark systématique
+src/bin/profile_8m.rs             ← Profiling baseline
+src/bin/profile_8m_morton.rs      ← Profiling Morton reorder
+src/bin/profile_8m_direct.rs      ← Test O(N²) direct
+```
+
+---
+
+## COMMITS (26 février 2026)
+
+```
+3d4b9e1 perf: Add force kernel benchmark framework
+dd3acb8 perf: Test OPT-2 (shared memory top nodes) - REGRESSION
+```
+
+---
+
+## RÉFÉRENCES TECHNIQUES
+
+- **Morton codes :** Z-order curve, interleaved bits → localité spatiale
+- **Radix sort GPU :** 8 passes × 256 buckets, O(N) complexity
+- **Karras 2012 :** "Maximizing Parallelism in the Construction of BVHs"
+- **Warp divergence :** threads d'un warp prenant des branches différentes

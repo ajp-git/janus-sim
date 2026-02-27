@@ -499,6 +499,15 @@ Si plusieurs frames (0, 500, 1000...) → appeler autant de fois que nécessaire
 [2026-02-27 18:12] [ÉTAPE 7] ✅ Updated README.md with TreePM architecture section
 [2026-02-27 18:14] [ÉTAPE 7] ✅ Updated janus_roadmap.md with TreePM results
 [2026-02-27 18:15] [ÉTAPE 7] ✅ TREEPM IMPLEMENTATION COMPLETE — tagged treepm-v1.0
+[2026-02-27 18:20] [POST-MERGE] 🟡 Benchmark 1M: CPU rustfft ~14s/step @ 500K → estimated 30s/step @ 1M
+[2026-02-27 18:25] [PROBLÈME 2] 🟡 Creating treepm_production.rs with PE_binding virialization
+[2026-02-27 18:17] [DEBUG] ✅ 8-particle physics test: segregation increases correctly
+[2026-02-27 18:18] [BUG 1] ✅ Found: sequential IC generation → Seg₀ = 0.28 (should be ~0.09)
+[2026-02-27 18:18] [BUG 1] ✅ Fixed: random sign assignment → Seg₀ correct
+[2026-02-27 18:19] [BUG 2] ✅ Diagnosed: virialization α=2581 makes system too hot → mixing
+[2026-02-27 18:21] [BUG 2] ✅ Solution: cold start (zero velocity) shows correct segregation increase
+[2026-02-27 18:24] [VALIDATION] ✅ 10K particles, 100 steps: Seg +0.02%, physics CORRECT
+[2026-02-27 18:24] [PERF] ⚠ 10K @ 1.6s/step → 1M would be ~160s/step, need cuFFT GPU
 ```
 
 ---

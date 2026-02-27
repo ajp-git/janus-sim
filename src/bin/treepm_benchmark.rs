@@ -78,7 +78,7 @@ fn main() {
     println!("=== TreePM Benchmark ===\n");
 
     let box_size = 100.0;
-    let grid_size = 64;  // 64³ grid
+    let grid_size = 128;  // 128³ grid for 1M particles
     let r_cut = box_size / 16.0;
 
     println!("Configuration:");
@@ -96,7 +96,7 @@ fn main() {
     println!("| N | PM (s) | Force (s) | Total (s) | ms/step |");
     println!("|---|--------|-----------|-----------|---------|");
 
-    let test_sizes = [1000, 5000, 10000, 50000, 100000];
+    let test_sizes = [1000, 5000, 10000, 50000, 100000, 500000, 1000000];
 
     for &n in &test_sizes {
         let (pm_time, force_time, total_time) = benchmark_treepm(n, grid_size, box_size, r_cut);

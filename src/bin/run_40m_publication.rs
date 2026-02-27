@@ -1,8 +1,10 @@
-//! 40M Publication Run — Morton+WarpCoherent
+//! 40M Publication Run — Morton+WarpCoherent + Hubble Friction
 //! z=5 → z=1.5, 6000 steps, snapshots every 100 steps
 
 #[cfg(feature = "cuda")]
 use janus::nbody_gpu_twopass::GpuNBodyTwoPass;
+#[cfg(feature = "cuda")]
+use janus::friedmann::{JanusParams, CosmoInterpolator};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::time::Instant;
@@ -21,13 +23,13 @@ const Z_FINAL: f64 = 1.5;
 
 #[cfg(feature = "cuda")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let output_dir = "/app/output/40M_publication_2026-02-27";
+    let output_dir = "/app/output/40M_v3_2026-02-27";
     let snapshot_dir = format!("{}/snapshots", output_dir);
 
     fs::create_dir_all(&snapshot_dir)?;
 
     eprintln!("╔════════════════════════════════════════════════════════════════╗");
-    eprintln!("║   40M PUBLICATION RUN — Morton + WarpCoherent                  ║");
+    eprintln!("║   40M PUBLICATION RUN — Morton + WarpCoherent + HUBBLE         ║");
     eprintln!("║   z={} → z={}, {} steps, snapshots every {}              ║", Z_INIT, Z_FINAL, STEPS, SNAPSHOT_INTERVAL);
     eprintln!("╚════════════════════════════════════════════════════════════════╝");
     eprintln!();
@@ -54,17 +56,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let csv_path = format!("{}/time_series.csv", output_dir);
     let csv_file = File::create(&csv_path)?;
     let mut csv = BufWriter::new(csv_file);
-    writeln!(csv, "step,time,z,a,seg,ke_ratio,step_time_ms")?;
+    writeln!(csv, "step,time,z,a,H,seg,ke_ratio,step_time_ms")?;
 
-    // Cosmology interpolation (simplified linear for now)
+    // Cosmology with proper Hubble friction from Friedmann integration
+    let params = JanusParams::from_eta(ETA);
+    let cosmo = CosmoInterpolator::new(&params, Z_INIT);
+
+    // Find tau values for z=5 and z=1.5 by searching history
     let a_init = 1.0 / (1.0 + Z_INIT);
     let a_final = 1.0 / (1.0 + Z_FINAL);
-    let da_per_step = (a_final - a_init) / STEPS as f64;
 
-    eprintln!("Cosmology:");
-    eprintln!("  a_init = {:.4} (z={})", a_init, Z_INIT);
-    eprintln!("  a_final = {:.4} (z={})", a_final, Z_FINAL);
-    eprintln!("  da/step = {:.6}", da_per_step);
+    // Find tau for z_init (smallest a)
+    let tau_z_init = cosmo.history.iter()
+        .min_by(|s1, s2| {
+            let d1 = (s1.a - a_init).abs();
+            let d2 = (s2.a - a_init).abs();
+            d1.partial_cmp(&d2).unwrap()
+        })
+        .map(|s| s.tau)
+        .unwrap_or(cosmo.tau_start);
+
+    // Find tau for z_final (larger a)
+    let tau_z_final = cosmo.history.iter()
+        .min_by(|s1, s2| {
+            let d1 = (s1.a - a_final).abs();
+            let d2 = (s2.a - a_final).abs();
+            d1.partial_cmp(&d2).unwrap()
+        })
+        .map(|s| s.tau)
+        .unwrap_or(cosmo.tau_end);
+
+    let dtau_per_step = (tau_z_final - tau_z_init) / STEPS as f64;
+    let mut tau_current = tau_z_init;
+
+    // Get initial H for display
+    let (_, h_init) = cosmo.get_params_at_tau(tau_z_init);
+    let (_, h_final) = cosmo.get_params_at_tau(tau_z_final);
+
+    eprintln!("Cosmology (Janus Friedmann with Hubble friction):");
+    eprintln!("  a_init = {:.4} (z={}), H_init = {:.4}", a_init, Z_INIT, h_init);
+    eprintln!("  a_final = {:.4} (z={}), H_final = {:.4}", a_final, Z_FINAL, h_final);
+    eprintln!("  tau_init = {:.6}, tau_final = {:.6}", tau_z_init, tau_z_final);
+    eprintln!("  dtau/step = {:.8}", dtau_per_step);
     eprintln!();
 
     // Get initial segregation
@@ -92,16 +125,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for step in 1..=STEPS {
         let step_start = Instant::now();
 
-        // Compute current scale factor and Hubble
-        let a = a_init + step as f64 * da_per_step;
+        // Get cosmological parameters from Friedmann integration
+        let (a, hubble) = cosmo.get_params_at_tau(tau_current);
         let z = 1.0 / a - 1.0;
 
-        // Simplified Hubble friction (H ∝ a^(-3/2) for matter-dominated)
-        let hubble = 0.0; // For now, no friction - can add later
-        let dtau_per_dt = 0.0;
+        // Hubble friction: dtau_per_dt = dtau/dt where dt is simulation time
+        // The kick uses: friction = -H * v * dtau_per_dt * dt = -H * v * dtau
+        let dtau_per_dt = dtau_per_step / DT;
 
-        // Step with Morton+WarpCoherent
+        // Step with Morton+WarpCoherent + Hubble friction
         sim.step_dkd_morton_warpcoherent(DT, hubble, dtau_per_dt)?;
+
+        // Advance conformal time
+        tau_current += dtau_per_step;
 
         let step_time_ms = step_start.elapsed().as_millis();
 
@@ -116,9 +152,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_seg_step = step;
         }
 
-        // Write CSV
-        writeln!(csv, "{},{:.6},{:.4},{:.6},{:.6},{:.4},{}",
-            step, step as f64 * DT, z, a, seg, ke_ratio, step_time_ms)?;
+        // Write CSV (now includes H)
+        writeln!(csv, "{},{:.6},{:.4},{:.6},{:.6},{:.6},{:.4},{}",
+            step, tau_current, z, a, hubble, seg, ke_ratio, step_time_ms)?;
 
         // Flush CSV every step
         csv.flush()?;
@@ -130,8 +166,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let elapsed = run_start.elapsed().as_secs_f64() / 3600.0;
             let eta = elapsed / step as f64 * (STEPS - step) as f64;
 
-            eprintln!("[{:5}/{:5}] z={:.3} Seg={:.4} (max={:.4}@{}) | {:.1}s/step | {:.1}h elapsed, {:.1}h ETA",
-                step, STEPS, z, seg, max_seg, max_seg_step,
+            eprintln!("[{:5}/{:5}] z={:.3} H={:.4} Seg={:.4} (max={:.4}@{}) | {:.1}s/step | {:.1}h elapsed, {:.1}h ETA",
+                step, STEPS, z, hubble, seg, max_seg, max_seg_step,
                 step_time_ms as f64 / 1000.0, elapsed, eta);
         }
 

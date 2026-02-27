@@ -1313,65 +1313,60 @@ impl GpuNBodyTwoPass {
         let sigma = amplitude * lambda;  // Gaussian displacement std dev
         let normal = Normal::new(0.0, sigma).unwrap();
 
-        // Grid dimensions (cubic grid for n_total particles)
-        let n_side = (n_total as f64).cbrt().ceil() as usize;
-        let cell_size = box_size / n_side as f64;
-        println!("         Grid: {}³ = {} cells, cell_size = {:.3}", n_side, n_side.pow(3), cell_size);
+        // PURE RANDOM positions (no grid) + Zel'dovich displacement
+        // This eliminates any grid memory artifact
+        println!("         Random positions + Zel'dovich (no grid)");
         println!("         Zel'dovich: amplitude = {:.0e}, lambda = {:.1}, sigma = {:.3}", amplitude, lambda, sigma);
 
         let mut pos_data = Vec::with_capacity(n_total * 3);
         let mut vel_data = Vec::with_capacity(n_total * 3);
         let mut signs_data: Vec<i8> = Vec::with_capacity(n_total);
 
-        // Ratio for sign assignment
-        let pos_ratio = n_positive as f64 / n_total as f64;
-        let mut count_pos = 0usize;
-        let mut count_neg = 0usize;
+        let half = box_size / 2.0;
 
-        // Generate grid with Zel'dovich perturbations
-        for iz in 0..n_side {
-            for iy in 0..n_side {
-                for ix in 0..n_side {
-                    let idx = iz * n_side * n_side + iy * n_side + ix;
-                    if idx >= n_total { break; }
+        // Generate purely random positions with Zel'dovich perturbations
+        for _ in 0..n_total {
+            // Random uniform position in box [-half, +half]
+            let x0 = rng.random::<f64>() * box_size - half;
+            let y0 = rng.random::<f64>() * box_size - half;
+            let z0 = rng.random::<f64>() * box_size - half;
 
-                    // Base grid position (centered in box)
-                    let x0 = (ix as f64 + 0.5) * cell_size - box_size / 2.0;
-                    let y0 = (iy as f64 + 0.5) * cell_size - box_size / 2.0;
-                    let z0 = (iz as f64 + 0.5) * cell_size - box_size / 2.0;
+            // Zel'dovich displacement (Gaussian)
+            let dx = normal.sample(&mut rng);
+            let dy = normal.sample(&mut rng);
+            let dz = normal.sample(&mut rng);
 
-                    // Zel'dovich displacement (Gaussian)
-                    let dx = normal.sample(&mut rng);
-                    let dy = normal.sample(&mut rng);
-                    let dz = normal.sample(&mut rng);
+            // Final position with periodic wrapping
+            let mut x = x0 + dx;
+            let mut y = y0 + dy;
+            let mut z = z0 + dz;
 
-                    // Final position with periodic wrapping
-                    let mut x = x0 + dx;
-                    let mut y = y0 + dy;
-                    let mut z = z0 + dz;
+            // Wrap to box
+            if x > half { x -= box_size; } else if x < -half { x += box_size; }
+            if y > half { y -= box_size; } else if y < -half { y += box_size; }
+            if z > half { z -= box_size; } else if z < -half { z += box_size; }
 
-                    // Wrap to box
-                    let half = box_size / 2.0;
-                    if x > half { x -= box_size; } else if x < -half { x += box_size; }
-                    if y > half { y -= box_size; } else if y < -half { y += box_size; }
-                    if z > half { z -= box_size; } else if z < -half { z += box_size; }
+            pos_data.extend([x as f32, y as f32, z as f32]);
 
-                    pos_data.extend([x as f32, y as f32, z as f32]);
-
-                    // Zero initial velocity (cold start)
-                    vel_data.extend([0.0f32, 0.0f32, 0.0f32]);
-
-                    // Assign sign based on target ratio
-                    if count_pos < n_positive && (count_neg >= n_negative || rng.random::<f64>() < pos_ratio) {
-                        signs_data.push(1i8);
-                        count_pos += 1;
-                    } else {
-                        signs_data.push(-1i8);
-                        count_neg += 1;
-                    }
-                }
-            }
+            // Zero initial velocity (cold start)
+            vel_data.extend([0.0f32, 0.0f32, 0.0f32]);
         }
+
+        // Assign signs uniformly at random using Fisher-Yates approach:
+        // Create array of indices, shuffle, first n_positive are +
+        let mut indices: Vec<usize> = (0..n_total).collect();
+        // Fisher-Yates shuffle
+        for i in (1..n_total).rev() {
+            let j = rng.gen_range(0..=i);
+            indices.swap(i, j);
+        }
+        // First n_positive shuffled indices get +1, rest get -1
+        signs_data.resize(n_total, -1i8);
+        for &idx in indices.iter().take(n_positive) {
+            signs_data[idx] = 1i8;
+        }
+        let count_pos = signs_data.iter().filter(|&&s| s > 0).count();
+        let count_neg = n_total - count_pos;
 
         println!("         Generated: N+ = {}, N- = {}", count_pos, count_neg);
         println!("         Velocities: v = 0 (cold start, no virialization)");

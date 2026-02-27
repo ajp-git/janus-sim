@@ -18,6 +18,10 @@ pub mod nbody_gpu_mixed;
 #[cfg(feature = "cuda")]
 pub mod nbody_gpu_twopass;
 
+// TreePM module uses rustfft (CPU) for initial implementation
+// GPU cuFFT optimization planned after architecture validation
+pub mod treepm;
+
 /// Physical constants (SI units)
 pub mod constants {
     /// Speed of light (m/s)

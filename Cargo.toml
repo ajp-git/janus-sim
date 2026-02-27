@@ -131,6 +131,9 @@ rayon = "1.10"
 # CUDA GPU (optional)
 cudarc = { version = "0.12", features = ["cuda-12030", "nvrtc"], optional = true }
 
+# Note: cuFFT bindings require libclang. Using rustfft (CPU) for initial TreePM.
+# GPU FFT optimization planned after architecture validation.
+
 # Random number generation
 rand = "0.9"
 rand_distr = "0.5"
@@ -331,4 +334,9 @@ required-features = ["cuda"]
 [[bin]]
 name = "test_40m_5steps"
 path = "src/bin/test_40m_5steps.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_1m_jitter"
+path = "src/bin/test_1m_jitter.rs"
 required-features = ["cuda"]

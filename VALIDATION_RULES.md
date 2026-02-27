@@ -310,7 +310,14 @@ ANTI-PM TEST: Segregation on 100K
 VALIDATED METHODS for Janus:
   ✅ Barnes-Hut CPU (Rust) — Phase 1b validated
   ✅ Barnes-Hut GPU (Rust+CUDA) — validated 0% deviation
-  ❌ Particle-Mesh (Python+CuPy) — zero segregation, unusable
+  ❌ Particle-Mesh SEUL (Python+CuPy) — zero segregation, unusable
+     → PM lisse les interactions sub-Mpc qui sont le cœur de la physique Janus
+
+  🔧 TreePM (en cours d'implémentation — TREEPM_ROADMAP.md) :
+     ✅ PM longue portée (FFT) pour isotropie — élimine l'artefact grille Barnes-Hut
+     ✅ Barnes-Hut courte portée pour interactions Janus +/- exactes
+     ATTENTION : architecture dual-grid obligatoire (voir KNOWN_FIXES.md FIX-009)
+     Ne PAS utiliser une seule grille ρ = Σ(±m) — invalide la physique Janus
 ```
 
 ---
@@ -346,10 +353,14 @@ VALIDATED METHODS for Janus:
 ## 10. CLAUDE CLI BEHAVIOR RULES
 
 ```
-1. Never launch a simulation without explicit instruction.
+1. Never launch a production simulation without explicit instruction.
+   EXCEPTION : runs de test < 500 steps définis dans une roadmap active
+   sont autorisés sans instruction explicite.
 
 2. Always report step 20 and wait for confirmation
    before continuing beyond step 50.
+   EXCEPTION TREEPM : si TREEPM_ROADMAP.md est actif, appliquer ses règles
+   d'autonomie à la place — continuer sans attendre, documenter dans le MD.
 
 3. If a stop criterion is met → stop and report.
    Do not "let it run for the frames".
@@ -360,10 +371,16 @@ VALIDATED METHODS for Janus:
 
 5. Never interpret an ambiguous result as "correct".
    Always ask the question explicitly.
+   EXCEPTION TREEPM : documenter l'ambiguïté dans TREEPM_ROADMAP.md
+   et continuer — le humain répondra de façon asynchrone.
 
 6. Every physics measurement function (segregation, energy,
    COM, distance) must have its trivial test in the code.
 ```
+
+**PRIORITÉ DES RÈGLES** : en cas de conflit entre ce fichier et une roadmap
+active (TREEPM_ROADMAP.md), la roadmap a priorité pour les règles d'autonomie
+et de validation. Ce fichier reste prioritaire pour la physique Janus.
 
 ---
 

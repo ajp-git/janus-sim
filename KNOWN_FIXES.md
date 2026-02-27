@@ -92,7 +92,43 @@ positions.push(x0 + displacement_x);  // FAUX si |displacement| > box/2 - |x0|
 
 ## pm_kernels.cu / gpu_simulation.rs
 
-### [FIX-006] Grille PM — format snapshot snapshot.rs vs réel
+## pm_kernels.cu / gpu_simulation.rs
+
+### [FIX-009] TreePM — architecture dual-grid OBLIGATOIRE
+```
+⚠️ CRITIQUE : La physique Janus interdit une grille PM unique.
+
+// ❌ INCORRECT — une seule grille (PM standard)
+rho[cell] += sign_i * mass;  // signe annule les contributions
+phi = FFT(rho) → force uniforme  // INVALIDE : masse négative = trou, pas répulsion
+
+// ✅ CORRECT — deux grilles séparées
+rho_plus[cell]  += mass  (uniquement si sign_i > 0)
+rho_minus[cell] += mass  (valeur absolue, uniquement si sign_i < 0)
+
+FFT(rho_plus)  → phi_plus
+FFT(rho_minus) → phi_minus
+
+Force sur particule + :  F = -∇φ_plus  + ∇φ_minus  (attirée par +, repoussée par -)
+Force sur particule - :  F = -∇φ_minus + ∇φ_plus   (attirée par -, repoussée par +)
+```
+**Symptôme si incorrect :** ségrégation nulle ou négative, comportement identique
+à une simulation newtonienne pure. Voir Run PM-5 (KNOWN_FIXES résultats référence).
+
+### [FIX-010] TreePM — artefact grille Barnes-Hut avec forces répulsives
+```
+Contexte : avec θ=0.7 (valeur par défaut), les forces répulsives Janus +/-
+amplifient les erreurs anisotropes de l'approximation multipôle de l'arbre,
+créant des filaments alignés sur les axes cartésiens (artefact grille).
+
+Tests effectués :
+  θ=0.7  → grille marquée (éliminatoire)
+  θ=0.3  → grille réduite mais toujours visible
+  Newton seul θ=0.7 → pas de grille (confirme que c'est l'interaction répulsive qui amplifie)
+
+Solution : TreePM avec FFT longue portée (isotrope par construction).
+Ne PAS tenter de descendre θ en dessous de 0.3 — coût 25x pour résultat insuffisant.
+```
 ```
 // ⚠️ snapshot.rs dans le repo décrit un format théorique (64 bytes header)
 // Le code réel écrit un format différent (32 bytes header, interleaved)

@@ -89,9 +89,18 @@ impl TreePMForce {
         )
     }
 
-    /// Compute forces on all particles
+    /// Compute forces on all particles (parallel)
     /// Returns vector of (Fx, Fy, Fz) for each particle
     pub fn compute_all_forces(&self, particles: &[Particle]) -> Vec<Vec3> {
+        use rayon::prelude::*;
+
+        particles.par_iter()
+            .map(|p| self.compute_force(p.pos, p.sign, particles))
+            .collect()
+    }
+
+    /// Compute forces on all particles (sequential, for benchmarking)
+    pub fn compute_all_forces_sequential(&self, particles: &[Particle]) -> Vec<Vec3> {
         particles.iter()
             .map(|p| self.compute_force(p.pos, p.sign, particles))
             .collect()

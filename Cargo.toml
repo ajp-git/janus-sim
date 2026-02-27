@@ -322,3 +322,13 @@ required-features = ["cuda"]
 name = "test_80m_quick"
 path = "src/bin/test_80m_quick.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "run_40m_publication"
+path = "src/bin/run_40m_publication.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_40m_5steps"
+path = "src/bin/test_40m_5steps.rs"
+required-features = ["cuda"]

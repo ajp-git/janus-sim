@@ -12,8 +12,17 @@
 /// Target: 100M particles on 12GB VRAM
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaSlice, DeviceRepr, LaunchAsync, LaunchConfig};
 use std::sync::Arc;
+
+/// Helper to get raw device pointer from CudaSlice for FFI calls
+#[cfg(feature = "cuda")]
+fn get_device_ptr<T: DeviceRepr>(slice: &CudaSlice<T>) -> u64 {
+    let ptr_to_ptr = slice.as_kernel_param();
+    // as_kernel_param returns &cu_device_ptr as *mut c_void
+    // We dereference to get the actual CUdeviceptr (u64 on 64-bit)
+    unsafe { *(ptr_to_ptr as *const u64) }
+}
 
 const CUDA_TWOPASS_KERNELS: &str = r#"
 
@@ -52,6 +61,205 @@ extern "C" __global__ void kick_f32(
         float friction = -hubble_param * v * dtau_per_dt;
         vel[base + d] = v + (acc[base + d] + friction) * dt;
     }
+}
+
+// Add PM long-range forces to acceleration buffer (TreePM hybrid)
+extern "C" __global__ void add_pm_forces(
+    float* __restrict__ acc,
+    const float* __restrict__ pm_forces,
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    int base = tid * 3;
+    acc[base]     += pm_forces[base];
+    acc[base + 1] += pm_forces[base + 1];
+    acc[base + 2] += pm_forces[base + 2];
+}
+
+// ============================================================================
+// CIC (Cloud-in-Cell) kernels for GPU TreePM
+// ============================================================================
+
+// Custom atomicAdd for double (not natively supported on all architectures)
+__device__ double atomicAddDouble(double* address, double val) {
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+            __double_as_longlong(val + __longlong_as_double(assumed)));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+
+// CIC scatter: distribute particle mass to 8 neighboring grid cells
+// Uses atomicAddDouble for thread-safe accumulation
+extern "C" __global__ void cic_scatter(
+    const float* __restrict__ pos,      // [n × 3] particle positions
+    const signed char* __restrict__ signs, // [n] particle signs
+    double* __restrict__ rho_plus,      // [grid³] positive density grid
+    double* __restrict__ rho_minus,     // [grid³] negative density grid
+    int n,                              // number of particles
+    int grid_size,                      // grid dimension (cubic)
+    float box_half,                     // box_size / 2
+    float inv_cell_size                 // grid_size / box_size
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    // Get particle position
+    float px = pos[tid * 3];
+    float py = pos[tid * 3 + 1];
+    float pz = pos[tid * 3 + 2];
+    int sign = signs[tid];
+
+    // Convert to grid coordinates [0, grid_size)
+    float gx = (px + box_half) * inv_cell_size;
+    float gy = (py + box_half) * inv_cell_size;
+    float gz = (pz + box_half) * inv_cell_size;
+
+    // Handle periodic wrapping
+    gx = fmodf(gx + (float)grid_size, (float)grid_size);
+    gy = fmodf(gy + (float)grid_size, (float)grid_size);
+    gz = fmodf(gz + (float)grid_size, (float)grid_size);
+
+    // Integer cell indices
+    int ix = (int)gx;
+    int iy = (int)gy;
+    int iz = (int)gz;
+
+    // Fractional position within cell [0, 1)
+    float fx = gx - (float)ix;
+    float fy = gy - (float)iy;
+    float fz = gz - (float)iz;
+
+    // CIC weights for 8 neighboring cells
+    float wx[2] = {1.0f - fx, fx};
+    float wy[2] = {1.0f - fy, fy};
+    float wz[2] = {1.0f - fz, fz};
+
+    // Select target grid
+    double* grid = (sign > 0) ? rho_plus : rho_minus;
+
+    // Distribute mass to 8 cells (atomic for thread safety)
+    for (int di = 0; di < 2; di++) {
+        for (int dj = 0; dj < 2; dj++) {
+            for (int dk = 0; dk < 2; dk++) {
+                int ci = (ix + di) % grid_size;
+                int cj = (iy + dj) % grid_size;
+                int ck = (iz + dk) % grid_size;
+                int idx = ci + grid_size * (cj + grid_size * ck);
+                double weight = (double)(wx[di] * wy[dj] * wz[dk]);
+                atomicAddDouble(&grid[idx], weight);  // mass = 1.0
+            }
+        }
+    }
+}
+
+// CIC gather: interpolate force from grid to particles
+// Janus physics: F_+ = -∇φ_plus + ∇φ_minus, F_- = -∇φ_minus + ∇φ_plus
+extern "C" __global__ void cic_gather(
+    const float* __restrict__ pos,      // [n × 3] particle positions
+    const signed char* __restrict__ signs, // [n] particle signs
+    const double* __restrict__ phi_plus,   // [grid³] positive potential
+    const double* __restrict__ phi_minus,  // [grid³] negative potential
+    float* __restrict__ pm_forces,      // [n × 3] output forces
+    int n,                              // number of particles
+    int grid_size,                      // grid dimension
+    float box_half,                     // box_size / 2
+    float inv_cell_size,                // grid_size / box_size
+    float cell_size                     // box_size / grid_size
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    // Get particle position
+    float px = pos[tid * 3];
+    float py = pos[tid * 3 + 1];
+    float pz = pos[tid * 3 + 2];
+    int sign = signs[tid];
+
+    // Convert to grid coordinates
+    float gx = (px + box_half) * inv_cell_size;
+    float gy = (py + box_half) * inv_cell_size;
+    float gz = (pz + box_half) * inv_cell_size;
+
+    gx = fmodf(gx + (float)grid_size, (float)grid_size);
+    gy = fmodf(gy + (float)grid_size, (float)grid_size);
+    gz = fmodf(gz + (float)grid_size, (float)grid_size);
+
+    int ix = (int)gx;
+    int iy = (int)gy;
+    int iz = (int)gz;
+
+    float fx = gx - (float)ix;
+    float fy = gy - (float)iy;
+    float fz = gz - (float)iz;
+
+    float wx[2] = {1.0f - fx, fx};
+    float wy[2] = {1.0f - fy, fy};
+    float wz[2] = {1.0f - fz, fz};
+
+    // Janus: + attracted by +, repelled by -
+    //        - attracted by -, repelled by +
+    const double* phi_attract = (sign > 0) ? phi_plus : phi_minus;
+    const double* phi_repel = (sign > 0) ? phi_minus : phi_plus;
+
+    float force_x = 0.0f, force_y = 0.0f, force_z = 0.0f;
+    float h = cell_size;
+    float inv_2h = 0.5f / h;
+
+    // CIC interpolation with gradient computation
+    for (int di = 0; di < 2; di++) {
+        for (int dj = 0; dj < 2; dj++) {
+            for (int dk = 0; dk < 2; dk++) {
+                int ci = (ix + di) % grid_size;
+                int cj = (iy + dj) % grid_size;
+                int ck = (iz + dk) % grid_size;
+
+                float weight = wx[di] * wy[dj] * wz[dk];
+
+                // Neighbor indices for central difference gradient
+                int ci_p = (ci + 1) % grid_size;
+                int ci_m = (ci + grid_size - 1) % grid_size;
+                int cj_p = (cj + 1) % grid_size;
+                int cj_m = (cj + grid_size - 1) % grid_size;
+                int ck_p = (ck + 1) % grid_size;
+                int ck_m = (ck + grid_size - 1) % grid_size;
+
+                // Grid indexing helper
+                #define IDX(i,j,k) ((i) + grid_size * ((j) + grid_size * (k)))
+
+                // Gradient of attractive potential
+                float dphi_a_dx = (float)(phi_attract[IDX(ci_p,cj,ck)] - phi_attract[IDX(ci_m,cj,ck)]) * inv_2h;
+                float dphi_a_dy = (float)(phi_attract[IDX(ci,cj_p,ck)] - phi_attract[IDX(ci,cj_m,ck)]) * inv_2h;
+                float dphi_a_dz = (float)(phi_attract[IDX(ci,cj,ck_p)] - phi_attract[IDX(ci,cj,ck_m)]) * inv_2h;
+
+                // Gradient of repulsive potential
+                float dphi_r_dx = (float)(phi_repel[IDX(ci_p,cj,ck)] - phi_repel[IDX(ci_m,cj,ck)]) * inv_2h;
+                float dphi_r_dy = (float)(phi_repel[IDX(ci,cj_p,ck)] - phi_repel[IDX(ci,cj_m,ck)]) * inv_2h;
+                float dphi_r_dz = (float)(phi_repel[IDX(ci,cj,ck_p)] - phi_repel[IDX(ci,cj,ck_m)]) * inv_2h;
+
+                #undef IDX
+
+                // F = -∇φ_attract + ∇φ_repel (Janus physics)
+                force_x += weight * (-dphi_a_dx + dphi_r_dx);
+                force_y += weight * (-dphi_a_dy + dphi_r_dy);
+                force_z += weight * (-dphi_a_dz + dphi_r_dz);
+            }
+        }
+    }
+
+    pm_forces[tid * 3]     = force_x;
+    pm_forces[tid * 3 + 1] = force_y;
+    pm_forces[tid * 3 + 2] = force_z;
+}
+
+// Reset double array to zero
+extern "C" __global__ void reset_f64_grid(double* arr, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < n) arr[tid] = 0.0;
 }
 
 // Extract particles of given sign into separate buffer
@@ -1202,6 +1410,123 @@ extern "C" __global__ void radix_scatter(
     }
 }
 
+// ============================================================================
+// TreePM SHORT-RANGE: GPU BH with r_cut cutoff
+// ============================================================================
+// For TreePM: only compute forces for r < r_cut
+// Long-range (r > r_cut) handled by PM cuFFT
+// This eliminates grid artifacts by construction
+
+// TreePM short-range: n_all_signed encodes both count and tree_sign
+// n_all_signed > 0 → tree_sign = +1, n_all = n_all_signed
+// n_all_signed < 0 → tree_sign = -1, n_all = -n_all_signed (accumulate mode)
+extern "C" __global__ void forces_treepm_short_range(
+    const float* __restrict__ pos_all,
+    const signed char* __restrict__ signs_all,
+    const float* __restrict__ node_pos,   // 7×f32 per node
+    const float* __restrict__ node_mass,
+    const int* __restrict__ left,
+    const int* __restrict__ right,
+    const int* __restrict__ node_types,
+    float* __restrict__ acc,
+    int n_all_signed, float theta, float softening, float r_cut
+) {
+    int n_all = (n_all_signed > 0) ? n_all_signed : -n_all_signed;
+    int tree_sign = (n_all_signed > 0) ? 1 : -1;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    bool valid = (tid < n_all);
+    int accumulate = (tree_sign < 0) ? 1 : 0;
+
+    extern __shared__ int shared_stack[];
+    int warp_id_in_block = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int* stack = shared_stack + warp_id_in_block * 128;
+
+    int safe_tid = valid ? tid : 0;
+    float px = pos_all[safe_tid*3], py = pos_all[safe_tid*3+1], pz = pos_all[safe_tid*3+2];
+    int my_sign = signs_all[safe_tid];
+    float sign_factor = (my_sign == tree_sign) ? 1.0f : -1.0f;
+
+    float ax=0, ay=0, az=0;
+    float eps2 = softening*softening;
+    float theta2 = theta*theta;
+    float r_cut_sq = r_cut * r_cut;
+
+    int sp = 0;
+    if (lane == 0) stack[sp++] = 0;
+    __syncwarp(0xFFFFFFFF);
+
+    while (true) {
+        int stack_empty = (lane == 0 && sp <= 0) ? 1 : 0;
+        stack_empty = __shfl_sync(0xFFFFFFFF, stack_empty, 0);
+        if (stack_empty) break;
+
+        int node;
+        if (lane == 0) node = stack[--sp];
+        node = __shfl_sync(0xFFFFFFFF, node, 0);
+
+        if (node < 0) continue;
+        int nt = node_types[node];
+        if (nt == 0) continue;
+
+        int pb = node * 7;
+        float cx = node_pos[pb], cy = node_pos[pb+1], cz = node_pos[pb+2];
+        float hs = node_pos[pb+3];
+        float comx = node_pos[pb+4], comy = node_pos[pb+5], comz = node_pos[pb+6];
+        float m = node_mass[node];
+
+        float dx = cx-px, dy = cy-py, dz = cz-pz;
+        float r2 = dx*dx + dy*dy + dz*dz + 1e-20f;
+        float r = sqrtf(r2);
+
+        // TreePM optimization: skip entire subtree if closest point is beyond r_cut
+        // Closest point of cell to particle is at distance (r - hs)
+        float closest_dist = r - hs;
+        bool cell_beyond_rcut = (closest_dist > r_cut);
+        if (__all_sync(0xFFFFFFFF, cell_beyond_rcut)) continue;
+
+        bool should_approx = (nt == 1) || ((4.0f*hs*hs) < (theta2*r2));
+        bool all_approx = __all_sync(0xFFFFFFFF, should_approx);
+        bool all_descend = __all_sync(0xFFFFFFFF, !should_approx);
+
+        if (all_approx) {
+            if (valid) {
+                float ddx = comx-px, ddy = comy-py, ddz = comz-pz;
+                float rp2 = ddx*ddx + ddy*ddy + ddz*ddz + eps2;
+
+                // TreePM: ONLY compute if r < r_cut
+                // Skip long-range pairs (handled by PM cuFFT)
+                if (rp2 < r_cut_sq) {
+                    float irp3 = rsqrtf(rp2) / rp2;
+                    float f = sign_factor * m * irp3;
+                    ax += f*ddx; ay += f*ddy; az += f*ddz;
+                }
+            }
+        } else if (all_descend) {
+            if (lane == 0) {
+                int lc = left[node], rc = right[node];
+                if (rc >= 0 && sp < 127) stack[sp++] = rc;
+                if (lc >= 0 && sp < 127) stack[sp++] = lc;
+            }
+        } else {
+            if (lane == 0) {
+                int lc = left[node], rc = right[node];
+                if (rc >= 0 && sp < 127) stack[sp++] = rc;
+                if (lc >= 0 && sp < 127) stack[sp++] = lc;
+            }
+        }
+        __syncwarp();
+    }
+
+    if (valid) {
+        if (accumulate) {
+            acc[tid*3] += ax; acc[tid*3+1] += ay; acc[tid*3+2] += az;
+        } else {
+            acc[tid*3] = ax; acc[tid*3+1] = ay; acc[tid*3+2] = az;
+        }
+    }
+}
+
 "#;
 
 /// Two-pass GPU N-body simulation
@@ -1244,6 +1569,14 @@ pub struct GpuNBodyTwoPass {
     bvh_node_mass: CudaSlice<f32>,  // 1×f32 per node (FP32 for speed)
     bvh_node_types: CudaSlice<i32>,
     bvh_atomic: CudaSlice<i32>,
+    // TreePM hybrid buffers
+    pm_forces: CudaSlice<f32>,  // [n_total × 3] PM long-range forces
+    // PM grid buffers (GPU cuFFT integration)
+    rho_plus: CudaSlice<f64>,   // [grid³] positive density
+    rho_minus: CudaSlice<f64>,  // [grid³] negative density
+    phi_plus: CudaSlice<f64>,   // [grid³] positive potential
+    phi_minus: CudaSlice<f64>,  // [grid³] negative potential
+    pm_grid_size: usize,        // PM grid dimension (128)
     // Parameters
     n_particles: usize,
     n_positive: usize,
@@ -1291,7 +1624,10 @@ impl GpuNBodyTwoPass {
             "forces_direct_n2",
             "compute_morton_all", "reorder_by_idx_f32x3", "reorder_by_idx_i8",
             "reset_i32", "reset_f64", "reset_f32", "set_i32",
-            "radix_histogram", "radix_prefix_sum", "radix_scatter"
+            "radix_histogram", "radix_prefix_sum", "radix_scatter",
+            "forces_treepm_short_range",  // TreePM short-range with r_cut
+            "add_pm_forces",  // Add PM long-range forces to acc
+            "cic_scatter", "cic_gather", "reset_f64_grid"  // GPU CIC for TreePM
         ])?;
         println!("         done ({:.2}s)", t0.elapsed().as_secs_f64());
 
@@ -1473,6 +1809,17 @@ impl GpuNBodyTwoPass {
         let bvh_node_mass = device.alloc_zeros::<f32>(n_bvh)?;     // 1 float per node (FP32)
         let bvh_node_types = device.alloc_zeros::<i32>(n_bvh)?;
         let bvh_atomic = device.alloc_zeros::<i32>(n_bvh)?;
+
+        // TreePM hybrid buffers
+        let pm_forces = device.alloc_zeros::<f32>(n_total * 3)?;  // PM long-range forces
+
+        // PM grid buffers (128³ = 2M cells × f64 = 16MB per grid × 4 = 64MB)
+        let pm_grid_size = 128usize;
+        let grid_cells = pm_grid_size * pm_grid_size * pm_grid_size;
+        let rho_plus = device.alloc_zeros::<f64>(grid_cells)?;
+        let rho_minus = device.alloc_zeros::<f64>(grid_cells)?;
+        let phi_plus = device.alloc_zeros::<f64>(grid_cells)?;
+        let phi_minus = device.alloc_zeros::<f64>(grid_cells)?;
         println!("         done ({:.2}s)", t0.elapsed().as_secs_f64());
 
         // Memory calculation (signs = i8, saves 3 bytes/particle)
@@ -1500,6 +1847,8 @@ impl GpuNBodyTwoPass {
             pos_sorted, signs_sorted, radix_hist_all,
             bvh_left, bvh_right, bvh_parent, bvh_rl, bvh_rr,
             bvh_node_pos, bvh_node_mass, bvh_node_types, bvh_atomic,
+            pm_forces,
+            rho_plus, rho_minus, phi_plus, phi_minus, pm_grid_size,
             n_particles: n_total,
             n_positive,
             n_negative,
@@ -2960,6 +3309,504 @@ impl GpuNBodyTwoPass {
         // Timing debug disabled for cleaner output
         let _ = (t_drift_ms, t_reorder_ms, t_force_pos_ms, t_force_neg_ms, t_kick_ms, t_drift2_ms);
         let _ = (tree_pos, tree_neg);
+
+        Ok(())
+    }
+
+    /// Helper: GPU radix sort Morton codes (8 passes × 8 bits)
+    fn radix_sort_all(&mut self, n: usize, blocks: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let hist_k = self.device.get_func("twopass", "radix_histogram")
+            .ok_or("radix_histogram not found")?;
+        let prefix_k = self.device.get_func("twopass", "radix_prefix_sum")
+            .ok_or("radix_prefix_sum not found")?;
+        let scatter_k = self.device.get_func("twopass", "radix_scatter")
+            .ok_or("radix_scatter not found")?;
+
+        let hist_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let prefix_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        for pass in 0..8 {
+            let bit_shift = pass * 8;
+            let (keys_in, keys_out, vals_in, vals_out) = if pass % 2 == 0 {
+                (&self.morton_all, &mut self.morton_all_tmp,
+                 &self.sorted_all, &mut self.sorted_all_tmp)
+            } else {
+                (&self.morton_all_tmp, &mut self.morton_all,
+                 &self.sorted_all_tmp, &mut self.sorted_all)
+            };
+
+            unsafe {
+                hist_k.clone().launch(hist_cfg, (
+                    keys_in, &mut self.radix_hist_all, n as i32, bit_shift as i32
+                ))?;
+                prefix_k.clone().launch(prefix_cfg, (
+                    &mut self.radix_hist_all, &mut self.radix_global, blocks as i32
+                ))?;
+                scatter_k.clone().launch(hist_cfg, (
+                    keys_in, keys_out, vals_in, vals_out,
+                    &self.radix_hist_all, &self.radix_global,
+                    n as i32, bit_shift as i32
+                ))?;
+            }
+        }
+        self.device.synchronize()?;
+        Ok(())
+    }
+
+    /// Helper: Reorder positions and signs by Morton order
+    fn reorder_all_by_morton(&mut self, n: usize, blocks: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let reorder_pos_k = self.device.get_func("twopass", "reorder_by_idx_f32x3")
+            .ok_or("reorder_by_idx_f32x3 not found")?;
+        let reorder_sign_k = self.device.get_func("twopass", "reorder_by_idx_i8")
+            .ok_or("reorder_by_idx_i8 not found")?;
+
+        unsafe {
+            reorder_pos_k.clone().launch(cfg, (
+                &self.pos, &mut self.pos_sorted, &self.sorted_all, n as i32
+            ))?;
+            reorder_sign_k.launch(cfg, (
+                &self.signs, &mut self.signs_sorted, &self.sorted_all, n as i32
+            ))?;
+        }
+        std::mem::swap(&mut self.pos, &mut self.pos_sorted);
+        std::mem::swap(&mut self.signs, &mut self.signs_sorted);
+        self.device.synchronize()?;
+        Ok(())
+    }
+
+    /// TreePM step: GPU BH for short-range only (r < r_cut)
+    /// Long-range forces from PM must be added separately
+    ///
+    /// This eliminates grid artifacts by construction:
+    /// - Long-range (r > r_cut): handled by PM cuFFT (accurate)
+    /// - Short-range (r < r_cut): GPU BH (accurate at short range)
+    pub fn compute_short_range_forces(&mut self, r_cut: f64) -> Result<(), Box<dyn std::error::Error>> {
+        let box_half = (self.box_size / 2.0) as f32;
+        let inv_cell_size = (2097152.0 / self.box_size) as f32;
+        let n = self.n_particles;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let warp_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 4096,
+        };
+
+        // Reset acceleration
+        let reset_f32_k = self.device.get_func("twopass", "reset_f32")
+            .ok_or("reset_f32 not found")?;
+        let acc_blocks = (n * 3 + 255) / 256;
+        let acc_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (acc_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            reset_f32_k.launch(acc_cfg, (&mut self.acc, (n * 3) as i32))?;
+        }
+        self.device.synchronize()?;
+
+        // Morton reorder (same as full step)
+        let morton_k = self.device.get_func("twopass", "compute_morton_all")
+            .ok_or("compute_morton_all not found")?;
+        unsafe {
+            morton_k.launch(cfg, (
+                &self.pos, &mut self.morton_all, &mut self.sorted_all,
+                n as i32, box_half, inv_cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Radix sort
+        self.radix_sort_all(n, blocks)?;
+
+        // Reorder particles by Morton order
+        self.reorder_all_by_morton(n, blocks)?;
+
+        // Get TreePM short-range force kernel
+        let forces_treepm_k = self.device.get_func("twopass", "forces_treepm_short_range")
+            .ok_or("forces_treepm_short_range not found")?;
+
+        let reset_i32_k = self.device.get_func("twopass", "reset_i32")
+            .ok_or("reset_i32 not found")?;
+        let extract_k = self.device.get_func("twopass", "extract_by_sign")
+            .ok_or("extract_by_sign not found")?;
+
+        // PASS 1: Positive particles tree (short-range only)
+        unsafe {
+            reset_i32_k.clone().launch(LaunchConfig {
+                block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+            }, (&mut self.extract_count, 1))?;
+            extract_k.clone().launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.pos_sign, &mut self.idx_map,
+                n as i32, 1i32, &mut self.extract_count,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let _ = self.build_single_sign_tree(1, self.n_positive)?;
+
+        // Force + with r_cut (overwrite): n_all_signed > 0 means tree_sign=+1
+        unsafe {
+            forces_treepm_k.clone().launch(warp_cfg, (
+                &self.pos, &self.signs,
+                &self.bvh_node_pos, &self.bvh_node_mass,
+                &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                &mut self.acc,
+                n as i32, self.theta as f32, self.softening as f32, r_cut as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // PASS 2: Negative particles tree (short-range only)
+        unsafe {
+            reset_i32_k.launch(LaunchConfig {
+                block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+            }, (&mut self.extract_count, 1))?;
+            extract_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.pos_sign, &mut self.idx_map,
+                n as i32, -1i32, &mut self.extract_count,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let _ = self.build_single_sign_tree(-1, self.n_negative)?;
+
+        // Force - with r_cut (accumulate): n_all_signed < 0 means tree_sign=-1
+        unsafe {
+            forces_treepm_k.launch(warp_cfg, (
+                &self.pos, &self.signs,
+                &self.bvh_node_pos, &self.bvh_node_mass,
+                &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                &mut self.acc,
+                -(n as i32), self.theta as f32, self.softening as f32, r_cut as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        Ok(())
+    }
+
+    /// Get acceleration buffer for adding PM long-range forces
+    pub fn get_acc_mut(&mut self) -> &mut CudaSlice<f32> {
+        &mut self.acc
+    }
+
+    /// Get positions for PM mass assignment
+    pub fn get_pos(&self) -> &CudaSlice<f32> {
+        &self.pos
+    }
+
+    /// Get signs for PM mass assignment
+    pub fn get_signs_slice(&self) -> &CudaSlice<i8> {
+        &self.signs
+    }
+
+    /// Hybrid TreePM step: CPU PM long-range + GPU BH short-range
+    ///
+    /// This eliminates grid artifacts by construction:
+    /// - Long-range (r > r_cut): PM with Gaussian splitting (CPU rustfft, accurate)
+    /// - Short-range (r < r_cut): GPU BH with r_cut cutoff (fast)
+    ///
+    /// Architecture:
+    /// 1. Download positions → CPU
+    /// 2. CPU PM: CIC mass assign, FFT solve with splitting, force interpolation
+    /// 3. Upload PM forces → GPU
+    /// 4. GPU: add PM forces to acc buffer
+    /// 5. GPU BH: compute short-range forces with r_cut
+    /// 6. GPU: kick + drift
+    pub fn step_treepm_hybrid(
+        &mut self,
+        dt: f64,
+        pm_grid: &mut crate::treepm::pm_grid::PmGrid,
+        r_cut: f64,
+        hubble: f64,
+        dtau_per_dt: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Instant;
+        let n = self.n_particles;
+        let box_half = (self.box_size / 2.0) as f32;
+        let half_dt = (dt / 2.0) as f32;
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // ===== DRIFT (dt/2) =====
+        let drift_k = self.device.get_func("twopass", "drift_f32")
+            .ok_or("drift_f32 not found")?;
+        unsafe {
+            drift_k.clone().launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== PM LONG-RANGE (CPU) =====
+        let t_pm = Instant::now();
+
+        // Download positions and signs
+        let pos_cpu = self.device.dtoh_sync_copy(&self.pos)?;
+        let signs_cpu = self.device.dtoh_sync_copy(&self.signs)?;
+
+        // CIC mass assignment to PM grid
+        pm_grid.clear();
+        for i in 0..n {
+            let x = pos_cpu[i * 3] as f64;
+            let y = pos_cpu[i * 3 + 1] as f64;
+            let z = pos_cpu[i * 3 + 2] as f64;
+            pm_grid.assign_mass(x, y, z, 1.0, signs_cpu[i]);
+        }
+
+        // FFT Poisson solve with Gaussian splitting (long-range only)
+        let r_s = r_cut / 3.0;  // Standard TreePM splitting scale
+        let g_constant = 1.0;   // Simulation units
+        pm_grid.solve_poisson_with_splitting(g_constant, Some(r_s));
+
+        // Interpolate PM forces for all particles
+        let mut pm_forces_cpu = vec![0.0f32; n * 3];
+        for i in 0..n {
+            let x = pos_cpu[i * 3] as f64;
+            let y = pos_cpu[i * 3 + 1] as f64;
+            let z = pos_cpu[i * 3 + 2] as f64;
+            let (fx, fy, fz) = pm_grid.interpolate_force(x, y, z, signs_cpu[i]);
+            pm_forces_cpu[i * 3] = fx as f32;
+            pm_forces_cpu[i * 3 + 1] = fy as f32;
+            pm_forces_cpu[i * 3 + 2] = fz as f32;
+        }
+
+        // Upload PM forces to GPU
+        self.device.htod_sync_copy_into(&pm_forces_cpu, &mut self.pm_forces)?;
+
+        let pm_ms = t_pm.elapsed().as_millis();
+
+        // ===== GPU BH SHORT-RANGE (r < r_cut) =====
+        let t_bh = Instant::now();
+        self.compute_short_range_forces(r_cut)?;
+        let bh_ms = t_bh.elapsed().as_millis();
+
+        // ===== ADD PM FORCES TO ACC =====
+        let add_pm_k = self.device.get_func("twopass", "add_pm_forces")
+            .ok_or("add_pm_forces not found")?;
+        unsafe {
+            add_pm_k.launch(cfg, (
+                &mut self.acc, &self.pm_forces, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== KICK (dt) =====
+        let kick_k = self.device.get_func("twopass", "kick_f32")
+            .ok_or("kick_f32 not found")?;
+        unsafe {
+            kick_k.launch(cfg, (
+                &mut self.vel, &self.acc,
+                dt as f32, n as i32,
+                hubble as f32, dtau_per_dt as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== DRIFT (dt/2) =====
+        unsafe {
+            drift_k.launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        self.time += dt;
+        self.step_count += 1;
+
+        // Timing info (optional, disable for cleaner output)
+        if self.step_count <= 5 || self.step_count % 100 == 0 {
+            eprintln!("  TreePM hybrid step {}: PM {}ms + BH {}ms = {}ms",
+                      self.step_count, pm_ms, bh_ms, pm_ms + bh_ms);
+        }
+
+        Ok(())
+    }
+
+    /// Full GPU TreePM step: GPU CIC + cuFFT + GPU BH
+    ///
+    /// Fastest path - everything on GPU:
+    /// 1. GPU CIC scatter: particles → rho_plus, rho_minus grids
+    /// 2. cuFFT Poisson: rho → phi (device-to-device, no host transfer)
+    /// 3. GPU CIC gather: phi grids → pm_forces
+    /// 4. GPU BH short-range: forces with r_cut cutoff
+    /// 5. Add PM forces to acc, kick, drift
+    ///
+    /// Requires: cufft feature + libcufft_wrapper.so built
+    #[cfg(feature = "cufft")]
+    pub fn step_treepm_gpu(
+        &mut self,
+        dt: f64,
+        r_cut: f64,
+        hubble: f64,
+        dtau_per_dt: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Instant;
+        let n = self.n_particles;
+        let grid = self.pm_grid_size;
+        let grid_cells = grid * grid * grid;
+        let box_half = (self.box_size / 2.0) as f32;
+        let half_dt = (dt / 2.0) as f32;
+        let cell_size = (self.box_size / grid as f64) as f32;
+        let inv_cell_size = (grid as f64 / self.box_size) as f32;
+        let r_s = r_cut / 3.0;  // TreePM splitting scale
+        let g_constant = 1.0;
+
+        let blocks = (n + 255) / 256;
+        let grid_blocks = (grid_cells + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let grid_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (grid_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // ===== DRIFT (dt/2) =====
+        let drift_k = self.device.get_func("twopass", "drift_f32")
+            .ok_or("drift_f32 not found")?;
+        unsafe {
+            drift_k.clone().launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== GPU CIC SCATTER =====
+        let t_pm = Instant::now();
+
+        // Reset density grids to zero
+        let reset_grid_k = self.device.get_func("twopass", "reset_f64_grid")
+            .ok_or("reset_f64_grid not found")?;
+        unsafe {
+            reset_grid_k.clone().launch(grid_cfg, (&mut self.rho_plus, grid_cells as i32))?;
+            reset_grid_k.launch(grid_cfg, (&mut self.rho_minus, grid_cells as i32))?;
+        }
+        self.device.synchronize()?;
+
+        // CIC scatter: particles → rho grids
+        let scatter_k = self.device.get_func("twopass", "cic_scatter")
+            .ok_or("cic_scatter not found")?;
+        unsafe {
+            scatter_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.rho_plus, &mut self.rho_minus,
+                n as i32, grid as i32, box_half, inv_cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== cuFFT POISSON SOLVE (device-to-device) =====
+        // Get raw device pointers for cuFFT
+        let rho_plus_ptr = get_device_ptr(&self.rho_plus) as *mut f64;
+        let rho_minus_ptr = get_device_ptr(&self.rho_minus) as *mut f64;
+        let phi_plus_ptr = get_device_ptr(&self.phi_plus) as *mut f64;
+        let phi_minus_ptr = get_device_ptr(&self.phi_minus) as *mut f64;
+
+        unsafe {
+            // Solve rho_plus → phi_plus
+            crate::treepm::cufft_ffi::solve_device(
+                rho_plus_ptr, phi_plus_ptr,
+                grid, self.box_size, g_constant, r_s,
+            )?;
+
+            // Solve rho_minus → phi_minus
+            crate::treepm::cufft_ffi::solve_device(
+                rho_minus_ptr, phi_minus_ptr,
+                grid, self.box_size, g_constant, r_s,
+            )?;
+        }
+
+        // ===== GPU CIC GATHER =====
+        let gather_k = self.device.get_func("twopass", "cic_gather")
+            .ok_or("cic_gather not found")?;
+        unsafe {
+            gather_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &self.phi_plus, &self.phi_minus,
+                &mut self.pm_forces,
+                n as i32, grid as i32, box_half, inv_cell_size, cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let pm_ms = t_pm.elapsed().as_millis();
+
+        // ===== GPU BH SHORT-RANGE (r < r_cut) =====
+        let t_bh = Instant::now();
+        self.compute_short_range_forces(r_cut)?;
+        let bh_ms = t_bh.elapsed().as_millis();
+
+        // ===== ADD PM FORCES TO ACC =====
+        let add_pm_k = self.device.get_func("twopass", "add_pm_forces")
+            .ok_or("add_pm_forces not found")?;
+        unsafe {
+            add_pm_k.launch(cfg, (
+                &mut self.acc, &self.pm_forces, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== KICK (dt) =====
+        let kick_k = self.device.get_func("twopass", "kick_f32")
+            .ok_or("kick_f32 not found")?;
+        unsafe {
+            kick_k.launch(cfg, (
+                &mut self.vel, &self.acc,
+                dt as f32, n as i32,
+                hubble as f32, dtau_per_dt as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== DRIFT (dt/2) =====
+        unsafe {
+            drift_k.launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        self.time += dt;
+        self.step_count += 1;
+
+        // Timing info
+        if self.step_count <= 5 || self.step_count % 100 == 0 {
+            eprintln!("  TreePM GPU step {}: PM {}ms + BH {}ms = {}ms",
+                      self.step_count, pm_ms, bh_ms, pm_ms + bh_ms);
+        }
 
         Ok(())
     }

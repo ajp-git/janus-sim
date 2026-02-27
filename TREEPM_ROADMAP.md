@@ -409,6 +409,61 @@ git tag treepm-v1.0
 
 ---
 
+## GPU TREEPM IMPLEMENTATION (2026-02-27)
+
+### Architecture
+```
+Full GPU TreePM Pipeline:
+  1. CIC scatter (GPU kernel) → rho_plus, rho_minus grids
+  2. cuFFT solve_device (device-to-device) → phi_plus, phi_minus
+  3. CIC gather (GPU kernel) → pm_forces
+  4. BH short-range (GPU kernel with r_cut cell pruning) → acc
+  5. Add PM forces to acc → total forces
+```
+
+### Performance Results (RTX 3060)
+
+| Component | Time | Notes |
+|-----------|------|-------|
+| CIC scatter | ~1ms | atomicAddDouble for f64 precision |
+| cuFFT solve | ~8ms | 128³ grid, device-to-device |
+| CIC gather | ~1ms | Trilinear interpolation |
+| BH short-range | ~93ms | With cell-level r_cut pruning |
+| **Total** | **~102ms** | **Target was <200ms ✓** |
+
+### Validation Results (1M particles, 1000 steps)
+
+```
+=== Results ===
+  Total time: 103.1s
+  Avg step: 102.4ms
+  Min/Max: 102ms / 237ms
+  Throughput: 9.76 steps/s
+
+=== Validation ===
+  Performance <200ms/step: ✓ PASS (102.4ms)
+  Segregation increasing: ✓ PASS (0.0010 → 0.0013)
+  Grid artifacts: ELIMINATED BY CONSTRUCTION
+```
+
+### Key Optimizations
+
+1. **atomicAddDouble**: Custom CUDA function for f64 atomic accumulation (not natively supported)
+2. **Cell-level r_cut pruning**: Skip entire BH subtrees when closest point > r_cut (2.7x speedup)
+3. **Device-to-device FFT**: cufft_solve_device() avoids host transfers
+4. **Separate density grids**: rho_plus/rho_minus for correct Janus physics
+
+### Files Modified
+- `src/nbody_gpu_twopass.rs`: CIC kernels, step_treepm_gpu(), cell pruning
+- `cuda/cufft_wrapper.cu`: cufft_solve_device() for device-to-device FFT
+- `src/treepm/cufft_ffi.rs`: Rust FFI bindings
+- `src/bin/test_treepm_gpu.rs`: Validation test binary
+
+### Validation Frame
+![TreePM GPU Validation](output/treepm_gpu_validation/frame_step_001000.png)
+
+---
+
 ## IMAGES GÉNÉRÉES
 
 *Toutes les frames PNG produites pendant l'implémentation sont référencées ici.*  
@@ -508,6 +563,19 @@ Si plusieurs frames (0, 500, 1000...) → appeler autant de fois que nécessaire
 [2026-02-27 18:21] [BUG 2] ✅ Solution: cold start (zero velocity) shows correct segregation increase
 [2026-02-27 18:24] [VALIDATION] ✅ 10K particles, 100 steps: Seg +0.02%, physics CORRECT
 [2026-02-27 18:24] [PERF] ⚠ 10K @ 1.6s/step → 1M would be ~160s/step, need cuFFT GPU
+[2026-02-27 18:30] [TASK B] ✅ TreePM-coherent virialization: α = 4.83 (was 2581!)
+[2026-02-27 18:30] [TASK B] ✅ PE_binding now only counts r < r_cut pairs
+[2026-02-27 18:30] [TASK A] 🟡 Starting cuFFT GPU implementation
+[2026-02-27 23:27] [GPU] ✅ cuFFT wrapper built (cuda/cufft_wrapper.cu)
+[2026-02-27 23:28] [GPU] ✅ CIC scatter/gather GPU kernels added (atomicAddDouble for f64)
+[2026-02-27 23:28] [GPU] ✅ step_treepm_gpu() implemented with full GPU path
+[2026-02-27 23:29] [GPU] ❌ First test: 260ms/step (BH short-range 250ms bottleneck)
+[2026-02-27 23:34] [GPU] ✅ Added cell-level r_cut pruning → BH speedup 2.7x
+[2026-02-27 23:35] [GPU] ✅ VALIDATION PASSED: 102ms/step @ 1M (target <200ms)
+[2026-02-27 23:35] [GPU] ✅ PM: 9ms (cuFFT), BH short-range: 93ms
+[2026-02-27 23:35] [GPU] ✅ Segregation: 0.0010 → 0.0013 (increasing ✓)
+[2026-02-27 23:39] [GPU] ✅ Validation frame: output/treepm_gpu_validation/frame_step_001000.png
+[2026-02-27 23:39] [GPU] ✅ No grid artifacts (visual inspection confirmed)
 ```
 
 ---

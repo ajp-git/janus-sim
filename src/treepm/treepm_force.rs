@@ -34,13 +34,15 @@ impl TreePMForce {
     pub fn new(r_cut: f64, grid_size: usize, box_size: f64, theta: f64, softening: f64) -> Self {
         let r_s = r_cut / 3.0;  // Standard choice for Gaussian splitting
 
+        let g_constant = 1.0;  // Default G=1 in simulation units
+
         Self {
             pm: PmGrid::new(grid_size, box_size),
-            tree: TreePMTree::build(&[], theta, r_cut),  // Empty tree, will be rebuilt
+            tree: TreePMTree::build_with_g(&[], theta, r_cut, g_constant),  // Empty tree, will be rebuilt
             r_cut,
             r_s,
             softening,
-            g_constant: 1.0,  // Use G=1 in simulation units
+            g_constant,
         }
     }
 
@@ -62,24 +64,29 @@ impl TreePMForce {
         // Solve Poisson with Gaussian splitting
         self.pm.solve_poisson_with_splitting(self.g_constant, Some(self.r_s));
 
-        // Rebuild Tree for short-range
-        self.tree = TreePMTree::build(particles, self.tree.theta, self.r_cut);
+        // Rebuild Tree for short-range (with same G constant)
+        self.tree = TreePMTree::build_with_g(particles, self.tree.theta, self.r_cut, self.g_constant);
     }
 
     /// Compute total force on particle at position (pos, sign)
     /// Returns (Fx, Fy, Fz)
     pub fn compute_force(&self, pos: Vec3, sign: MassSign, particles: &[Particle]) -> Vec3 {
+        self.compute_force_excluding(pos, sign, particles, None)
+    }
+
+    /// Compute force excluding a specific particle index (to avoid self-interaction)
+    pub fn compute_force_excluding(&self, pos: Vec3, sign: MassSign, particles: &[Particle], exclude_idx: Option<usize>) -> Vec3 {
         let sign_i8 = match sign {
             MassSign::Positive => 1i8,
             MassSign::Negative => -1i8,
         };
 
-        // PM long-range force
+        // PM long-range force (no self-exclusion needed - PM spreads mass to grid)
         let (fx_pm, fy_pm, fz_pm) = self.pm.interpolate_force(pos.x, pos.y, pos.z, sign_i8);
         let f_pm = Vec3::new(fx_pm, fy_pm, fz_pm);
 
-        // Tree short-range force
-        let f_tree = self.tree.compute_short_range_acc(pos, sign, particles, self.softening);
+        // Tree short-range force (with self-exclusion)
+        let f_tree = self.tree.compute_short_range_acc_excluding(pos, sign, particles, self.softening, exclude_idx);
 
         // Total = PM_long + Tree_short
         Vec3::new(
@@ -89,20 +96,22 @@ impl TreePMForce {
         )
     }
 
-    /// Compute forces on all particles (parallel)
+    /// Compute forces on all particles (parallel, with self-exclusion)
     /// Returns vector of (Fx, Fy, Fz) for each particle
     pub fn compute_all_forces(&self, particles: &[Particle]) -> Vec<Vec3> {
         use rayon::prelude::*;
 
         particles.par_iter()
-            .map(|p| self.compute_force(p.pos, p.sign, particles))
+            .enumerate()
+            .map(|(i, p)| self.compute_force_excluding(p.pos, p.sign, particles, Some(i)))
             .collect()
     }
 
-    /// Compute forces on all particles (sequential, for benchmarking)
+    /// Compute forces on all particles (sequential, with self-exclusion)
     pub fn compute_all_forces_sequential(&self, particles: &[Particle]) -> Vec<Vec3> {
         particles.iter()
-            .map(|p| self.compute_force(p.pos, p.sign, particles))
+            .enumerate()
+            .map(|(i, p)| self.compute_force_excluding(p.pos, p.sign, particles, Some(i)))
             .collect()
     }
 

@@ -34,6 +34,7 @@ pub fn splitting_tree_weight(r: f64, r_cut: f64) -> f64 {
 pub struct TreePMTree {
     pub theta: f64,
     pub r_cut: f64,
+    pub g_constant: f64,  // Gravitational constant
     pub root: OctreeNode,
     pub bounds: BoundingBox,
 }
@@ -41,6 +42,11 @@ pub struct TreePMTree {
 impl TreePMTree {
     /// Build tree from particles
     pub fn build(particles: &[Particle], theta: f64, r_cut: f64) -> Self {
+        Self::build_with_g(particles, theta, r_cut, 1.0)
+    }
+
+    /// Build tree with custom G constant
+    pub fn build_with_g(particles: &[Particle], theta: f64, r_cut: f64, g_constant: f64) -> Self {
         // Compute bounding box
         let mut min = Vec3::new(f64::MAX, f64::MAX, f64::MAX);
         let mut max = Vec3::new(f64::MIN, f64::MIN, f64::MIN);
@@ -75,7 +81,7 @@ impl TreePMTree {
         let indices: Vec<usize> = (0..particles.len()).collect();
         let root = Self::build_node(&indices, particles, &bounds);
 
-        Self { theta, r_cut, root, bounds }
+        Self { theta, r_cut, g_constant, root, bounds }
     }
 
     fn build_node(indices: &[usize], particles: &[Particle], bounds: &BoundingBox) -> OctreeNode {
@@ -153,17 +159,28 @@ impl TreePMTree {
     pub fn compute_short_range_acc(&self, pos: Vec3, sign: MassSign, particles: &[Particle],
         softening: f64) -> Vec3
     {
-        self.acc_recursive(&self.root, pos, sign, particles, &self.bounds, softening)
+        self.acc_recursive(&self.root, pos, sign, particles, &self.bounds, softening, None)
+    }
+
+    /// Compute short-range acceleration excluding a specific particle (for self-exclusion)
+    pub fn compute_short_range_acc_excluding(&self, pos: Vec3, sign: MassSign, particles: &[Particle],
+        softening: f64, exclude_idx: Option<usize>) -> Vec3
+    {
+        self.acc_recursive(&self.root, pos, sign, particles, &self.bounds, softening, exclude_idx)
     }
 
     fn acc_recursive(&self, node: &OctreeNode, pos: Vec3, sign: MassSign,
-        particles: &[Particle], bounds: &BoundingBox, softening: f64) -> Vec3
+        particles: &[Particle], bounds: &BoundingBox, softening: f64, exclude_idx: Option<usize>) -> Vec3
     {
         match node {
             OctreeNode::Empty => Vec3::zero(),
             OctreeNode::Leaf { particle_idx } => {
+                // Skip self-interaction
+                if Some(*particle_idx) == exclude_idx {
+                    return Vec3::zero();
+                }
                 let p = &particles[*particle_idx];
-                Self::pairwise_acc_with_split(pos, sign, p.pos, p.mass, p.sign, softening, self.r_cut)
+                Self::pairwise_acc_with_split(pos, sign, p.pos, p.mass, p.sign, softening, self.r_cut, self.g_constant)
             }
             OctreeNode::Internal { children, com_plus, mass_plus, com_minus, mass_minus } => {
                 // Distance to cell center
@@ -180,16 +197,16 @@ impl TreePMTree {
                 if cell_size / r_to_cell < self.theta && r_to_cell < self.r_cut {
                     // Far enough for approximation, but still within r_cut
                     let acc_from_plus = Self::pairwise_acc_with_split(
-                        pos, sign, *com_plus, *mass_plus, MassSign::Positive, softening, self.r_cut);
+                        pos, sign, *com_plus, *mass_plus, MassSign::Positive, softening, self.r_cut, self.g_constant);
                     let acc_from_minus = Self::pairwise_acc_with_split(
-                        pos, sign, *com_minus, *mass_minus, MassSign::Negative, softening, self.r_cut);
+                        pos, sign, *com_minus, *mass_minus, MassSign::Negative, softening, self.r_cut, self.g_constant);
                     acc_from_plus + acc_from_minus
                 } else {
                     // Too close or crossing r_cut boundary: recurse into children
                     let mut acc = Vec3::zero();
                     for (i, child) in children.iter().enumerate() {
                         acc += self.acc_recursive(child, pos, sign, particles,
-                            &bounds.child_box(i), softening);
+                            &bounds.child_box(i), softening, exclude_idx);
                     }
                     acc
                 }
@@ -200,7 +217,7 @@ impl TreePMTree {
     /// Pairwise acceleration with TreePM splitting
     /// F_tree = F_full * (1 - W_pm(r))
     fn pairwise_acc_with_split(pos_i: Vec3, sign_i: MassSign, pos_j: Vec3, mass_j: f64,
-        sign_j: MassSign, softening: f64, r_cut: f64) -> Vec3
+        sign_j: MassSign, softening: f64, r_cut: f64, g_constant: f64) -> Vec3
     {
         if mass_j == 0.0 { return Vec3::zero(); }
 
@@ -218,7 +235,7 @@ impl TreePMTree {
         if r2_soft < 1e-20 { return Vec3::zero(); }
 
         // Janus interaction
-        let interaction = if sign_i == sign_j { 1.0 } else { -1.0 };
+        let interaction = if sign_i == sign_j { 1.0 } else { -1.0 } * g_constant;
 
         // Full force magnitude
         let inv_r3_soft = 1.0 / (r2_soft * r2_soft.sqrt());

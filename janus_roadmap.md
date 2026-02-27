@@ -1224,6 +1224,78 @@ CONTACT PETIT :
 
 ---
 
+## TREEPM IMPLEMENTATION — COMPLÈTE (27 février 2026)
+
+### Motivation
+Barnes-Hut θ=0.7 shows grid artifacts with Janus +/− interactions. TreePM provides a cleaner split: FFT for long-range, Tree for short-range.
+
+### Architecture
+```
+Force_total(i) = Force_PM_longrange(i) + Force_Tree_shortrange(i)
+
+PM dual-grid:
+  ρ⁺ for positive masses, ρ⁻ for negative masses
+  F_on_+ = -∇φ⁺ + ∇φ⁻  (attracted by +, repelled by -)
+  F_on_- = -∇φ⁻ + ∇φ⁺  (attracted by -, repelled by +)
+
+Splitting (polynomial x⁴):
+  PM weight = (r/r_cut)⁴ → 0 at r=0, 1 at r≥r_cut
+  Tree weight = 1 - PM weight
+  k-space: G(k) × exp(-k²r_s²) with r_s = r_cut/3
+```
+
+### Implementation (7 steps in 2h30)
+| Step | Duration | Result |
+|------|----------|--------|
+| 0: Scaffold | 20min | Module created, rustfft (CPU) |
+| 1: 8-particle test | 40min | All 4 Janus signs correct |
+| 2: PM isotropy | 15min | σ=0.12° < 2° |
+| 3: Tree splitting | 30min | Continuity 8.9% < 10% |
+| 4: Integration | 20min | TreePM complete |
+| 5: Benchmarks | 10min | 100K @ 1s/step |
+| 6: Validation | 15min | ALL CHECKS PASSED |
+
+### Validation Results
+```
+=== TreePM Physics Validation ===
+N particles: 10000
+Grid: 64³, r_cut: 6.25, η: 1.045
+
+Final (100 steps):
+  KE/KE₀ = 1.000
+  Seg = 0.618
+  max_r = 83.7 < 200
+
+✓ KE stable
+✓ Segregation non-negative
+✓ No particle escape
+=== ALL VALIDATION CHECKS PASSED ===
+```
+
+### Files Created
+```
+src/treepm/
+├── mod.rs, pm_grid.rs, splitting.rs
+├── tree_short.rs, treepm_force.rs
+src/bin/
+├── treepm_benchmark.rs, treepm_validate.rs
+tests/
+├── treepm_physics_8p.rs, treepm_isotropy.rs, treepm_continuity.rs
+```
+
+### Performance (CPU, Rayon parallel)
+| N | ms/step |
+|---|---------|
+| 10K | 63 |
+| 50K | 298 |
+| 100K | 1017 |
+
+Next: GPU cuFFT acceleration.
+
+See `TREEPM_ROADMAP.md` for full implementation details.
+
+---
+
 ## PROJET FILAMENTS COSMOLOGIQUES
 
 ### Problème identifié (23 février 2026)

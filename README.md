@@ -215,6 +215,76 @@ Standard (2KE + PE_total = 0) fails: with η ≈ 1, repulsive +/− pairs domina
 
 ---
 
+## TreePM Architecture (New in v1.0)
+
+### Motivation
+
+Barnes-Hut θ=0.7 shows grid artifacts with Janus +/− interactions due to aggressive cell approximation at intermediate distances. TreePM provides a cleaner split: FFT for long-range, Tree for short-range.
+
+### Architecture
+
+```
+Force_total(i) = Force_PM_longrange(i)  + Force_Tree_shortrange(i)
+                 (FFT, r > r_cut)         (BH, r < r_cut)
+
+PM dual-grid (FIX-009):
+  ρ⁺ grid for positive masses
+  ρ⁻ grid for negative masses
+
+  F_on_+ = -∇φ⁺ + ∇φ⁻  (attracted by +, repelled by -)
+  F_on_- = -∇φ⁻ + ∇φ⁺  (attracted by -, repelled by +)
+
+Splitting:
+  PM weight = (r/r_cut)⁴  → 0 at r=0, 1 at r≥r_cut
+  Tree weight = 1 - PM weight
+  k-space: G(k) × exp(-k²r_s²)  with r_s = r_cut/3
+```
+
+### Validation Results
+
+| Test | Result |
+|------|--------|
+| PM isotropy (64³) | σ = 0.12° < 2° ✓ |
+| PM isotropy (128³) | σ = 0.03° < 2° ✓ |
+| Force continuity at r_cut | 8.9% jump < 10% ✓ |
+| All 4 Janus sign combinations | Correct ✓ |
+| KE stability (100 steps) | KE/KE₀ = 1.000 ✓ |
+| Memory (256³ grid) | 512 MB < 2 GB ✓ |
+
+### Performance (CPU rustfft + Rayon)
+
+| N | PM (s) | Force (s) | Total (ms/step) |
+|---|--------|-----------|-----------------|
+| 10K | 0.051 | 0.012 | 63 |
+| 50K | 0.073 | 0.226 | 298 |
+| 100K | 0.120 | 0.897 | 1017 |
+
+Note: GPU cuFFT would significantly accelerate PM phase.
+
+### Files
+
+```
+src/treepm/
+├── mod.rs           # Module declaration
+├── pm_grid.rs       # Dual-grid PM with Gaussian splitting
+├── splitting.rs     # Real-space x⁴ splitting function
+├── tree_short.rs    # Barnes-Hut with r_cut cutoff
+└── treepm_force.rs  # Combined PM + Tree force calculator
+
+src/bin/
+├── treepm_benchmark.rs  # Performance benchmarking
+└── treepm_validate.rs   # Physics validation run
+
+tests/
+├── treepm_physics_8p.rs  # 8-particle Janus sign tests
+├── treepm_isotropy.rs    # PM isotropy validation
+└── treepm_continuity.rs  # Force continuity at r_cut
+```
+
+See `TREEPM_ROADMAP.md` for full implementation details.
+
+---
+
 ## Project Structure
 
 ```
@@ -225,11 +295,17 @@ janus-sim/
 │   ├── nbody.rs                  # CPU N-body (Barnes-Hut, Rayon)
 │   ├── nbody_gpu.rs              # GPU N-body (CUDA, f64, Yukawa kernel)
 │   ├── analysis.rs               # χ² fitting on Pantheon+
+│   ├── treepm/                   # TreePM hybrid force calculator (NEW)
+│   │   ├── mod.rs
+│   │   ├── pm_grid.rs            # Dual-grid PM with Gaussian splitting
+│   │   ├── splitting.rs          # Real-space splitting functions
+│   │   ├── tree_short.rs         # BH tree with r_cut cutoff
+│   │   └── treepm_force.rs       # Combined PM + Tree
 │   └── bin/
 │       ├── friedmann.rs          # Friedmann solver + SNIa fit
 │       ├── nbody_overnight.rs    # GPU production binary
-│       ├── test_anisotropic.rs   # Day 1: anisotropic mode test
-│       ├── test_yukawa_n2.rs     # Day 2: Yukawa N² diagnostic
+│       ├── treepm_benchmark.rs   # TreePM performance (NEW)
+│       ├── treepm_validate.rs    # TreePM physics validation (NEW)
 │       └── ...
 ├── scripts/
 │   ├── render_overnight.py       # 3-panel frame renderer

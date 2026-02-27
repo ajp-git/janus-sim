@@ -13,6 +13,7 @@
 pub mod pm_grid;
 pub mod splitting;
 pub mod tree_short;
+pub mod treepm_force;
 
 /// Splitting radius for TreePM
 /// Forces at r > R_CUT are computed by PM (long-range)

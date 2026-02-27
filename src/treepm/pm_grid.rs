@@ -104,7 +104,19 @@ impl PmGrid {
 
     /// Solve Poisson equation: ∇²φ = 4πGρ using FFT
     /// Applies to both rho_plus → phi_plus and rho_minus → phi_minus
+    ///
+    /// For standard gravity, use r_s = None.
+    /// For TreePM long-range only, use r_s = Some(r_cut / 3.0) for Gaussian splitting.
     pub fn solve_poisson(&mut self, g_constant: f64) {
+        self.solve_poisson_with_splitting(g_constant, None);
+    }
+
+    /// Solve Poisson with optional k-space splitting for TreePM
+    ///
+    /// With r_s = Some(value), applies Gaussian damping:
+    ///   G_pm(k) = -4πG/k² * exp(-k²r_s²)
+    /// This suppresses short-range forces (high k), leaving only long-range.
+    pub fn solve_poisson_with_splitting(&mut self, g_constant: f64, r_s: Option<f64>) {
         let n = self.grid_size;
         let n3 = n * n * n;
 
@@ -156,7 +168,10 @@ impl PmGrid {
             }
 
             // Apply Green's function: G(k) = -4πG / k²
+            // With optional Gaussian splitting: G_pm(k) = G(k) * exp(-k²r_s²)
             let dk = 2.0 * PI / self.box_size;
+            let r_s_sq = r_s.map(|r| r * r);
+
             for i in 0..n {
                 for j in 0..n {
                     for k in 0..n {
@@ -171,7 +186,13 @@ impl PmGrid {
 
                         if k2 > 1e-10 {
                             // G(k) = -4πG / k²
-                            let green = -4.0 * PI * g_constant / k2;
+                            let mut green = -4.0 * PI * g_constant / k2;
+
+                            // Optional Gaussian damping for TreePM
+                            if let Some(rs2) = r_s_sq {
+                                green *= (-k2 * rs2).exp();
+                            }
+
                             data[idx] *= green;
                         } else {
                             // k=0 mode: set to zero (removes mean)
@@ -323,6 +344,51 @@ impl PmGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_gaussian_splitting() {
+        // Test that Gaussian splitting reduces short-range forces
+        let mut pm_full = PmGrid::new(64, 100.0);
+        let mut pm_split = PmGrid::new(64, 100.0);
+
+        // Single mass at origin
+        pm_full.assign_mass(0.0, 0.0, 0.0, 1.0, 1);
+        pm_split.assign_mass(0.0, 0.0, 0.0, 1.0, 1);
+
+        // Solve without splitting
+        pm_full.solve_poisson(1.0);
+
+        // Solve with Gaussian splitting (r_s = 10 corresponds to r_cut ~ 30)
+        let r_s = 10.0;
+        pm_split.solve_poisson_with_splitting(1.0, Some(r_s));
+
+        // Compare forces at different distances
+        println!("\n=== Gaussian Splitting Test ===");
+        println!("r_s = {}", r_s);
+
+        for r in [5.0, 10.0, 20.0, 30.0, 40.0] {
+            let (fx_full, _, _) = pm_full.interpolate_force(r, 0.0, 0.0, 1);
+            let (fx_split, _, _) = pm_split.interpolate_force(r, 0.0, 0.0, 1);
+
+            let ratio = if fx_full.abs() > 1e-10 { fx_split / fx_full } else { 0.0 };
+            println!("  r={:.0}: F_full={:.6}, F_split={:.6}, ratio={:.3}",
+                     r, fx_full, fx_split, ratio);
+        }
+
+        // At short range, split force should be reduced
+        let (fx_full_short, _, _) = pm_full.interpolate_force(5.0, 0.0, 0.0, 1);
+        let (fx_split_short, _, _) = pm_split.interpolate_force(5.0, 0.0, 0.0, 1);
+        assert!(fx_split_short.abs() < fx_full_short.abs() * 0.5,
+                "Split force should be significantly reduced at short range");
+
+        // At long range, forces should be similar
+        let (fx_full_long, _, _) = pm_full.interpolate_force(40.0, 0.0, 0.0, 1);
+        let (fx_split_long, _, _) = pm_split.interpolate_force(40.0, 0.0, 0.0, 1);
+        let ratio_long = fx_split_long / fx_full_long;
+        assert!(ratio_long > 0.8, "Split force should be close to full at long range: ratio={}", ratio_long);
+
+        println!("✓ Gaussian splitting correctly reduces short-range forces");
+    }
 
     #[test]
     fn test_pm_grid_creation() {

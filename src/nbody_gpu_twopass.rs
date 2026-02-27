@@ -1304,19 +1304,62 @@ impl GpuNBodyTwoPass {
         let t0 = Instant::now();
         use rand::{Rng, SeedableRng};
         use rand::rngs::StdRng;
-        use rand_distr::{Distribution, Normal};
         let mut rng = StdRng::seed_from_u64(42);
 
-        // Zel'dovich parameters
-        let amplitude = 1e-3_f64;  // Perturbation amplitude
-        let lambda = 100.0_f64;    // Characteristic scale (Mpc in simulation units)
-        let sigma = amplitude * lambda;  // Gaussian displacement std dev
-        let normal = Normal::new(0.0, sigma).unwrap();
+        // Multi-mode Zel'dovich parameters
+        // 100 modes with non-integer k values to avoid harmonic artifacts
+        let n_modes = 100_usize;
+        let amplitude = 5.0_f64;  // Total displacement amplitude (Mpc)
+        let k_min = 0.5_f64;  // Non-integer minimum
+        let k_max = 4.0_f64;  // Non-integer maximum
+        let k_fundamental = 2.0 * std::f64::consts::PI / box_size;
 
-        // PURE RANDOM positions (no grid) + Zel'dovich displacement
-        // This eliminates any grid memory artifact
-        println!("         Random positions + Zel'dovich (no grid)");
-        println!("         Zel'dovich: amplitude = {:.0e}, lambda = {:.1}, sigma = {:.3}", amplitude, lambda, sigma);
+        // Generate random modes with independent seeds
+        struct ZelMode {
+            kx: f64, ky: f64, kz: f64,  // Wave vector
+            phi: f64,                    // Phase
+            dx: f64, dy: f64, dz: f64,  // Displacement direction (unit vector)
+            amp: f64,                    // Amplitude
+        }
+
+        let mut modes: Vec<ZelMode> = Vec::with_capacity(n_modes);
+        let amp_per_mode = amplitude / (n_modes as f64).sqrt();
+
+        for i in 0..n_modes {
+            // Fresh RNG for each mode using different seed
+            let mut mode_rng = StdRng::seed_from_u64(42 + 1000 * (i as u64) + 7919);
+
+            // Random k magnitude in [k_min, k_max] - continuous, not integer
+            let k_mag = k_min + mode_rng.random::<f64>() * (k_max - k_min);
+            let k = k_mag * k_fundamental;
+
+            // Uniform random direction on sphere for wave vector
+            // theta = arccos(uniform(-1,1)), phi = uniform(0, 2π)
+            let cos_theta_k = 2.0 * mode_rng.random::<f64>() - 1.0;
+            let sin_theta_k = (1.0 - cos_theta_k * cos_theta_k).sqrt();
+            let phi_k = mode_rng.random::<f64>() * 2.0 * std::f64::consts::PI;
+            let kx = k * sin_theta_k * phi_k.cos();
+            let ky = k * sin_theta_k * phi_k.sin();
+            let kz = k * cos_theta_k;
+
+            // Random phase
+            let phase = mode_rng.random::<f64>() * 2.0 * std::f64::consts::PI;
+
+            // Uniform random direction on sphere for displacement
+            let cos_theta_d = 2.0 * mode_rng.random::<f64>() - 1.0;
+            let sin_theta_d = (1.0 - cos_theta_d * cos_theta_d).sqrt();
+            let phi_d = mode_rng.random::<f64>() * 2.0 * std::f64::consts::PI;
+            let dx = sin_theta_d * phi_d.cos();
+            let dy = sin_theta_d * phi_d.sin();
+            let dz = cos_theta_d;
+
+            modes.push(ZelMode { kx, ky, kz, phi: phase, dx, dy, dz, amp: amp_per_mode });
+        }
+
+        // PURE RANDOM positions + multi-mode Zel'dovich displacement
+        println!("         Random positions + multi-mode Zel'dovich (no grid)");
+        println!("         Zel'dovich: {} modes, amplitude = {:.1} Mpc, k in [{:.1}, {:.1}]×2π/L",
+                 n_modes, amplitude, k_min, k_max);
 
         let mut pos_data = Vec::with_capacity(n_total * 3);
         let mut vel_data = Vec::with_capacity(n_total * 3);
@@ -1324,22 +1367,30 @@ impl GpuNBodyTwoPass {
 
         let half = box_size / 2.0;
 
-        // Generate purely random positions with Zel'dovich perturbations
+        // Generate purely random positions with multi-mode Zel'dovich perturbations
         for _ in 0..n_total {
             // Random uniform position in box [-half, +half]
             let x0 = rng.random::<f64>() * box_size - half;
             let y0 = rng.random::<f64>() * box_size - half;
             let z0 = rng.random::<f64>() * box_size - half;
 
-            // Zel'dovich displacement (Gaussian)
-            let dx = normal.sample(&mut rng);
-            let dy = normal.sample(&mut rng);
-            let dz = normal.sample(&mut rng);
+            // Multi-mode Zel'dovich displacement: Σ_k A_k × sin(k·r + φ_k) × d_k
+            let mut disp_x = 0.0_f64;
+            let mut disp_y = 0.0_f64;
+            let mut disp_z = 0.0_f64;
+
+            for mode in &modes {
+                let phase = mode.kx * x0 + mode.ky * y0 + mode.kz * z0 + mode.phi;
+                let s = phase.sin();
+                disp_x += mode.amp * s * mode.dx;
+                disp_y += mode.amp * s * mode.dy;
+                disp_z += mode.amp * s * mode.dz;
+            }
 
             // Final position with periodic wrapping
-            let mut x = x0 + dx;
-            let mut y = y0 + dy;
-            let mut z = z0 + dz;
+            let mut x = x0 + disp_x;
+            let mut y = y0 + disp_y;
+            let mut z = z0 + disp_z;
 
             // Wrap to box
             if x > half { x -= box_size; } else if x < -half { x += box_size; }
@@ -2906,22 +2957,9 @@ impl GpuNBodyTwoPass {
 
         self.time += dt;
 
-        // Print timing
-        let total = t_drift_ms + t_reorder_ms + t_force_pos_ms + t_force_neg_ms + t_kick_ms + t_drift2_ms;
-        eprintln!("[step {:03}] MORTON+WARP-COHERENT TIMING (ms):", step_num);
-        eprintln!("  drift (1st)           : {:>6} ms", t_drift_ms);
-        eprintln!("  morton sort+reorder   : {:>6} ms", t_reorder_ms);
-        eprintln!("  --- PASS + ---");
-        eprintln!("    tree build          : {:>6} ms", tree_pos.morton_ms + tree_pos.sort_ms + tree_pos.bvh_karras_ms + tree_pos.reduce_ms);
-        eprintln!("    force+ (warp-coh)   : {:>6} ms  <<<", t_force_pos_ms - (tree_pos.morton_ms + tree_pos.sort_ms + tree_pos.bvh_karras_ms + tree_pos.reduce_ms + tree_pos.reorder_ms + tree_pos.reset_ms + tree_pos.init_leaves_ms));
-        eprintln!("  --- PASS - ---");
-        eprintln!("    tree build          : {:>6} ms", tree_neg.morton_ms + tree_neg.sort_ms + tree_neg.bvh_karras_ms + tree_neg.reduce_ms);
-        eprintln!("    force- (warp-coh)   : {:>6} ms  <<<", t_force_neg_ms - (tree_neg.morton_ms + tree_neg.sort_ms + tree_neg.bvh_karras_ms + tree_neg.reduce_ms + tree_neg.reorder_ms + tree_neg.reset_ms + tree_neg.init_leaves_ms));
-        eprintln!("  kick                  : {:>6} ms", t_kick_ms);
-        eprintln!("  drift (2nd)           : {:>6} ms", t_drift2_ms);
-        eprintln!("  ─────────────────────────────────");
-        eprintln!("  TOTAL                 : {:>6} ms", total);
-        eprintln!();
+        // Timing debug disabled for cleaner output
+        let _ = (t_drift_ms, t_reorder_ms, t_force_pos_ms, t_force_neg_ms, t_kick_ms, t_drift2_ms);
+        let _ = (tree_pos, tree_neg);
 
         Ok(())
     }

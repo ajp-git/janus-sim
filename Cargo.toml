@@ -485,3 +485,28 @@ required-features = ["cuda", "cufft"]
 name = "janus_85m_treepm"
 path = "src/bin/janus_85m_treepm.rs"
 required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "validate_virial_500k"
+path = "src/bin/validate_virial_500k.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "validate_virial_100k"
+path = "src/bin/validate_virial_100k.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "validate_zeldovich_100k"
+path = "src/bin/validate_zeldovich_100k.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "treepm_zeldovich_test"
+path = "src/bin/treepm_zeldovich_test.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "treepm_zeldovich_multimode"
+path = "src/bin/treepm_zeldovich_multimode.rs"
+required-features = ["cuda", "cufft"]

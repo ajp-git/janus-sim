@@ -1,6 +1,10 @@
 //! Janus 85M particle simulation with TreePM + Morton + warp-coherent
 //!
-//! Production run using optimized step_treepm_gpu_morton:
+//! ICs: Multi-mode Zel'dovich P(k) + virialized (validated: onset z=2.65)
+//!   - Positions: grid + FFT-based P(k) displacement spectrum
+//!   - Velocities: random, scaled by virial_factor = 0.8
+//!
+//! TreePM using optimized step_treepm_gpu_morton:
 //!   - Morton ordering: 7.4x speedup
 //!   - Warp-coherent kernel: 3x additional
 //!   - Expected: ~35s/step @ 85M → 5 days for 12000 steps
@@ -11,6 +15,10 @@
 use janus::nbody_gpu_twopass::GpuNBodyTwoPass;
 #[cfg(all(feature = "cuda", feature = "cufft"))]
 use janus::friedmann::{JanusParams, CosmoInterpolator};
+use rand::prelude::*;
+use rand_distr::Normal;
+use rustfft::{FftPlanner, num_complex::Complex};
+use std::f64::consts::PI;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
@@ -26,7 +34,239 @@ const SNAPSHOT_INTERVAL: usize = 1000;
 const MAX_SNAPSHOTS: usize = 20;  // Keep last 20 snapshots
 const Z_INIT: f64 = 5.0;
 const TOTAL_STEPS: usize = 12000;
-const VIRIAL_FACTOR: f64 = 0.5;  // 0.5 for large N (prevents premature collapse)
+const VIRIAL_FACTOR: f64 = 0.8;  // 0.8 validated on 100K: KE/KE₀ < 10 throughout
+
+// Power spectrum parameters (validated in treepm_zeldovich_multimode: onset z=2.65)
+const N_S: f64 = 0.96;   // Spectral index
+const K0: f64 = 0.02;    // Turnover scale (Mpc⁻¹)
+
+/// 3D inverse FFT helper
+fn ifft_3d(data: &mut [Complex<f64>], ifft: &std::sync::Arc<dyn rustfft::Fft<f64>>, n: usize) -> Vec<f64> {
+    let n3 = n * n * n;
+
+    for iy in 0..n {
+        for ix in 0..n {
+            let mut slice: Vec<Complex<f64>> = (0..n)
+                .map(|iz| data[iz * n * n + iy * n + ix])
+                .collect();
+            ifft.process(&mut slice);
+            for iz in 0..n {
+                data[iz * n * n + iy * n + ix] = slice[iz];
+            }
+        }
+    }
+
+    for iz in 0..n {
+        for ix in 0..n {
+            let mut slice: Vec<Complex<f64>> = (0..n)
+                .map(|iy| data[iz * n * n + iy * n + ix])
+                .collect();
+            ifft.process(&mut slice);
+            for iy in 0..n {
+                data[iz * n * n + iy * n + ix] = slice[iy];
+            }
+        }
+    }
+
+    for iz in 0..n {
+        for iy in 0..n {
+            let base = iz * n * n + iy * n;
+            let mut slice: Vec<Complex<f64>> = data[base..base+n].to_vec();
+            ifft.process(&mut slice);
+            for ix in 0..n {
+                data[base + ix] = slice[ix];
+            }
+        }
+    }
+
+    let norm = 1.0 / (n3 as f64);
+    data.iter().map(|c| c.re * norm).collect()
+}
+
+/// Generate multi-mode Zel'dovich ICs with P(k) spectrum + virialized velocities
+/// - Positions: grid + FFT-based P(k) displacement spectrum
+/// - Velocities: random, scaled by virial_velocity = sqrt(N/box) × virial_factor
+#[cfg(all(feature = "cuda", feature = "cufft"))]
+fn generate_zeldovich_ics(n_total: usize, box_size: f64, seed: u64) -> (Vec<f32>, Vec<f32>, Vec<i8>) {
+    let n_grid = (n_total as f64).powf(1.0/3.0).ceil() as usize;
+    let n3 = n_grid * n_grid * n_grid;
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    println!("Generating multi-mode Zel'dovich ICs with P(k) spectrum...");
+    println!("  Grid: {}³ = {} particles", n_grid, n3);
+    println!("  Box: {:.1} Mpc", box_size);
+    println!("  P(k) ∝ k^{} / (1 + (k/{})⁴)", N_S, K0);
+
+    let dk = 2.0 * PI / box_size;
+    let half_n = n_grid / 2;
+    let spacing = box_size / n_grid as f64;
+    let half_box = box_size / 2.0;
+
+    let a_init = 1.0 / (1.0 + Z_INIT);
+    let d_growth = a_init;
+    let amplitude = 0.01;
+
+    // Generate Gaussian random field in Fourier space
+    println!("  Generating Fourier modes...");
+    let mut delta_k: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); n3];
+    let normal = Normal::new(0.0, 1.0).unwrap();
+
+    for iz in 0..n_grid {
+        for iy in 0..n_grid {
+            for ix in 0..n_grid {
+                let idx = iz * n_grid * n_grid + iy * n_grid + ix;
+
+                let kx_idx = if ix <= half_n { ix as i32 } else { ix as i32 - n_grid as i32 };
+                let ky_idx = if iy <= half_n { iy as i32 } else { iy as i32 - n_grid as i32 };
+                let kz_idx = if iz <= half_n { iz as i32 } else { iz as i32 - n_grid as i32 };
+
+                let kx = kx_idx as f64 * dk;
+                let ky = ky_idx as f64 * dk;
+                let kz = kz_idx as f64 * dk;
+                let k = (kx*kx + ky*ky + kz*kz).sqrt();
+
+                if k < 1e-10 {
+                    delta_k[idx] = Complex::new(0.0, 0.0);
+                    continue;
+                }
+
+                let pk = k.powf(N_S) / (1.0 + (k / K0).powi(4));
+                let sigma_k = pk.sqrt() * amplitude * d_growth;
+
+                let re: f64 = rng.sample(&normal) * sigma_k;
+                let im: f64 = rng.sample(&normal) * sigma_k;
+                delta_k[idx] = Complex::new(re, im);
+            }
+        }
+    }
+
+    // Enforce Hermitian symmetry
+    for iz in 0..n_grid {
+        for iy in 0..n_grid {
+            for ix in 0..=half_n {
+                let idx = iz * n_grid * n_grid + iy * n_grid + ix;
+                let iz_conj = if iz == 0 { 0 } else { n_grid - iz };
+                let iy_conj = if iy == 0 { 0 } else { n_grid - iy };
+                let ix_conj = if ix == 0 { 0 } else { n_grid - ix };
+                let idx_conj = iz_conj * n_grid * n_grid + iy_conj * n_grid + ix_conj;
+
+                if idx < idx_conj {
+                    delta_k[idx_conj] = delta_k[idx].conj();
+                }
+            }
+        }
+    }
+
+    // Compute displacement field
+    println!("  Computing displacement fields...");
+    let mut psi_x_k: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); n3];
+    let mut psi_y_k: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); n3];
+    let mut psi_z_k: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); n3];
+
+    for iz in 0..n_grid {
+        for iy in 0..n_grid {
+            for ix in 0..n_grid {
+                let idx = iz * n_grid * n_grid + iy * n_grid + ix;
+
+                let kx_idx = if ix <= half_n { ix as i32 } else { ix as i32 - n_grid as i32 };
+                let ky_idx = if iy <= half_n { iy as i32 } else { iy as i32 - n_grid as i32 };
+                let kz_idx = if iz <= half_n { iz as i32 } else { iz as i32 - n_grid as i32 };
+
+                let kx = kx_idx as f64 * dk;
+                let ky = ky_idx as f64 * dk;
+                let kz = kz_idx as f64 * dk;
+                let k2 = kx*kx + ky*ky + kz*kz;
+
+                if k2 < 1e-20 { continue; }
+
+                let minus_i = Complex::new(0.0, -1.0);
+                psi_x_k[idx] = minus_i * kx * delta_k[idx] / k2;
+                psi_y_k[idx] = minus_i * ky * delta_k[idx] / k2;
+                psi_z_k[idx] = minus_i * kz * delta_k[idx] / k2;
+            }
+        }
+    }
+
+    // Inverse FFT
+    println!("  Performing inverse FFT...");
+    let mut planner = FftPlanner::new();
+    let ifft = planner.plan_fft_inverse(n_grid);
+
+    let psi_x = ifft_3d(&mut psi_x_k, &ifft, n_grid);
+    let psi_y = ifft_3d(&mut psi_y_k, &ifft, n_grid);
+    let psi_z = ifft_3d(&mut psi_z_k, &ifft, n_grid);
+
+    // Find max displacement and scale
+    let mut max_disp = 0.0f64;
+    for i in 0..n3 {
+        let d = (psi_x[i]*psi_x[i] + psi_y[i]*psi_y[i] + psi_z[i]*psi_z[i]).sqrt();
+        if d > max_disp { max_disp = d; }
+    }
+
+    let target_disp = spacing * 0.3;
+    let scale = if max_disp > 1e-10 { target_disp / max_disp } else { 1.0 };
+    println!("  Max displacement: {:.6e} Mpc → scaling to {:.4} Mpc", max_disp, target_disp);
+
+    // Virialized velocities
+    let virial_velocity = ((n3 as f64) / box_size).sqrt() * VIRIAL_FACTOR;
+    println!("  Virialized velocities: virial_velocity = {:.4} (factor = {:.2})",
+        virial_velocity, VIRIAL_FACTOR);
+
+    // Generate particles
+    println!("  Placing {} particles...", n3);
+    let n_positive = (n3 as f64 / (1.0 + ETA)) as usize;
+
+    let mut positions = Vec::with_capacity(n3 * 3);
+    let mut velocities = Vec::with_capacity(n3 * 3);
+    let mut signs: Vec<i8> = Vec::with_capacity(n3);
+
+    for iz in 0..n_grid {
+        for iy in 0..n_grid {
+            for ix in 0..n_grid {
+                let idx = iz * n_grid * n_grid + iy * n_grid + ix;
+
+                let x0 = (ix as f64 + 0.5) * spacing - half_box;
+                let y0 = (iy as f64 + 0.5) * spacing - half_box;
+                let z0 = (iz as f64 + 0.5) * spacing - half_box;
+
+                let mut x = x0 + psi_x[idx] * scale;
+                let mut y = y0 + psi_y[idx] * scale;
+                let mut z = z0 + psi_z[idx] * scale;
+
+                while x > half_box { x -= box_size; }
+                while x < -half_box { x += box_size; }
+                while y > half_box { y -= box_size; }
+                while y < -half_box { y += box_size; }
+                while z > half_box { z -= box_size; }
+                while z < -half_box { z += box_size; }
+
+                positions.push(x as f32);
+                positions.push(y as f32);
+                positions.push(z as f32);
+
+                let vx = (rng.random::<f64>() - 0.5) * virial_velocity;
+                let vy = (rng.random::<f64>() - 0.5) * virial_velocity;
+                let vz = (rng.random::<f64>() - 0.5) * virial_velocity;
+                velocities.push(vx as f32);
+                velocities.push(vy as f32);
+                velocities.push(vz as f32);
+
+                signs.push(1i8);
+            }
+        }
+    }
+
+    // Assign signs based on eta
+    for i in 0..n_positive { signs[i] = 1; }
+    for i in n_positive..n3 { signs[i] = -1; }
+    signs.shuffle(&mut rng);
+
+    let actual_pos = signs.iter().filter(|&&s| s > 0).count();
+    let actual_neg = signs.iter().filter(|&&s| s < 0).count();
+    println!("  Generated: N+ = {}, N- = {}", actual_pos, actual_neg);
+
+    (positions, velocities, signs)
+}
 
 #[cfg(all(feature = "cuda", feature = "cufft"))]
 struct RenderJob {
@@ -159,7 +399,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  dt = {}", DT);
     println!("  box = {:.2} Mpc", box_size);
     println!("  integrator = TreePM (Morton + warp-coherent)");
-    println!("  virial_factor = {} (prevents premature collapse)", VIRIAL_FACTOR);
+    println!("  ICs = Zel'dovich + virialized (virial_factor = {})", VIRIAL_FACTOR);
     println!("  frames every {} steps", FRAME_INTERVAL);
     println!("  snapshots every {} steps", SNAPSHOT_INTERVAL);
     println!();
@@ -214,9 +454,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("CSV: {}", csv_path);
     println!();
 
-    // Create simulation with proper virialization
-    println!("Creating simulation...");
-    let mut sim = GpuNBodyTwoPass::new_with_virial_factor(n_positive, n_negative, box_size, VIRIAL_FACTOR)?;
+    // Generate Zel'dovich ICs (validated: onset z=2.46 in treepm_zeldovich_test)
+    println!("Creating simulation with Zel'dovich ICs...");
+    let t0 = Instant::now();
+    let (positions, velocities, signs) = generate_zeldovich_ics(N_PARTICLES, box_size, 12345);
+    println!("  IC generation: {:.2}s", t0.elapsed().as_secs_f64());
+
+    let mut sim = GpuNBodyTwoPass::with_custom_ics(positions, velocities, signs, box_size)?;
     sim.set_theta(THETA);
     println!("  θ = {}", THETA);
 

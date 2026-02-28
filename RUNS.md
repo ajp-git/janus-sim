@@ -162,11 +162,42 @@ Notes:
 
 ---
 
+### Run: treepm_zeldovich_100K (Validation)
+Date: 2026-02-28
+Status: **completed** ✅
+
+Parameters:
+  N particles: 97,336 (46³ grid)
+  eta: 1.045
+  z_init: 5.0
+  theta: 0.7
+  r_cut: box/16 (6.19 Mpc)
+  dt: 0.01
+  steps: 2000
+  box_size: 99.10 Mpc
+  integrator: TreePM (step_treepm_gpu_morton)
+
+  **ICs: Zel'dovich + virialized**
+    - Positions: grid + sinusoidal (A=1e-3, λ=100 Mpc, σ=0.1)
+    - Velocities: random, virial_factor = 0.8
+
+Results:
+  - **Onset at z = 2.46** ✅ (criterion: z ∈ [2.0, 3.0])
+  - S_max = 0.9255 at step 1820 (z = 0.09)
+  - Final KE/KE₀ = 28 (stable, no collapse)
+  - Runtime: 0.6 min (18 ms/step)
+
+Notes:
+  - This validates Zel'dovich ICs for 85M production run
+  - CSV: output/treepm_zeldovich_2026-02-28_212851/time_series.csv
+
+---
+
 ## Current Run
 
 ### Run: 85M_treepm_production (FINAL)
 Date: 2026-02-28
-Status: **pending** (waiting for 2M run to finish)
+Status: **ready to launch** (Zel'dovich ICs validated)
 
 Parameters:
   N particles: 85,000,000
@@ -179,7 +210,15 @@ Parameters:
   box_size: ~947 Mpc (auto: 100 × (85M/100K)^(1/3))
   integrator: TreePM (step_treepm_gpu_morton)
   kernel: Morton + warp-coherent (optim-warpcoherent-v1.0)
-  virial_factor: 0.5 (prevents premature collapse for large N)
+
+  **ICs: Zel'dovich + virialized** (validated 2026-02-28)
+    - Positions: grid + sinusoidal displacement (A=1e-3, λ=100 Mpc, σ=0.1)
+    - Velocities: random, scaled by virial_factor = 0.8
+
+Validation runs:
+  - vf=0.3 on 2M (uniform): ❌ KE/KE₀ = 850 (collapse)
+  - vf=0.8 on 100K (uniform): ✅ KE/KE₀ = 8.8 (stable)
+  - **Zel'dovich + vf=0.8 on 100K**: ✅ onset z = 2.46, S_max = 0.93
 
 Output:
   - frames every 500 steps
@@ -199,7 +238,8 @@ docker compose run --rm dev cargo run --release --features cuda,cufft \
 
 Notes:
   - Uses warp-coherent kernel (22x faster than baseline)
-  - First 85M TreePM production run
+  - Uses Zel'dovich ICs (validated: onset z=2.46 on 100K)
+  - First 85M TreePM production run with cosmological ICs
   - Will replace 85M_expansion (which uses old BH code)
 
 ---

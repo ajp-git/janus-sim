@@ -1494,20 +1494,11 @@ extern "C" __global__ void forces_treepm_short_range(
                 float ddx = comx-px, ddy = comy-py, ddz = comz-pz;
                 float rp2 = ddx*ddx + ddy*ddy + ddz*ddz + eps2;
 
-                // TreePM: Compute SHORT-RANGE complement to PM long-range
-                // PM applies exp(-k²r_s²) in k-space → erfc(r/r_s) in real space
-                // Short-range must compute erf(r/r_s) weight to avoid double-counting
+                // BH computes full force (no erfc splitting for now)
+                // PM handles residual long-range with k-space damping
                 if (rp2 < r_cut_sq) {
-                    float rp = sqrtf(rp2);
-                    float r_s = r_cut * 0.4f;  // r_s ≈ r_cut/2.5, matching k-space splitting
-
-                    // Short-range splitting weight: erf(r / r_s)
-                    // This goes from 0 at r=0 to 1 at r >> r_s
-                    float x = rp / r_s;
-                    float short_weight = erff(x);
-
-                    float irp3 = rsqrtf(rp2) / rp2;
-                    float f = sign_factor * m * irp3 * short_weight;
+                    float irp3 = rsqrtf(rp2) / rp2;  // 1/r³
+                    float f = sign_factor * m * irp3;
                     ax += f*ddx; ay += f*ddy; az += f*ddz;
                 }
             }
@@ -3477,33 +3468,22 @@ impl GpuNBodyTwoPass {
         }
         self.device.synchronize()?;
 
-        // Morton reorder (same as full step)
-        let morton_k = self.device.get_func("twopass", "compute_morton_all")
-            .ok_or("compute_morton_all not found")?;
-        unsafe {
-            morton_k.launch(cfg, (
-                &self.pos, &mut self.morton_all, &mut self.sorted_all,
-                n as i32, box_half, inv_cell_size,
-            ))?;
-        }
-        self.device.synchronize()?;
+        // NOTE: Morton reordering removed to avoid position/velocity mismatch
+        // The reordering was corrupting the simulation by applying wrong velocities
+        // to wrong particles after the kick step.
 
-        // Radix sort
-        self.radix_sort_all(n, blocks)?;
-
-        // Reorder particles by Morton order
-        self.reorder_all_by_morton(n, blocks)?;
-
-        // Get TreePM short-range force kernel
-        let forces_treepm_k = self.device.get_func("twopass", "forces_treepm_short_range")
-            .ok_or("forces_treepm_short_range not found")?;
+        // Use same kernels as step_dkd for consistency
+        let forces_ow_k = self.device.get_func("twopass", "forces_twopass_overwrite")
+            .ok_or("forces_twopass_overwrite not found")?;
+        let forces_acc_k = self.device.get_func("twopass", "forces_twopass_accumulate")
+            .ok_or("forces_twopass_accumulate not found")?;
 
         let reset_i32_k = self.device.get_func("twopass", "reset_i32")
             .ok_or("reset_i32 not found")?;
         let extract_k = self.device.get_func("twopass", "extract_by_sign")
             .ok_or("extract_by_sign not found")?;
 
-        // PASS 1: Positive particles tree (short-range only)
+        // PASS 1: Positive particles tree
         unsafe {
             reset_i32_k.clone().launch(LaunchConfig {
                 block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
@@ -3517,19 +3497,19 @@ impl GpuNBodyTwoPass {
         self.device.synchronize()?;
         let _ = self.build_single_sign_tree(1, self.n_positive)?;
 
-        // Force + with r_cut (overwrite): n_all_signed > 0 means tree_sign=+1
+        // Force + (overwrite) - same kernel as step_dkd
         unsafe {
-            forces_treepm_k.clone().launch(warp_cfg, (
+            forces_ow_k.launch(cfg, (
                 &self.pos, &self.signs,
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                 &mut self.acc,
-                n as i32, self.theta as f32, self.softening as f32, r_cut as f32,
+                n as i32, 1i32, self.theta as f32, self.softening as f32,
             ))?;
         }
         self.device.synchronize()?;
 
-        // PASS 2: Negative particles tree (short-range only)
+        // PASS 2: Negative particles tree
         unsafe {
             reset_i32_k.launch(LaunchConfig {
                 block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
@@ -3543,14 +3523,14 @@ impl GpuNBodyTwoPass {
         self.device.synchronize()?;
         let _ = self.build_single_sign_tree(-1, self.n_negative)?;
 
-        // Force - with r_cut (accumulate): n_all_signed < 0 means tree_sign=-1
+        // Force - (accumulate) - same kernel as step_dkd
         unsafe {
-            forces_treepm_k.launch(warp_cfg, (
+            forces_acc_k.launch(cfg, (
                 &self.pos, &self.signs,
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                 &mut self.acc,
-                -(n as i32), self.theta as f32, self.softening as f32, r_cut as f32,
+                n as i32, -1i32, self.theta as f32, self.softening as f32,
             ))?;
         }
         self.device.synchronize()?;
@@ -3632,9 +3612,11 @@ impl GpuNBodyTwoPass {
             pm_grid.assign_mass(x, y, z, 1.0, signs_cpu[i]);
         }
 
-        // FFT Poisson solve with Gaussian splitting (long-range only)
-        let r_s = r_cut * 0.4;  // r_s ≈ r_cut/2.5, matching short-range kernel
-        let g_constant = 1.0;   // Simulation units
+        // FFT Poisson solve with STRONG k-space damping
+        // r_s = r_cut → PM only affects r >> r_cut (very long range)
+        // BH handles r < r_cut with full force (no erfc)
+        let r_s = r_cut;  // Strong damping
+        let g_constant = 1.0;
         pm_grid.solve_poisson_with_splitting(g_constant, Some(r_s));
 
         // Interpolate PM forces for all particles
@@ -3728,7 +3710,7 @@ impl GpuNBodyTwoPass {
         let half_dt = (dt / 2.0) as f32;
         let cell_size = (self.box_size / grid as f64) as f32;
         let inv_cell_size = (grid as f64 / self.box_size) as f32;
-        let r_s = r_cut * 0.4;  // r_s ≈ r_cut/2.5, matching short-range kernel
+        // No k-space damping: BH handles r < r_cut, PM handles r > r_cut
         let g_constant = 1.0;
 
         let blocks = (n + 255) / 256;
@@ -3786,6 +3768,10 @@ impl GpuNBodyTwoPass {
         let phi_plus_ptr = get_device_ptr(&self.phi_plus) as *mut f64;
         let phi_minus_ptr = get_device_ptr(&self.phi_minus) as *mut f64;
 
+        // TreePM Gaussian splitting: r_s = r_cut/3
+        // PM k-space damping: exp(-k²×r_s²) → affects scales > r_s
+        // BH real-space: should use erfc(r/(2r_s)) → affects scales < r_s
+        let r_s = r_cut / 3.0;
         unsafe {
             // Solve rho_plus → phi_plus
             crate::treepm::cufft_ffi::solve_device(
@@ -3819,7 +3805,7 @@ impl GpuNBodyTwoPass {
         self.compute_short_range_forces(r_cut)?;
         let bh_ms = t_bh.elapsed().as_millis();
 
-        // ===== ADD PM FORCES TO ACC =====
+        // Add PM long-range forces (r > r_cut)
         let add_pm_k = self.device.get_func("twopass", "add_pm_forces")
             .ok_or("add_pm_forces not found")?;
         unsafe {

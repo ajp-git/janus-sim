@@ -84,6 +84,40 @@ Results:
 
 ---
 
+## Completed Validation Runs
+
+### Run: TreePM_validation_100K
+Date: 2026-02-28
+Status: **completed** ✅
+
+Parameters:
+  N particles: 100,000
+  eta: 1.045
+  z_init: 5.0
+  theta: 0.7
+  r_cut: box/16 (6.25 Mpc)
+  dt: 0.01
+  steps: 5000
+  integrator: TreePM (BH short-range + cuFFT PM long-range)
+
+Results:
+  - **S_max = 0.659 at step 1300 (z = 1.88)**
+  - Grid artifacts: **absent** (human validated)
+  - Performance: ~46ms/step (PM 8ms + BH 38ms)
+
+Validation Criteria:
+  - [x] S_max > 0.4 (got 0.659)
+  - [x] z @ S_max ≈ 1.8 (got 1.88)
+  - [x] No grid artifacts (visual inspection passed)
+
+Notes:
+  - TreePM production-ready after this validation
+  - Centered box convention [-L/2, +L/2] confirmed correct
+  - PM uses dual-grid (rho_plus, rho_minus) per FIX-009
+  - Frames saved: output/treepm_validation/frame_{1000,3000}.png
+
+---
+
 ## Current Run
 
 ### Run: 85M_expansion

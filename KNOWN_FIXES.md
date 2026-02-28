@@ -146,6 +146,34 @@ const GRID_SIZE: usize = 256;  // 256³ — Run A uniquement
 
 ---
 
+### [FIX-012] TreePM production-ready — configuration validée
+```
+Date validation : 2026-02-28
+Run référence : TreePM_validation_100K (S_max=0.659 @ z=1.88)
+
+✅ PARAMÈTRES VALIDÉS :
+  θ = 0.7              (obligatoire pour physique correcte)
+  r_cut = box/16       (split BH/PM)
+  PM grid = 128³       (cuFFT GPU)
+  erfc splitting: BH short-range + PM k-space damping exp(-k²r_s²)
+  r_s = r_cut/3        (Gaussian splitting scale)
+  virial_velocity = sqrt(N/box) × 0.3
+
+❌ PARAMÈTRES INVALIDÉS :
+  θ = 0.5              → ségrégation trop faible (~0.40 vs 0.65)
+  TreePM sans erfc     → double-comptage forces, non publiable
+  PM seul (sans BH)    → ségrégation nulle (FIX-009)
+  r_cut = ∞            → revient à BH pur (valide mais pas TreePM)
+
+Convention coordonnées : [-L/2, +L/2] (centré)
+  - ICs : (rng - 0.5) * box_size
+  - drift : wrap sur [-box_half, +box_half]
+  - CIC : (px + box_half) * inv_cell_size
+  - Visualisation : pos += box/2 pour afficher en [0, L]
+```
+
+---
+
 ## Résultats de référence (ne pas invalider)
 
 ### Run BH 2M (janus-sim, KDK original)

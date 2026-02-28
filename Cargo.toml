@@ -435,3 +435,28 @@ required-features = ["cuda", "cufft"]
 name = "test_no_virial"
 path = "src/bin/test_no_virial.rs"
 required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "test_force_compare"
+path = "src/bin/test_force_compare.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "test_pm_vs_bh"
+path = "src/bin/test_pm_vs_bh.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "diag_bh_pure"
+path = "src/bin/diag_bh_pure.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "treepm_validation"
+path = "src/bin/treepm_validation.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "treepm_2m_production"
+path = "src/bin/treepm_2m_production.rs"
+required-features = ["cuda", "cufft"]

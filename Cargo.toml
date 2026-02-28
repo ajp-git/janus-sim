@@ -120,6 +120,7 @@ path = "src/lib.rs"
 [features]
 default = []
 cuda = ["cudarc"]
+cufft = []  # Requires libcufft_wrapper.so (see cuda/build_cufft.sh)
 
 [dependencies]
 # Algèbre linéaire SIMD
@@ -131,8 +132,9 @@ rayon = "1.10"
 # CUDA GPU (optional)
 cudarc = { version = "0.12", features = ["cuda-12030", "nvrtc"], optional = true }
 
-# Note: cuFFT bindings require libclang. Using rustfft (CPU) for initial TreePM.
-# GPU FFT optimization planned after architecture validation.
+# Note: cuFFT not available in cudarc 0.12. Using hybrid approach:
+# - rustfft for FFT (CPU)
+# - CUDA kernel for force interpolation (GPU)
 
 # Random number generation
 rand = "0.9"
@@ -340,3 +342,96 @@ required-features = ["cuda"]
 name = "test_1m_jitter"
 path = "src/bin/test_1m_jitter.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "gpu_visual_run"
+path = "src/bin/gpu_visual_run.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_grid_artifact"
+path = "src/bin/test_grid_artifact.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_cufft"
+path = "src/bin/test_cufft.rs"
+required-features = ["cufft"]
+
+[[bin]]
+name = "test_treepm_hybrid"
+path = "src/bin/test_treepm_hybrid.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_treepm_gpu"
+path = "src/bin/test_treepm_gpu.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "treepm_production_test"
+path = "src/bin/treepm_production_test.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "diag_ke"
+path = "src/bin/diag_ke.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "diag_cosmo"
+path = "src/bin/diag_cosmo.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "diag_bugs"
+path = "src/bin/diag_bugs.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "test_pm_repulsion"
+path = "src/bin/test_pm_repulsion.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "test_2particle"
+path = "src/bin/test_2particle.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "test_segregation"
+path = "src/bin/test_segregation.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "regression_bh_ref"
+path = "src/bin/regression_bh_ref.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "diag_bh_vs_treepm"
+path = "src/bin/diag_bh_vs_treepm.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "diag_pe_analytical_vs_exact"
+path = "src/bin/diag_pe_analytical_vs_exact.rs"
+
+[[bin]]
+name = "diag_no_virialization"
+path = "src/bin/diag_no_virialization.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "diag_rcut_virialization"
+path = "src/bin/diag_rcut_virialization.rs"
+
+[[bin]]
+name = "diag_uniform_vs_zeldovich"
+path = "src/bin/diag_uniform_vs_zeldovich.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "test_no_virial"
+path = "src/bin/test_no_virial.rs"
+required-features = ["cuda", "cufft"]

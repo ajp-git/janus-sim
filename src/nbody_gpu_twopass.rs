@@ -1635,135 +1635,59 @@ impl GpuNBodyTwoPass {
         let n_max_sign = n_positive.max(n_negative);
         let n_bvh = 2 * n_max_sign;  // Only need tree for ONE sign at a time!
 
-        // Generate particles with Zel'dovich perturbations
-        println!("  [3/6] Generating {} particles with Zel'dovich ICs...", n_total);
+        // Generate particles with UNIFORM RANDOM positions (like reference GpuNBodySimulation)
+        // Note: Zel'dovich ICs were found to suppress segregation - reverted to uniform random
+        println!("  [3/6] Generating {} particles with uniform random ICs...", n_total);
         let t0 = Instant::now();
         use rand::{Rng, SeedableRng};
         use rand::rngs::StdRng;
         let mut rng = StdRng::seed_from_u64(42);
 
-        // Multi-mode Zel'dovich parameters
-        // 100 modes with non-integer k values to avoid harmonic artifacts
-        let n_modes = 100_usize;
-        let amplitude = 5.0_f64;  // Total displacement amplitude (Mpc)
-        let k_min = 0.5_f64;  // Non-integer minimum
-        let k_max = 4.0_f64;  // Non-integer maximum
-        let k_fundamental = 2.0 * std::f64::consts::PI / box_size;
-
-        // Generate random modes with independent seeds
-        struct ZelMode {
-            kx: f64, ky: f64, kz: f64,  // Wave vector
-            phi: f64,                    // Phase
-            dx: f64, dy: f64, dz: f64,  // Displacement direction (unit vector)
-            amp: f64,                    // Amplitude
-        }
-
-        let mut modes: Vec<ZelMode> = Vec::with_capacity(n_modes);
-        let amp_per_mode = amplitude / (n_modes as f64).sqrt();
-
-        for i in 0..n_modes {
-            // Fresh RNG for each mode using different seed
-            let mut mode_rng = StdRng::seed_from_u64(42 + 1000 * (i as u64) + 7919);
-
-            // Random k magnitude in [k_min, k_max] - continuous, not integer
-            let k_mag = k_min + mode_rng.random::<f64>() * (k_max - k_min);
-            let k = k_mag * k_fundamental;
-
-            // Uniform random direction on sphere for wave vector
-            // theta = arccos(uniform(-1,1)), phi = uniform(0, 2π)
-            let cos_theta_k = 2.0 * mode_rng.random::<f64>() - 1.0;
-            let sin_theta_k = (1.0 - cos_theta_k * cos_theta_k).sqrt();
-            let phi_k = mode_rng.random::<f64>() * 2.0 * std::f64::consts::PI;
-            let kx = k * sin_theta_k * phi_k.cos();
-            let ky = k * sin_theta_k * phi_k.sin();
-            let kz = k * cos_theta_k;
-
-            // Random phase
-            let phase = mode_rng.random::<f64>() * 2.0 * std::f64::consts::PI;
-
-            // Uniform random direction on sphere for displacement
-            let cos_theta_d = 2.0 * mode_rng.random::<f64>() - 1.0;
-            let sin_theta_d = (1.0 - cos_theta_d * cos_theta_d).sqrt();
-            let phi_d = mode_rng.random::<f64>() * 2.0 * std::f64::consts::PI;
-            let dx = sin_theta_d * phi_d.cos();
-            let dy = sin_theta_d * phi_d.sin();
-            let dz = cos_theta_d;
-
-            modes.push(ZelMode { kx, ky, kz, phi: phase, dx, dy, dz, amp: amp_per_mode });
-        }
-
-        // PURE RANDOM positions + multi-mode Zel'dovich displacement
-        println!("         Random positions + multi-mode Zel'dovich (no grid)");
-        println!("         Zel'dovich: {} modes, amplitude = {:.1} Mpc, k in [{:.1}, {:.1}]×2π/L",
-                 n_modes, amplitude, k_min, k_max);
-
         let mut pos_data = Vec::with_capacity(n_total * 3);
         let mut vel_data = Vec::with_capacity(n_total * 3);
         let mut signs_data: Vec<i8> = Vec::with_capacity(n_total);
 
-        let half = box_size / 2.0;
+        // Initial velocity scale matching reference BH implementation
+        // virial_velocity = sqrt(N/box) × 0.3 gives proper KE for virialization
+        let virial_velocity = ((n_total as f64) / box_size).sqrt() * 0.3;
 
-        // Generate purely random positions with multi-mode Zel'dovich perturbations
-        for _ in 0..n_total {
-            // Random uniform position in box [-half, +half]
-            let x0 = rng.random::<f64>() * box_size - half;
-            let y0 = rng.random::<f64>() * box_size - half;
-            let z0 = rng.random::<f64>() * box_size - half;
-
-            // Multi-mode Zel'dovich displacement: Σ_k A_k × sin(k·r + φ_k) × d_k
-            let mut disp_x = 0.0_f64;
-            let mut disp_y = 0.0_f64;
-            let mut disp_z = 0.0_f64;
-
-            for mode in &modes {
-                let phase = mode.kx * x0 + mode.ky * y0 + mode.kz * z0 + mode.phi;
-                let s = phase.sin();
-                disp_x += mode.amp * s * mode.dx;
-                disp_y += mode.amp * s * mode.dy;
-                disp_z += mode.amp * s * mode.dz;
-            }
-
-            // Final position with periodic wrapping
-            let mut x = x0 + disp_x;
-            let mut y = y0 + disp_y;
-            let mut z = z0 + disp_z;
-
-            // Wrap to box
-            if x > half { x -= box_size; } else if x < -half { x += box_size; }
-            if y > half { y -= box_size; } else if y < -half { y += box_size; }
-            if z > half { z -= box_size; } else if z < -half { z += box_size; }
-
+        // Generate + particles first (like reference)
+        for _ in 0..n_positive {
+            let x = (rng.random::<f64>() - 0.5) * box_size;
+            let y = (rng.random::<f64>() - 0.5) * box_size;
+            let z = (rng.random::<f64>() - 0.5) * box_size;
+            let vx = (rng.random::<f64>() - 0.5) * virial_velocity;
+            let vy = (rng.random::<f64>() - 0.5) * virial_velocity;
+            let vz = (rng.random::<f64>() - 0.5) * virial_velocity;
             pos_data.extend([x as f32, y as f32, z as f32]);
-
-            // Zero initial velocity (cold start)
-            vel_data.extend([0.0f32, 0.0f32, 0.0f32]);
+            vel_data.extend([vx as f32, vy as f32, vz as f32]);
+            signs_data.push(1);
         }
 
-        // Assign signs uniformly at random using Fisher-Yates approach:
-        // Create array of indices, shuffle, first n_positive are +
-        let mut indices: Vec<usize> = (0..n_total).collect();
-        // Fisher-Yates shuffle
-        for i in (1..n_total).rev() {
-            let j = rng.gen_range(0..=i);
-            indices.swap(i, j);
+        // Then - particles (like reference)
+        for _ in 0..n_negative {
+            let x = (rng.random::<f64>() - 0.5) * box_size;
+            let y = (rng.random::<f64>() - 0.5) * box_size;
+            let z = (rng.random::<f64>() - 0.5) * box_size;
+            let vx = (rng.random::<f64>() - 0.5) * virial_velocity;
+            let vy = (rng.random::<f64>() - 0.5) * virial_velocity;
+            let vz = (rng.random::<f64>() - 0.5) * virial_velocity;
+            pos_data.extend([x as f32, y as f32, z as f32]);
+            vel_data.extend([vx as f32, vy as f32, vz as f32]);
+            signs_data.push(-1);
         }
-        // First n_positive shuffled indices get +1, rest get -1
-        signs_data.resize(n_total, -1i8);
-        for &idx in indices.iter().take(n_positive) {
-            signs_data[idx] = 1i8;
-        }
-        let count_pos = signs_data.iter().filter(|&&s| s > 0).count();
-        let count_neg = n_total - count_pos;
 
-        println!("         Generated: N+ = {}, N- = {}", count_pos, count_neg);
-        println!("         Velocities: v = 0 (cold start, no virialization)");
+        println!("         Generated: N+ = {}, N- = {}", n_positive, n_negative);
+        println!("         virial_velocity = {:.4}", virial_velocity);
         println!("         done ({:.2}s)", t0.elapsed().as_secs_f64());
 
-        // Skip virialization - cold start
-        println!("  [4/6] Skipping virialization (cold ICs)...");
+        // NOTE: No alpha scaling applied. The reference GpuNBodySimulation uses
+        // virial_velocity = sqrt(N/box)*0.3 directly without additional scaling.
+        // Exact PE_binding virialization over-stabilizes the system and prevents
+        // gravitational collapse (segregation).
 
         // Allocate GPU buffers
-        println!("  [5/6] Copying data to GPU...");
+        println!("  [4/5] Copying data to GPU...");
         let t0 = Instant::now();
         let pos = device.htod_sync_copy(&pos_data)?;
         let vel = device.htod_sync_copy(&vel_data)?;
@@ -1772,7 +1696,7 @@ impl GpuNBodyTwoPass {
         println!("         done ({:.2}s)", t0.elapsed().as_secs_f64());
 
         // Single-sign extraction buffers (sized for max sign count)
-        println!("  [6/6] Allocating GPU buffers...");
+        println!("  [5/5] Allocating GPU buffers...");
         let t0 = Instant::now();
         let pos_sign = device.alloc_zeros::<f32>(n_max_sign * 3)?;
         let pos_sign_tmp = device.alloc_zeros::<f32>(n_max_sign * 3)?;
@@ -1853,6 +1777,124 @@ impl GpuNBodyTwoPass {
             n_positive,
             n_negative,
             theta: 5.0,  // Aggressive but fast; validated on 8M
+            softening: 0.1,
+            box_size,
+            time: 0.0,
+            step_count: 0,
+        })
+    }
+
+    /// Create simulation with custom initial conditions (no virialization)
+    pub fn with_custom_ics(
+        pos_data: Vec<f32>,
+        vel_data: Vec<f32>,
+        signs_data: Vec<i8>,
+        box_size: f64,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        use std::time::Instant;
+
+        let n_total = signs_data.len();
+        assert_eq!(pos_data.len(), n_total * 3);
+        assert_eq!(vel_data.len(), n_total * 3);
+
+        let n_positive = signs_data.iter().filter(|&&s| s > 0).count();
+        let n_negative = n_total - n_positive;
+
+        println!("Creating GpuNBodyTwoPass with custom ICs...");
+        println!("  N_total = {}, N+ = {}, N- = {}", n_total, n_positive, n_negative);
+
+        // Initialize CUDA
+        let device = CudaDevice::new(0)?;
+        let ptx = cudarc::nvrtc::compile_ptx(CUDA_TWOPASS_KERNELS)?;
+        device.load_ptx(ptx, "twopass", &[
+            "drift_f32", "kick_f32", "extract_by_sign",
+            "compute_morton_f32", "reorder_f32x3", "reorder_i32",
+            "build_bvh_tp", "init_leaves_tp", "reduce_tp",
+            "forces_twopass_overwrite", "forces_twopass_accumulate",
+            "forces_twopass_warpcoherent",
+            "forces_twopass_shmem_overwrite", "forces_twopass_shmem_accumulate",
+            "forces_direct_n2",
+            "compute_morton_all", "reorder_by_idx_f32x3", "reorder_by_idx_i8",
+            "reset_i32", "reset_f64", "reset_f32", "set_i32",
+            "radix_histogram", "radix_prefix_sum", "radix_scatter",
+            "forces_treepm_short_range",
+            "add_pm_forces",
+            "cic_scatter", "cic_gather", "reset_f64_grid"
+        ])?;
+
+        // Buffer sizes
+        let n_max_sign = n_positive.max(n_negative);
+        let n_bvh = 2 * n_max_sign - 1;
+
+        // Copy data to GPU
+        let t0 = Instant::now();
+        let pos = device.htod_sync_copy(&pos_data)?;
+        let vel = device.htod_sync_copy(&vel_data)?;
+        let signs = device.htod_sync_copy(&signs_data)?;
+        let acc = device.alloc_zeros::<f32>(n_total * 3)?;
+        println!("  Copied to GPU ({:.2}s)", t0.elapsed().as_secs_f64());
+
+        // Allocate all buffers (same as in new())
+        let pos_sign = device.alloc_zeros::<f32>(n_max_sign * 3)?;
+        let pos_sign_tmp = device.alloc_zeros::<f32>(n_max_sign * 3)?;
+        let idx_map = device.alloc_zeros::<i32>(n_max_sign)?;
+        let idx_map_tmp = device.alloc_zeros::<i32>(n_max_sign)?;
+        let extract_count = device.alloc_zeros::<i32>(1)?;
+
+        let n_blocks = (n_max_sign + 255) / 256;
+        let morton_codes = device.alloc_zeros::<u64>(n_max_sign)?;
+        let morton_codes_tmp = device.alloc_zeros::<u64>(n_max_sign)?;
+        let sorted_indices = device.alloc_zeros::<i32>(n_max_sign)?;
+        let sorted_indices_tmp = device.alloc_zeros::<i32>(n_max_sign)?;
+        let radix_hist = device.alloc_zeros::<u32>(n_blocks * 256)?;
+        let radix_global = device.alloc_zeros::<u32>(256)?;
+
+        let n_blocks_all = (n_total + 255) / 256;
+        let morton_all = device.alloc_zeros::<u64>(n_total)?;
+        let morton_all_tmp = device.alloc_zeros::<u64>(n_total)?;
+        let sorted_all = device.alloc_zeros::<i32>(n_total)?;
+        let sorted_all_tmp = device.alloc_zeros::<i32>(n_total)?;
+        let pos_sorted = device.alloc_zeros::<f32>(n_total * 3)?;
+        let signs_sorted = device.alloc_zeros::<i8>(n_total)?;
+        let radix_hist_all = device.alloc_zeros::<u32>(n_blocks_all * 256)?;
+
+        let bvh_left = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_right = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_parent = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_rl = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_rr = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_node_pos = device.alloc_zeros::<f32>(n_bvh * 7)?;
+        let bvh_node_mass = device.alloc_zeros::<f32>(n_bvh)?;
+        let bvh_node_types = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_atomic = device.alloc_zeros::<i32>(n_bvh)?;
+
+        let pm_forces = device.alloc_zeros::<f32>(n_total * 3)?;
+
+        let pm_grid_size = 128usize;
+        let grid_cells = pm_grid_size * pm_grid_size * pm_grid_size;
+        let rho_plus = device.alloc_zeros::<f64>(grid_cells)?;
+        let rho_minus = device.alloc_zeros::<f64>(grid_cells)?;
+        let phi_plus = device.alloc_zeros::<f64>(grid_cells)?;
+        let phi_minus = device.alloc_zeros::<f64>(grid_cells)?;
+
+        println!("  GPU buffers allocated");
+
+        Ok(Self {
+            device,
+            pos, vel, acc, signs,
+            pos_sign, pos_sign_tmp, idx_map, idx_map_tmp, extract_count,
+            morton_codes, morton_codes_tmp, sorted_indices, sorted_indices_tmp,
+            radix_hist, radix_global,
+            morton_all, morton_all_tmp, sorted_all, sorted_all_tmp,
+            pos_sorted, signs_sorted, radix_hist_all,
+            bvh_left, bvh_right, bvh_parent, bvh_rl, bvh_rr,
+            bvh_node_pos, bvh_node_mass, bvh_node_types, bvh_atomic,
+            pm_forces,
+            rho_plus, rho_minus, phi_plus, phi_minus, pm_grid_size,
+            n_particles: n_total,
+            n_positive,
+            n_negative,
+            theta: 0.5,
             softening: 0.1,
             box_size,
             time: 0.0,
@@ -3876,6 +3918,14 @@ impl GpuNBodyTwoPass {
     /// Download signs from GPU (85M × i8)
     pub fn get_signs(&self) -> Result<Vec<i8>, Box<dyn std::error::Error>> {
         Ok(self.device.dtoh_sync_copy(&self.signs)?)
+    }
+
+    /// Download all particle data from GPU (positions, velocities, signs)
+    pub fn get_particles(&self) -> Result<(Vec<f32>, Vec<f32>, Vec<i8>), Box<dyn std::error::Error>> {
+        let pos = self.device.dtoh_sync_copy(&self.pos)?;
+        let vel = self.device.dtoh_sync_copy(&self.vel)?;
+        let signs = self.device.dtoh_sync_copy(&self.signs)?;
+        Ok((pos, vel, signs))
     }
 }
 

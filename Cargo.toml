@@ -540,3 +540,8 @@ required-features = ["cuda", "cufft"]
 name = "janus_60m_treepm"
 path = "src/bin/janus_60m_treepm.rs"
 required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "test_virial_factor"
+path = "src/bin/test_virial_factor.rs"
+required-features = ["cuda", "cufft"]

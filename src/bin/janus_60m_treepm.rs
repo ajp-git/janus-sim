@@ -1,8 +1,8 @@
 //! Janus 60M particle simulation with TreePM + Morton + warp-coherent
 //!
-//! ICs: Multi-mode Zel'dovich P(k) + virialized (validated: onset z=2.37)
+//! ICs: Multi-mode Zel'dovich P(k) + virialized
 //!   - Positions: grid + FFT-based P(k) displacement spectrum
-//!   - Velocities: random, scaled by virial_factor = 0.8
+//!   - Velocities: random, scaled by virial_factor = 1.5 (box=400 calibration)
 //!
 //! TreePM using optimized step_treepm_gpu_morton:
 //!   - Morton ordering: 7.4x speedup
@@ -32,12 +32,12 @@ const BOX_SIZE: f64 = 400.0;  // Fixed 400 Mpc (resolution 1.0 Mpc → filaments
 const ETA: f64 = 1.045;
 const THETA: f64 = 0.7;  // Per FIX-012: theta=0.7 obligatoire
 const DT: f64 = 0.01;
-const FRAME_INTERVAL: usize = 10;      // PNG every 10 steps
+const FRAME_INTERVAL: usize = 20;      // PNG every 20 steps (783MB × 600 = 470GB)
 const SNAPSHOT_INTERVAL: usize = 50;   // Snapshots every 50 steps
 const MAX_SNAPSHOTS: usize = 30;       // Keep last 30 snapshots
 const Z_INIT: f64 = 5.0;
 const TOTAL_STEPS: usize = 12000;
-const VIRIAL_FACTOR: f64 = 0.8;  // 0.8 validated on 100K: KE/KE₀ < 10 throughout
+const VIRIAL_FACTOR: f64 = 1.5;  // 1.5 for box=400: prevents premature collapse (Seg<0.005@z=5)
 
 // Power spectrum parameters (validated in treepm_zeldovich_multimode: onset z=2.65)
 const N_S: f64 = 0.96;   // Spectral index

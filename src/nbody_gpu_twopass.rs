@@ -1557,6 +1557,7 @@ pub struct GpuNBodyTwoPass {
     sorted_all: CudaSlice<i32>,
     sorted_all_tmp: CudaSlice<i32>,
     pos_sorted: CudaSlice<f32>,      // [n_total × 3]
+    vel_sorted: CudaSlice<f32>,      // [n_total × 3] - for Morton reorder
     signs_sorted: CudaSlice<i8>,     // [n_total]
     radix_hist_all: CudaSlice<u32>,  // for n_total radix sort
     // BVH for single-sign tree (sized for max(N+, N-))
@@ -1720,6 +1721,7 @@ impl GpuNBodyTwoPass {
         let sorted_all = device.alloc_zeros::<i32>(n_total)?;
         let sorted_all_tmp = device.alloc_zeros::<i32>(n_total)?;
         let pos_sorted = device.alloc_zeros::<f32>(n_total * 3)?;
+        let vel_sorted = device.alloc_zeros::<f32>(n_total * 3)?;  // for Morton reorder
         let signs_sorted = device.alloc_zeros::<i8>(n_total)?;
         let radix_hist_all = device.alloc_zeros::<u32>(n_blocks_all * 256)?;
 
@@ -1768,7 +1770,7 @@ impl GpuNBodyTwoPass {
             morton_codes, morton_codes_tmp, sorted_indices, sorted_indices_tmp,
             radix_hist, radix_global,
             morton_all, morton_all_tmp, sorted_all, sorted_all_tmp,
-            pos_sorted, signs_sorted, radix_hist_all,
+            pos_sorted, vel_sorted, signs_sorted, radix_hist_all,
             bvh_left, bvh_right, bvh_parent, bvh_rl, bvh_rr,
             bvh_node_pos, bvh_node_mass, bvh_node_types, bvh_atomic,
             pm_forces,
@@ -1855,6 +1857,7 @@ impl GpuNBodyTwoPass {
         let sorted_all = device.alloc_zeros::<i32>(n_total)?;
         let sorted_all_tmp = device.alloc_zeros::<i32>(n_total)?;
         let pos_sorted = device.alloc_zeros::<f32>(n_total * 3)?;
+        let vel_sorted = device.alloc_zeros::<f32>(n_total * 3)?;  // for Morton reorder
         let signs_sorted = device.alloc_zeros::<i8>(n_total)?;
         let radix_hist_all = device.alloc_zeros::<u32>(n_blocks_all * 256)?;
 
@@ -1886,7 +1889,7 @@ impl GpuNBodyTwoPass {
             morton_codes, morton_codes_tmp, sorted_indices, sorted_indices_tmp,
             radix_hist, radix_global,
             morton_all, morton_all_tmp, sorted_all, sorted_all_tmp,
-            pos_sorted, signs_sorted, radix_hist_all,
+            pos_sorted, vel_sorted, signs_sorted, radix_hist_all,
             bvh_left, bvh_right, bvh_parent, bvh_rl, bvh_rr,
             bvh_node_pos, bvh_node_mass, bvh_node_types, bvh_atomic,
             pm_forces,
@@ -2604,7 +2607,8 @@ impl GpuNBodyTwoPass {
         }
         self.device.synchronize()?;
 
-        // Reorder positions and signs by sorted indices
+        // Reorder positions, velocities, and signs by sorted indices
+        // CRITICAL: Must reorder vel to keep pos[i]/vel[i] correspondence
         let reorder_pos_k = self.device.get_func("twopass", "reorder_by_idx_f32x3")
             .ok_or("reorder_by_idx_f32x3 not found")?;
         let reorder_sign_k = self.device.get_func("twopass", "reorder_by_idx_i8")
@@ -2614,12 +2618,16 @@ impl GpuNBodyTwoPass {
             reorder_pos_k.clone().launch(cfg, (
                 &self.pos, &mut self.pos_sorted, &self.sorted_all, n as i32
             ))?;
+            reorder_pos_k.clone().launch(cfg, (
+                &self.vel, &mut self.vel_sorted, &self.sorted_all, n as i32
+            ))?;
             reorder_sign_k.launch(cfg, (
                 &self.signs, &mut self.signs_sorted, &self.sorted_all, n as i32
             ))?;
         }
         // Swap buffers: sorted becomes main
         std::mem::swap(&mut self.pos, &mut self.pos_sorted);
+        std::mem::swap(&mut self.vel, &mut self.vel_sorted);
         std::mem::swap(&mut self.signs, &mut self.signs_sorted);
         self.device.synchronize()?;
         let t_reorder_ms = t0.elapsed().as_millis();
@@ -2839,7 +2847,8 @@ impl GpuNBodyTwoPass {
         }
         self.device.synchronize()?;
 
-        // Reorder positions and signs
+        // Reorder positions, velocities, and signs
+        // CRITICAL: Must reorder vel to keep pos[i]/vel[i] correspondence
         let reorder_pos_k = self.device.get_func("twopass", "reorder_by_idx_f32x3")
             .ok_or("reorder_by_idx_f32x3 not found")?;
         let reorder_sign_k = self.device.get_func("twopass", "reorder_by_idx_i8")
@@ -2849,11 +2858,15 @@ impl GpuNBodyTwoPass {
             reorder_pos_k.clone().launch(cfg, (
                 &self.pos, &mut self.pos_sorted, &self.sorted_all, n as i32
             ))?;
+            reorder_pos_k.clone().launch(cfg, (
+                &self.vel, &mut self.vel_sorted, &self.sorted_all, n as i32
+            ))?;
             reorder_sign_k.launch(cfg, (
                 &self.signs, &mut self.signs_sorted, &self.sorted_all, n as i32
             ))?;
         }
         std::mem::swap(&mut self.pos, &mut self.pos_sorted);
+        std::mem::swap(&mut self.vel, &mut self.vel_sorted);
         std::mem::swap(&mut self.signs, &mut self.signs_sorted);
         self.device.synchronize()?;
         let t_reorder_ms = t0.elapsed().as_millis();
@@ -3239,7 +3252,8 @@ impl GpuNBodyTwoPass {
         }
         self.device.synchronize()?;
 
-        // Reorder positions and signs
+        // Reorder positions, velocities, and signs
+        // CRITICAL: Must reorder vel to keep pos[i]/vel[i] correspondence
         let reorder_pos_k = self.device.get_func("twopass", "reorder_by_idx_f32x3")
             .ok_or("reorder_by_idx_f32x3 not found")?;
         let reorder_sign_k = self.device.get_func("twopass", "reorder_by_idx_i8")
@@ -3249,11 +3263,15 @@ impl GpuNBodyTwoPass {
             reorder_pos_k.clone().launch(cfg, (
                 &self.pos, &mut self.pos_sorted, &self.sorted_all, n as i32
             ))?;
+            reorder_pos_k.clone().launch(cfg, (
+                &self.vel, &mut self.vel_sorted, &self.sorted_all, n as i32
+            ))?;
             reorder_sign_k.launch(cfg, (
                 &self.signs, &mut self.signs_sorted, &self.sorted_all, n as i32
             ))?;
         }
         std::mem::swap(&mut self.pos, &mut self.pos_sorted);
+        std::mem::swap(&mut self.vel, &mut self.vel_sorted);
         std::mem::swap(&mut self.signs, &mut self.signs_sorted);
         self.device.synchronize()?;
         let t_reorder_ms = t0.elapsed().as_millis();
@@ -3843,6 +3861,236 @@ impl GpuNBodyTwoPass {
         if self.step_count <= 5 || self.step_count % 100 == 0 {
             eprintln!("  TreePM GPU step {}: PM {}ms + BH {}ms = {}ms",
                       self.step_count, pm_ms, bh_ms, pm_ms + bh_ms);
+        }
+
+        Ok(())
+    }
+
+    /// TreePM step with Morton ordering for improved cache coherence
+    /// Same as step_treepm_gpu but with Morton reordering for ~3-7x BH speedup
+    #[cfg(feature = "cufft")]
+    pub fn step_treepm_gpu_morton(
+        &mut self,
+        dt: f64,
+        r_cut: f64,
+        hubble: f64,
+        dtau_per_dt: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Instant;
+        let n = self.n_particles;
+        let grid = self.pm_grid_size;
+        let grid_cells = grid * grid * grid;
+        let box_half = (self.box_size / 2.0) as f32;
+        let half_dt = (dt / 2.0) as f32;
+        let cell_size = (self.box_size / grid as f64) as f32;
+        let inv_cell_size = (grid as f64 / self.box_size) as f32;
+        let g_constant = 1.0;
+
+        let blocks = (n + 255) / 256;
+        let n_blocks_all = blocks;
+        let grid_blocks = (grid_cells + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let grid_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (grid_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let hist_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (n_blocks_all as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let prefix_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // ===== DRIFT (dt/2) =====
+        let drift_k = self.device.get_func("twopass", "drift_f32")
+            .ok_or("drift_f32 not found")?;
+        unsafe {
+            drift_k.clone().launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== MORTON REORDER =====
+        let t_morton = Instant::now();
+
+        // Compute Morton codes for all particles
+        let morton_k = self.device.get_func("twopass", "compute_morton_all")
+            .ok_or("compute_morton_all not found")?;
+        unsafe {
+            morton_k.launch(cfg, (
+                &self.pos, &mut self.morton_all, &mut self.sorted_all,
+                n as i32, box_half, inv_cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Radix sort Morton codes (8 passes)
+        let hist_k = self.device.get_func("twopass", "radix_histogram")
+            .ok_or("radix_histogram not found")?;
+        let prefix_k = self.device.get_func("twopass", "radix_prefix_sum")
+            .ok_or("radix_prefix_sum not found")?;
+        let scatter_k = self.device.get_func("twopass", "radix_scatter")
+            .ok_or("radix_scatter not found")?;
+
+        for pass in 0..8 {
+            let bit_shift = pass * 8;
+            let (keys_in, keys_out, vals_in, vals_out) = if pass % 2 == 0 {
+                (&self.morton_all, &mut self.morton_all_tmp,
+                 &self.sorted_all, &mut self.sorted_all_tmp)
+            } else {
+                (&self.morton_all_tmp, &mut self.morton_all,
+                 &self.sorted_all_tmp, &mut self.sorted_all)
+            };
+
+            unsafe {
+                hist_k.clone().launch(hist_cfg, (
+                    keys_in, &mut self.radix_hist_all, n as i32, bit_shift as i32
+                ))?;
+                prefix_k.clone().launch(prefix_cfg, (
+                    &mut self.radix_hist_all, &mut self.radix_global, n_blocks_all as i32
+                ))?;
+                scatter_k.clone().launch(hist_cfg, (
+                    keys_in, keys_out, vals_in, vals_out,
+                    &self.radix_hist_all, &self.radix_global,
+                    n as i32, bit_shift as i32
+                ))?;
+            }
+        }
+        self.device.synchronize()?;
+
+        // Reorder positions, velocities, and signs by Morton order
+        let reorder_pos_k = self.device.get_func("twopass", "reorder_by_idx_f32x3")
+            .ok_or("reorder_by_idx_f32x3 not found")?;
+        let reorder_sign_k = self.device.get_func("twopass", "reorder_by_idx_i8")
+            .ok_or("reorder_by_idx_i8 not found")?;
+
+        unsafe {
+            reorder_pos_k.clone().launch(cfg, (
+                &self.pos, &mut self.pos_sorted, &self.sorted_all, n as i32
+            ))?;
+            reorder_pos_k.clone().launch(cfg, (
+                &self.vel, &mut self.vel_sorted, &self.sorted_all, n as i32
+            ))?;
+            reorder_sign_k.launch(cfg, (
+                &self.signs, &mut self.signs_sorted, &self.sorted_all, n as i32
+            ))?;
+        }
+        std::mem::swap(&mut self.pos, &mut self.pos_sorted);
+        std::mem::swap(&mut self.vel, &mut self.vel_sorted);
+        std::mem::swap(&mut self.signs, &mut self.signs_sorted);
+        self.device.synchronize()?;
+        let morton_ms = t_morton.elapsed().as_millis();
+
+        // ===== GPU CIC SCATTER (uses Morton-ordered positions) =====
+        let t_pm = Instant::now();
+
+        // Reset density grids to zero
+        let reset_grid_k = self.device.get_func("twopass", "reset_f64_grid")
+            .ok_or("reset_f64_grid not found")?;
+        unsafe {
+            reset_grid_k.clone().launch(grid_cfg, (&mut self.rho_plus, grid_cells as i32))?;
+            reset_grid_k.launch(grid_cfg, (&mut self.rho_minus, grid_cells as i32))?;
+        }
+        self.device.synchronize()?;
+
+        // CIC scatter: particles → rho grids
+        let cic_scatter_k = self.device.get_func("twopass", "cic_scatter")
+            .ok_or("cic_scatter not found")?;
+        unsafe {
+            cic_scatter_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.rho_plus, &mut self.rho_minus,
+                n as i32, grid as i32, box_half, inv_cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== cuFFT POISSON SOLVE =====
+        let rho_plus_ptr = get_device_ptr(&self.rho_plus) as *mut f64;
+        let rho_minus_ptr = get_device_ptr(&self.rho_minus) as *mut f64;
+        let phi_plus_ptr = get_device_ptr(&self.phi_plus) as *mut f64;
+        let phi_minus_ptr = get_device_ptr(&self.phi_minus) as *mut f64;
+
+        let r_s = r_cut / 3.0;
+        unsafe {
+            crate::treepm::cufft_ffi::solve_device(
+                rho_plus_ptr, phi_plus_ptr,
+                grid, self.box_size, g_constant, r_s,
+            )?;
+            crate::treepm::cufft_ffi::solve_device(
+                rho_minus_ptr, phi_minus_ptr,
+                grid, self.box_size, g_constant, r_s,
+            )?;
+        }
+
+        // ===== GPU CIC GATHER =====
+        let gather_k = self.device.get_func("twopass", "cic_gather")
+            .ok_or("cic_gather not found")?;
+        unsafe {
+            gather_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &self.phi_plus, &self.phi_minus,
+                &mut self.pm_forces,
+                n as i32, grid as i32, box_half, inv_cell_size, cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let pm_ms = t_pm.elapsed().as_millis();
+
+        // ===== GPU BH SHORT-RANGE (Morton-ordered for cache coherence) =====
+        let t_bh = Instant::now();
+        self.compute_short_range_forces(r_cut)?;
+        let bh_ms = t_bh.elapsed().as_millis();
+
+        // Add PM long-range forces
+        let add_pm_k = self.device.get_func("twopass", "add_pm_forces")
+            .ok_or("add_pm_forces not found")?;
+        unsafe {
+            add_pm_k.launch(cfg, (
+                &mut self.acc, &self.pm_forces, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== KICK (Morton-ordered vel and acc) =====
+        let kick_k = self.device.get_func("twopass", "kick_f32")
+            .ok_or("kick_f32 not found")?;
+        unsafe {
+            kick_k.launch(cfg, (
+                &mut self.vel, &self.acc,
+                dt as f32, n as i32,
+                hubble as f32, dtau_per_dt as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== DRIFT (dt/2) =====
+        unsafe {
+            drift_k.launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        self.time += dt;
+        self.step_count += 1;
+
+        // Timing info
+        if self.step_count <= 5 || self.step_count % 100 == 0 {
+            eprintln!("  TreePM Morton step {}: Morton {}ms + PM {}ms + BH {}ms = {}ms",
+                      self.step_count, morton_ms, pm_ms, bh_ms, morton_ms + pm_ms + bh_ms);
         }
 
         Ok(())

@@ -62,8 +62,10 @@ fn main() {
     println!("\n  Mean particle separation: {:.2} Mpc", mean_sep);
 
     let x = mean_sep / (2.0 * r_s);
-    let expected_erfc = libm::erfc(x);
-    println!("  erfc({:.3}) = {:.4} (expected short-range weight at mean sep)", x, expected_erfc);
+    // Approximate erfc using polynomial (Abramowitz & Stegun)
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let erfc_approx = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429)))) * (-x*x).exp();
+    println!("  erfc({:.3}) ≈ {:.4} (expected short-range weight at mean sep)", x, erfc_approx);
 
     // If TreePM is correctly splitting, acc_treepm should ≈ acc_bh
     // If acc_treepm < acc_bh, either PM is missing or erfc is too aggressive

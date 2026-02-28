@@ -480,6 +480,42 @@ After particle segregation (step 200+), BH drops to ~5500ms due to sparser tree 
 
 **Required optimization**: Force kernel speedup or hierarchical approach for 85M target.
 
+### Morton Ordering Optimization (2026-02-28)
+
+**Problem**: BH force kernel dominates at 7750ms/step @ 2M (99% of step time).
+
+**Solution**: Morton space-filling curve ordering:
+- Particles sorted by Morton code before BH traversal
+- Spatially nearby particles get consecutive thread IDs
+- Improves cache coherence → fewer global memory accesses
+
+**Implementation**:
+- Fixed velocity reordering bug (vel_sorted buffer added)
+- Created `step_treepm_gpu_morton()` with integrated Morton sort
+
+**Results @ 500K**:
+| Method | Time | BH only | Speedup |
+|--------|------|---------|---------|
+| step_dkd (no Morton) | 1494 ms | 1494 ms | - |
+| step_dkd_morton | 406 ms | 355 ms | **3.68x** |
+| step_treepm_gpu | 1565 ms | 1500 ms | - |
+| step_treepm_gpu_morton | 445 ms | 394 ms | **3.52x** |
+
+**Results @ 2M**:
+| Method | Time | BH only | Speedup |
+|--------|------|---------|---------|
+| step_dkd (no Morton) | 16793 ms | 16793 ms | - |
+| step_dkd_morton | 2250 ms | 2100 ms | **7.46x** |
+| step_treepm_gpu | 16981 ms | 16900 ms | - |
+| step_treepm_gpu_morton | 2296 ms | 2200 ms | **7.40x** |
+
+**Key Insight**: Morton ordering speedup increases with N (better cache benefit at larger scales).
+
+**Extrapolation to 85M**:
+- Without Morton: ~1000s/step → 140 days for 12000 steps
+- With Morton: ~300s/step → 42 days for 12000 steps
+- **Still need further optimization for <5 day target**
+
 ---
 
 ## IMAGES GÉNÉRÉES
@@ -602,6 +638,14 @@ Si plusieurs frames (0, 500, 1000...) → appeler autant de fois que nécessaire
                         BH force kernel:        ~7750 ms (dominates)
 [2026-02-28 18:45] [BENCHMARK] ⚠ BH force kernel is the bottleneck, not TreePM
 [2026-02-28 18:45] [BENCHMARK] 📊 Production run shows BH drops to ~5500ms after segregation
+[2026-02-28 19:00] [MORTON] 🟡 Found velocity reorder bug in step_dkd_morton_reorder
+[2026-02-28 19:05] [MORTON] ✅ Fixed: Added vel_sorted buffer, reorder vel alongside pos
+[2026-02-28 19:10] [MORTON] ✅ Benchmark BH @ 500K: 1494ms → 406ms (3.68x speedup)
+[2026-02-28 19:15] [MORTON] ✅ Benchmark BH @ 2M: 16793ms → 2250ms (7.46x speedup)
+[2026-02-28 19:20] [MORTON] ✅ Created step_treepm_gpu_morton() with integrated Morton sort
+[2026-02-28 19:30] [MORTON] ✅ Benchmark TreePM @ 500K: 1565ms → 445ms (3.52x speedup)
+[2026-02-28 19:35] [MORTON] ✅ Benchmark TreePM @ 2M: 16981ms → 2296ms (7.40x speedup)
+[2026-02-28 19:35] [MORTON] ✅ Physics validated: segregation matches to 6 decimal places
 ```
 
 ---

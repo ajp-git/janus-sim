@@ -470,3 +470,13 @@ required-features = ["cuda", "cufft"]
 name = "treepm_benchmark"
 path = "src/bin/treepm_benchmark.rs"
 required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "bench_morton"
+path = "src/bin/bench_morton.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "bench_treepm_morton"
+path = "src/bin/bench_treepm_morton.rs"
+required-features = ["cuda", "cufft"]

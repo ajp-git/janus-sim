@@ -1494,11 +1494,20 @@ extern "C" __global__ void forces_treepm_short_range(
                 float ddx = comx-px, ddy = comy-py, ddz = comz-pz;
                 float rp2 = ddx*ddx + ddy*ddy + ddz*ddz + eps2;
 
-                // TreePM: ONLY compute if r < r_cut
-                // Skip long-range pairs (handled by PM cuFFT)
+                // TreePM: Compute SHORT-RANGE complement to PM long-range
+                // PM applies exp(-k²r_s²) in k-space → erfc(r/r_s) in real space
+                // Short-range must compute erf(r/r_s) weight to avoid double-counting
                 if (rp2 < r_cut_sq) {
+                    float rp = sqrtf(rp2);
+                    float r_s = r_cut * 0.4f;  // r_s ≈ r_cut/2.5, matching k-space splitting
+
+                    // Short-range splitting weight: erf(r / r_s)
+                    // This goes from 0 at r=0 to 1 at r >> r_s
+                    float x = rp / r_s;
+                    float short_weight = erff(x);
+
                     float irp3 = rsqrtf(rp2) / rp2;
-                    float f = sign_factor * m * irp3;
+                    float f = sign_factor * m * irp3 * short_weight;
                     ax += f*ddx; ay += f*ddy; az += f*ddz;
                 }
             }
@@ -3624,7 +3633,7 @@ impl GpuNBodyTwoPass {
         }
 
         // FFT Poisson solve with Gaussian splitting (long-range only)
-        let r_s = r_cut / 3.0;  // Standard TreePM splitting scale
+        let r_s = r_cut * 0.4;  // r_s ≈ r_cut/2.5, matching short-range kernel
         let g_constant = 1.0;   // Simulation units
         pm_grid.solve_poisson_with_splitting(g_constant, Some(r_s));
 
@@ -3719,7 +3728,7 @@ impl GpuNBodyTwoPass {
         let half_dt = (dt / 2.0) as f32;
         let cell_size = (self.box_size / grid as f64) as f32;
         let inv_cell_size = (grid as f64 / self.box_size) as f32;
-        let r_s = r_cut / 3.0;  // TreePM splitting scale
+        let r_s = r_cut * 0.4;  // r_s ≈ r_cut/2.5, matching short-range kernel
         let g_constant = 1.0;
 
         let blocks = (n + 255) / 256;

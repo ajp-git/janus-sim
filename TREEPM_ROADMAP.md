@@ -1,5 +1,5 @@
 # TREEPM_ROADMAP.md — Implémentation TreePM pour simulation Janus
-**Dernière mise à jour** : 2026-02-27 18:15
+**Dernière mise à jour** : 2026-02-28 20:20
 **Statut global** : 🟢 COMPLÉTÉ
 **Version finale** : treepm-v1.0
 
@@ -511,10 +511,43 @@ After particle segregation (step 200+), BH drops to ~5500ms due to sparser tree 
 
 **Key Insight**: Morton ordering speedup increases with N (better cache benefit at larger scales).
 
-**Extrapolation to 85M**:
-- Without Morton: ~1000s/step → 140 days for 12000 steps
-- With Morton: ~300s/step → 42 days for 12000 steps
-- **Still need further optimization for <5 day target**
+### Warp-Coherent Kernel Optimization (2026-02-28)
+
+**Problem**: Morton alone gives 7.4x but still 2296ms @ 2M, target <1000ms.
+
+**Approach tried**:
+1. ❌ Stack reduction 32→16: 6% slower (register pressure not the bottleneck)
+2. ❌ Shared memory for top 1024 nodes: 2x slower (44KB static shmem kills occupancy)
+3. ✅ **Warp-coherent traversal**: All 32 threads in warp traverse tree together, reducing divergence
+
+**Warp-coherent kernel features**:
+- All threads in warp process same tree node simultaneously
+- Single stack in shared memory per warp (128 levels, 4KB/block)
+- `__shfl_sync` for broadcasting node index to all lanes
+- `__any_sync/__all_sync` for collective MAC decisions
+- Handles overwrite/accumulate via `tree_sign` parameter
+
+**Final Results @ 500K**:
+| Method | Time | BH only | Speedup vs baseline |
+|--------|------|---------|---------------------|
+| No Morton, standard kernel | 1562 ms | ~1500 ms | 1.00x |
+| Morton + standard kernel | 449 ms | ~400 ms | 3.48x |
+| Morton + warp-coherent | **212 ms** | **156 ms** | **7.37x** |
+
+**Final Results @ 2M**:
+| Method | Time | BH only | Speedup vs baseline |
+|--------|------|---------|---------------------|
+| No Morton, standard kernel | 16989 ms | ~16800 ms | 1.00x |
+| No Morton, warp-coherent | 9391 ms | ~9200 ms | 1.81x |
+| Morton + standard kernel | 2296 ms | ~2200 ms | 7.40x |
+| Morton + warp-coherent | **759 ms** | **677 ms** | **22.4x** |
+
+**🎯 TARGET ACHIEVED**: 759 ms @ 2M < 1000 ms target!
+
+**Updated extrapolation to 85M**:
+- Original (no Morton): ~17s/step @ 2M → ~1000s/step @ 85M
+- Morton + warp-coherent: ~0.76s/step @ 2M → ~100s/step @ 85M (estimated O(N log N))
+- **85M × 12000 steps: ~14 days** (viable on RTX 3060)
 
 ---
 
@@ -646,6 +679,13 @@ Si plusieurs frames (0, 500, 1000...) → appeler autant de fois que nécessaire
 [2026-02-28 19:30] [MORTON] ✅ Benchmark TreePM @ 500K: 1565ms → 445ms (3.52x speedup)
 [2026-02-28 19:35] [MORTON] ✅ Benchmark TreePM @ 2M: 16981ms → 2296ms (7.40x speedup)
 [2026-02-28 19:35] [MORTON] ✅ Physics validated: segregation matches to 6 decimal places
+[2026-02-28 20:00] [OPT] ❌ Stack reduction 32→16: 6% slower (not the bottleneck)
+[2026-02-28 20:05] [OPT] ❌ Shmem for top 1024 nodes: 2x slower (occupancy loss from 44KB static shmem)
+[2026-02-28 20:10] [OPT] ✅ Warp-coherent kernel: enabled in compute_short_range_forces()
+[2026-02-28 20:12] [OPT] ✅ Benchmark @ 500K: 449ms → 212ms (2.1x additional speedup)
+[2026-02-28 20:15] [OPT] ✅ Benchmark @ 2M: 2296ms → 759ms (3.0x additional speedup)
+[2026-02-28 20:15] [OPT] 🎯 TARGET ACHIEVED: 759ms @ 2M < 1000ms target
+[2026-02-28 20:16] [OPT] ✅ Total speedup vs baseline: 22.4x @ 2M (Morton + warp-coherent)
 ```
 
 ---

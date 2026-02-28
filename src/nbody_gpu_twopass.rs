@@ -583,7 +583,7 @@ extern "C" __global__ void forces_twopass_overwrite(
     float ax = 0.0f, ay = 0.0f, az = 0.0f;
     float eps2 = softening * softening;
 
-    int stack[32];  // Reduced from 64 for better occupancy
+    int stack[32];
     int sp = 0;
     stack[sp++] = 0;
 
@@ -663,7 +663,7 @@ extern "C" __global__ void forces_twopass_accumulate(
     float ax = 0.0f, ay = 0.0f, az = 0.0f;
     float eps2 = softening * softening;
 
-    int stack[32];  // Reduced from 64 for better occupancy
+    int stack[32];
     int sp = 0;
     stack[sp++] = 0;
 
@@ -3490,11 +3490,9 @@ impl GpuNBodyTwoPass {
         // The reordering was corrupting the simulation by applying wrong velocities
         // to wrong particles after the kick step.
 
-        // Use same kernels as step_dkd for consistency
-        let forces_ow_k = self.device.get_func("twopass", "forces_twopass_overwrite")
-            .ok_or("forces_twopass_overwrite not found")?;
-        let forces_acc_k = self.device.get_func("twopass", "forces_twopass_accumulate")
-            .ok_or("forces_twopass_accumulate not found")?;
+        // Use warp-coherent kernel (all threads in warp traverse together)
+        let forces_wc_k = self.device.get_func("twopass", "forces_twopass_warpcoherent")
+            .ok_or("forces_twopass_warpcoherent not found")?;
 
         let reset_i32_k = self.device.get_func("twopass", "reset_i32")
             .ok_or("reset_i32 not found")?;
@@ -3515,9 +3513,9 @@ impl GpuNBodyTwoPass {
         self.device.synchronize()?;
         let _ = self.build_single_sign_tree(1, self.n_positive)?;
 
-        // Force + (overwrite) - same kernel as step_dkd
+        // Force + (overwrite: tree_sign=+1) with warp-coherent
         unsafe {
-            forces_ow_k.launch(cfg, (
+            forces_wc_k.clone().launch(warp_cfg, (
                 &self.pos, &self.signs,
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
@@ -3541,9 +3539,9 @@ impl GpuNBodyTwoPass {
         self.device.synchronize()?;
         let _ = self.build_single_sign_tree(-1, self.n_negative)?;
 
-        // Force - (accumulate) - same kernel as step_dkd
+        // Force - (accumulate: tree_sign=-1) with warp-coherent
         unsafe {
-            forces_acc_k.launch(cfg, (
+            forces_wc_k.launch(warp_cfg, (
                 &self.pos, &self.signs,
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,

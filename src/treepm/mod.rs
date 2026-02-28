@@ -15,6 +15,14 @@ pub mod splitting;
 pub mod tree_short;
 pub mod treepm_force;
 
+/// GPU cuFFT Poisson solver (requires cuda feature + libcufft_wrapper.so)
+#[cfg(feature = "cufft")]
+pub mod cufft_ffi;
+
+// Re-export for convenience
+#[cfg(feature = "cufft")]
+pub use cufft_ffi::CuFFTPoisson;
+
 /// Splitting radius for TreePM
 /// Forces at r > R_CUT are computed by PM (long-range)
 /// Forces at r < R_CUT are computed by Tree (short-range)

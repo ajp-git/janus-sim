@@ -13,25 +13,74 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
-/// Generate particles with COLD START (zero velocity)
-/// Cold start shows correct Janus physics: segregation INCREASES over time
-fn generate_cold_particles(n: usize, box_size: f64, eta: f64, seed: u64) -> Vec<Particle> {
+/// Compute PE_binding for TreePM: only pairs with r < r_cut
+/// This is coherent with what TreePM actually computes
+fn compute_pe_binding_treepm(particles: &[Particle], r_cut: f64, g_constant: f64, softening: f64) -> f64 {
+    let r_cut_sq = r_cut * r_cut;
+    let soft_sq = softening * softening;
+    let mut pe_binding = 0.0;
+
+    // O(N²) but only for initialization - acceptable
+    for i in 0..particles.len() {
+        for j in (i+1)..particles.len() {
+            let pi = &particles[i];
+            let pj = &particles[j];
+
+            // Only same-sign pairs contribute to PE_binding
+            if pi.sign != pj.sign {
+                continue;
+            }
+
+            let dx = pj.pos.x - pi.pos.x;
+            let dy = pj.pos.y - pi.pos.y;
+            let dz = pj.pos.z - pi.pos.z;
+            let r_sq = dx*dx + dy*dy + dz*dz;
+
+            // Only pairs within r_cut (TreePM short-range)
+            if r_sq >= r_cut_sq {
+                continue;
+            }
+
+            // Plummer-softened potential
+            let r_soft = (r_sq + soft_sq).sqrt();
+            // Same-sign attraction: PE < 0
+            pe_binding -= g_constant * pi.mass * pj.mass / r_soft;
+        }
+    }
+
+    pe_binding
+}
+
+/// Generate particles with TreePM-coherent virialization
+/// PE_binding only includes pairs within r_cut
+fn generate_virialized_particles_treepm(
+    n: usize, box_size: f64, eta: f64, seed: u64,
+    r_cut: f64, g_constant: f64, softening: f64
+) -> Vec<Particle> {
     let mut rng = StdRng::seed_from_u64(seed);
 
     // Use random sign assignment to avoid artificial segregation
     let prob_pos = 1.0 / (1.0 + eta);
 
-    println!("Generating {} particles (prob_pos={:.3}, COLD START)", n, prob_pos);
+    println!("Generating {} particles (prob_pos={:.3})", n, prob_pos);
 
     let mut particles = Vec::with_capacity(n);
     let mut n_pos: usize = 0;
     let mut n_neg: usize = 0;
+
+    // Initial velocity scale
+    let v_init = 0.1;
 
     for _ in 0..n {
         let pos = Vec3::new(
             (rng.random::<f64>() - 0.5) * box_size,
             (rng.random::<f64>() - 0.5) * box_size,
             (rng.random::<f64>() - 0.5) * box_size,
+        );
+        let vel = Vec3::new(
+            (rng.random::<f64>() - 0.5) * v_init,
+            (rng.random::<f64>() - 0.5) * v_init,
+            (rng.random::<f64>() - 0.5) * v_init,
         );
 
         let sign = if rng.random::<f64>() < prob_pos {
@@ -42,12 +91,48 @@ fn generate_cold_particles(n: usize, box_size: f64, eta: f64, seed: u64) -> Vec<
             MassSign::Negative
         };
 
-        // COLD START: zero initial velocity
-        particles.push(Particle::new(pos, Vec3::zero(), 1.0, sign));
+        particles.push(Particle::new(pos, vel, 1.0, sign));
     }
 
     println!("  Generated {}+ / {}- particles", n_pos, n_neg);
-    println!("  Cold start: all velocities = 0");
+
+    // Compute PE_binding with TreePM-coherent r_cut
+    println!("  Computing PE_binding (r < r_cut = {:.2})...", r_cut);
+    let pe_binding = compute_pe_binding_treepm(&particles, r_cut, g_constant, softening);
+
+    // Current KE
+    let ke_current: f64 = particles.iter()
+        .map(|p| 0.5 * (p.vel.x*p.vel.x + p.vel.y*p.vel.y + p.vel.z*p.vel.z))
+        .sum();
+
+    // Virial: 2*KE + PE_binding = 0 → KE_target = |PE_binding| / 2
+    let ke_target = pe_binding.abs() / 2.0;
+    let alpha = if ke_current > 1e-20 { (ke_target / ke_current).sqrt() } else { 1.0 };
+
+    println!("TreePM-coherent virialization:");
+    println!("  PE_binding (r<r_cut) = {:.4e}", pe_binding);
+    println!("  KE_initial = {:.4e}", ke_current);
+    println!("  KE_target  = {:.4e}", ke_target);
+    println!("  alpha      = {:.6}", alpha);
+
+    // Safety check: α should be reasonable (< 100)
+    if alpha > 100.0 {
+        println!("  ⚠ WARNING: alpha > 100, system may be unstable");
+    }
+
+    // Scale velocities
+    for p in particles.iter_mut() {
+        p.vel.x *= alpha;
+        p.vel.y *= alpha;
+        p.vel.z *= alpha;
+    }
+
+    // Verify
+    let ke_after: f64 = particles.iter()
+        .map(|p| 0.5 * (p.vel.x*p.vel.x + p.vel.y*p.vel.y + p.vel.z*p.vel.z))
+        .sum();
+    let virial_error = (2.0 * ke_after + pe_binding).abs() / pe_binding.abs();
+    println!("  Virial error: {:.4}%", virial_error * 100.0);
 
     particles
 }
@@ -153,17 +238,30 @@ fn main() {
     println!("  Output: {}", output_dir);
     println!();
 
-    // G constant - scale to get visible dynamics in reasonable time
-    // With cold start, G controls the segregation rate
-    let g_constant = 1.0;  // Full G for clear segregation dynamics
+    // G constant
+    let g_constant = 1.0;
     println!("  G_constant: {}", g_constant);
 
-    // Generate cold start particles (zero velocity, random positions)
-    let mut particles = generate_cold_particles(n, box_size, eta, 42);
+    // Generate virialized particles with TreePM-coherent PE_binding
+    // Only pairs within r_cut contribute to PE_binding (same as TreePM forces)
+    let mut particles = generate_virialized_particles_treepm(
+        n, box_size, eta, 42, r_cut, g_constant, softening
+    );
 
     // Initialize TreePM
-    let mut treepm = TreePMForce::new(r_cut, grid_size, box_size, theta, softening);
-    treepm.g_constant = g_constant;
+    // For fast visual validation, use PM-only (skip Tree short-range)
+    let pm_only = std::env::var("PM_ONLY").is_ok();
+    let mut treepm = if pm_only {
+        println!("  MODE: PM-only (Tree short-range disabled)");
+        let mut t = TreePMForce::new_pm_only(grid_size, box_size);
+        t.g_constant = g_constant;
+        t
+    } else {
+        println!("  MODE: Full TreePM (PM + Tree)");
+        let mut t = TreePMForce::new(r_cut, grid_size, box_size, theta, softening);
+        t.g_constant = g_constant;
+        t
+    };
 
     // Initial metrics
     let ke_0 = compute_kinetic_energy(&particles);

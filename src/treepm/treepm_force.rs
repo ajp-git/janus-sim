@@ -21,6 +21,7 @@ pub struct TreePMForce {
     pub r_s: f64,  // Gaussian splitting scale (typically r_cut / 3)
     pub softening: f64,
     pub g_constant: f64,
+    pub pm_only: bool,  // Skip Tree short-range for fast visual validation
 }
 
 impl TreePMForce {
@@ -43,6 +44,20 @@ impl TreePMForce {
             r_s,
             softening,
             g_constant,
+            pm_only: false,  // Default: full TreePM
+        }
+    }
+
+    /// Create PM-only force calculator (skip Tree for fast visual validation)
+    pub fn new_pm_only(grid_size: usize, box_size: f64) -> Self {
+        Self {
+            pm: PmGrid::new(grid_size, box_size),
+            tree: TreePMTree::build_with_g(&[], 0.5, 10.0, 1.0),  // Dummy tree
+            r_cut: 0.0,
+            r_s: 0.0,
+            softening: 0.5,
+            g_constant: 1.0,
+            pm_only: true,
         }
     }
 
@@ -61,11 +76,14 @@ impl TreePMForce {
             self.pm.assign_mass(p.pos.x, p.pos.y, p.pos.z, p.mass, sign);
         }
 
-        // Solve Poisson with Gaussian splitting
-        self.pm.solve_poisson_with_splitting(self.g_constant, Some(self.r_s));
-
-        // Rebuild Tree for short-range (with same G constant)
-        self.tree = TreePMTree::build_with_g(particles, self.tree.theta, self.r_cut, self.g_constant);
+        // Solve Poisson (with splitting if using Tree, without if PM-only)
+        if self.pm_only {
+            self.pm.solve_poisson(self.g_constant);
+        } else {
+            self.pm.solve_poisson_with_splitting(self.g_constant, Some(self.r_s));
+            // Rebuild Tree for short-range (with same G constant)
+            self.tree = TreePMTree::build_with_g(particles, self.tree.theta, self.r_cut, self.g_constant);
+        }
     }
 
     /// Compute total force on particle at position (pos, sign)
@@ -81,9 +99,14 @@ impl TreePMForce {
             MassSign::Negative => -1i8,
         };
 
-        // PM long-range force (no self-exclusion needed - PM spreads mass to grid)
+        // PM force
         let (fx_pm, fy_pm, fz_pm) = self.pm.interpolate_force(pos.x, pos.y, pos.z, sign_i8);
         let f_pm = Vec3::new(fx_pm, fy_pm, fz_pm);
+
+        // PM-only mode: skip Tree short-range
+        if self.pm_only {
+            return f_pm;
+        }
 
         // Tree short-range force (with self-exclusion)
         let f_tree = self.tree.compute_short_range_acc_excluding(pos, sign, particles, self.softening, exclude_idx);

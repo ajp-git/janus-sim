@@ -20,6 +20,10 @@
    - En cas d'erreur Python : corriger et relancer automatiquement
    - Ne jamais demander "voulez-vous que je crée/exécute ce script ?"
    - Ne jamais demander "puis-je lancer ce script ?"
+9. **Git push régulier** : au moins toutes les 2h et avant toute opération risquée
+   - Ne jamais laisser du travail non pushé plus de 2h
+   - Push obligatoire avant : pause container, restart Docker, opérations destructives
+   - Raison : si Docker crash, le code non pushé est perdu
 
 ---
 
@@ -462,6 +466,20 @@ Full GPU TreePM Pipeline:
 ### Validation Frame
 ![TreePM GPU Validation](output/treepm_gpu_validation/frame_step_001000.png)
 
+### Benchmark @ 2M Particles (2026-02-28)
+
+| Method | AVG ms/step | PM | BH | Notes |
+|--------|-------------|----|----|-------|
+| step_dkd (pure BH) | 7779 | - | 7779 | Baseline |
+| step_treepm_gpu | 7831 | 67 | ~7764 | +0.7% vs BH |
+
+**Finding**: PM overhead is negligible (67ms, <1%). The BH force kernel dominates at ~7750ms.
+After particle segregation (step 200+), BH drops to ~5500ms due to sparser tree structure.
+
+**Extrapolation to 85M**: ~1000 sec/step → 140 days for 12000 steps (unacceptable)
+
+**Required optimization**: Force kernel speedup or hierarchical approach for 85M target.
+
 ---
 
 ## IMAGES GÉNÉRÉES
@@ -576,6 +594,14 @@ Si plusieurs frames (0, 500, 1000...) → appeler autant de fois que nécessaire
 [2026-02-27 23:35] [GPU] ✅ Segregation: 0.0010 → 0.0013 (increasing ✓)
 [2026-02-27 23:39] [GPU] ✅ Validation frame: output/treepm_gpu_validation/frame_step_001000.png
 [2026-02-27 23:39] [GPU] ✅ No grid artifacts (visual inspection confirmed)
+[2026-02-28 18:30] [BENCHMARK] 🟡 2M benchmark: step_dkd vs step_treepm_gpu
+[2026-02-28 18:45] [BENCHMARK] ✅ Results:
+                        step_dkd (pure BH):     7779 ms/step
+                        step_treepm_gpu:        7831 ms/step (+0.7%)
+                        PM overhead:            67 ms (< 1% of total)
+                        BH force kernel:        ~7750 ms (dominates)
+[2026-02-28 18:45] [BENCHMARK] ⚠ BH force kernel is the bottleneck, not TreePM
+[2026-02-28 18:45] [BENCHMARK] 📊 Production run shows BH drops to ~5500ms after segregation
 ```
 
 ---

@@ -21,6 +21,9 @@ RUN apt-get update && apt-get install -y \
     # Pour visualisation légère des résultats CSV
     python3-matplotlib \
     python3-numpy \
+    # For cuFFT bindings (cufft_rust, cudarc)
+    libclang-dev \
+    clang \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust

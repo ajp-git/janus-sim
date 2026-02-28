@@ -118,6 +118,46 @@ Notes:
 
 ---
 
+### Run: TreePM_2M_production
+Date: 2026-02-28
+Status: **running**
+
+Parameters:
+  N particles: 2,000,000
+  eta: 1.045
+  z_init: 5.0
+  theta: 0.7
+  r_cut: box/16 (16.97 Mpc)
+  dt: 0.01
+  steps: 12000
+  integrator: TreePM (step_treepm_gpu)
+  frame_interval: 500 steps
+
+Performance @ 2M:
+  - step_dkd (pure BH): 7779 ms/step
+  - step_treepm_gpu: 7831 ms/step (PM 67ms + BH ~7750ms)
+  - After segregation (step 200+): BH drops to ~5500ms
+
+Current Progress (step 1400):
+  - z = 3.0
+  - Seg = 0.51
+  - S_max = 0.51
+  - Avg step time: 5800ms
+
+**OBSERVATION: Early segregation onset**
+  - Segregation reaching 0.50 already at z ≈ 3.6 (step 1000)
+  - Reference BH run: S_max=0.694 at z=1.8
+  - TreePM 100K validation: S_max=0.659 at z=1.88
+  - **Current run segregates EARLIER (z~3.6 vs z~2.4)**
+  - To investigate: Is this physics or a TreePM artifact?
+
+Notes:
+  - First production-scale TreePM run
+  - BH force kernel is the bottleneck (>99% of step time)
+  - Container: 5e3c41117aba
+
+---
+
 ## Current Run
 
 ### Run: 85M_expansion

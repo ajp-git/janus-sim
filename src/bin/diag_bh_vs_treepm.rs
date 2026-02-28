@@ -18,12 +18,12 @@ fn main() {
     println!("Parameters: N=100K, η=1.045, box=100, z_init=5, 2000 steps\n");
 
     let n = 100_000;
-    let n_steps = 500; // Reduced for faster diagnostic
+    let n_steps = 2000; // Match reference run
     let dt = 0.01;
     let box_size = 100.0;
     let eta = 1.045;
     let z_init = 5.0;
-    let r_cut = box_size / 8.0;
+    let r_cut = box_size / 4.0;  // Larger r_cut for more BH coverage
 
     let janus_params = JanusParams::from_eta(eta);
     let cosmo = CosmoInterpolator::new(&janus_params, z_init);

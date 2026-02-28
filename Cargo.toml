@@ -460,3 +460,13 @@ required-features = ["cuda", "cufft"]
 name = "treepm_2m_production"
 path = "src/bin/treepm_2m_production.rs"
 required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "bench_step_methods"
+path = "src/bin/bench_step_methods.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "treepm_benchmark"
+path = "src/bin/treepm_benchmark.rs"
+required-features = ["cuda", "cufft"]

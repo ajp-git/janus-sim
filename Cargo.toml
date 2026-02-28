@@ -510,3 +510,33 @@ required-features = ["cuda", "cufft"]
 name = "treepm_zeldovich_multimode"
 path = "src/bin/treepm_zeldovich_multimode.rs"
 required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "janus_40m_treepm"
+path = "src/bin/janus_40m_treepm.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "test_vram_limit"
+path = "src/bin/test_vram_limit.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "janus_20m_treepm"
+path = "src/bin/janus_20m_treepm.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "test_box_config"
+path = "src/bin/test_box_config.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "diag_cufft_mem"
+path = "src/bin/diag_cufft_mem.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "janus_60m_treepm"
+path = "src/bin/janus_60m_treepm.rs"
+required-features = ["cuda", "cufft"]

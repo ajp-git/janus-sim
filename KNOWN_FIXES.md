@@ -160,8 +160,9 @@ Optimisation finale : Morton + warp-coherent (tag optim-warpcoherent-v1.0)
   r_s = r_cut/3        (Gaussian splitting scale)
 
   virial_factor:
-    - 0.3 : OK pour N < 1M (référence historique)
-    - 0.5 : REQUIS pour N > 1M (prévient collapse prématuré)
+    - 0.3 : INVALIDE (collapse prématuré, KE/KE₀ = 850)
+    - 0.5 : Borderline (KE/KE₀ = 103 @ 500K, step 2000)
+    - 0.8 : RECOMMANDÉ pour N > 100K (KE/KE₀ < 10 validé @ 100K)
   virial_velocity = sqrt(N/box) × virial_factor
 
 ✅ OPTIMISATIONS ACTIVÉES :
@@ -190,6 +191,50 @@ Convention coordonnées : [-L/2, +L/2] (centré)
   - drift : wrap sur [-box_half, +box_half]
   - CIC : (px + box_half) * inv_cell_size
   - Visualisation : pos += box/2 pour afficher en [0, L]
+```
+
+### [FIX-013] Limite VRAM RTX 3060 12GB — N_max = 63M particules
+```
+Date validation : 2026-02-28
+Mesure empirique avec test_vram_limit.rs (GPU 100% libre)
+
+⚠️ IMPORTANT: Tuer tous les processus GPU parasites avant mesure!
+   nvidia-smi → sudo kill -9 <pid> pour chaque processus
+
+MESURES RÉELLES (TreePM step complet, GPU clean) :
+  N=30M →  5.77 GB (188 bytes/particle) ✅
+  N=40M →  7.58 GB (190 bytes/particle) ✅
+  N=50M →  9.39 GB (189 bytes/particle) ✅
+  N=60M → 11.17 GB (188 bytes/particle) ✅
+  N=62M → 11.55 GB (188 bytes/particle) ✅
+  N=63M → 11.74 GB (188 bytes/particle) ✅ MAX
+  N=64M → OOM at buffer allocation ❌
+  N=65M → OOM at buffer allocation ❌
+
+Formule empirique : VRAM(N) ≈ 0.1 GB + N × 188 bytes
+
+Composants mesurés (N=60M) :
+  Particles (pos+vel+sign)    : 2.94 GB
+  Extract buffers             : 0.98 GB
+  Morton sort buffers         : 0.86 GB
+  BVH single-sign (61M nodes) : 3.92 GB
+  cuFFT overhead              : ~0.06 GB (négligeable)
+  Total step peak             : 11.17 GB
+
+✅ N_max RTX 3060 12GB = 63M particules
+✅ Recommandé production  = 60M (marge 0.8 GB)
+
+Performance @ 60M: ~30s/step → 100h (4.2 jours) pour 12000 steps
+
+❌ 64M+ : CUDA_ERROR_OUT_OF_MEMORY au GPU buffer allocation
+❌ 85M  : impossible sur RTX 3060 (nécessite ~16 GB)
+
+Pour 85M : nécessite GPU 16GB+ (RTX 4080, A4000)
+Pour 100M+ : nécessite GPU 24GB+ (RTX 4090, A5000, A100)
+
+Note IC génération :
+  FFT Zel'dovich utilise CPU RAM (rustfft), pas VRAM
+  60M : grille 391³ ≈ 0.5 GB × 3 champs = 1.5 GB CPU RAM → OK
 ```
 
 ---

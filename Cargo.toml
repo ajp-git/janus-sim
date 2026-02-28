@@ -480,3 +480,8 @@ required-features = ["cuda"]
 name = "bench_treepm_morton"
 path = "src/bin/bench_treepm_morton.rs"
 required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "janus_85m_treepm"
+path = "src/bin/janus_85m_treepm.rs"
+required-features = ["cuda", "cufft"]

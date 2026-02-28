@@ -120,7 +120,7 @@ Notes:
 
 ### Run: TreePM_2M_production
 Date: 2026-02-28
-Status: **running**
+Status: **running** (using OLD kernel, not warp-coherent)
 
 Parameters:
   N particles: 2,000,000
@@ -130,39 +130,78 @@ Parameters:
   r_cut: box/16 (16.97 Mpc)
   dt: 0.01
   steps: 12000
-  integrator: TreePM (step_treepm_gpu)
+  integrator: TreePM (step_treepm_gpu) — OLD, not Morton
   frame_interval: 500 steps
 
-Performance @ 2M:
-  - step_dkd (pure BH): 7779 ms/step
-  - step_treepm_gpu: 7831 ms/step (PM 67ms + BH ~7750ms)
-  - After segregation (step 200+): BH drops to ~5500ms
+Performance @ 2M (OLD kernel):
+  - step_treepm_gpu: ~6000 ms/step (after segregation)
+  - Note: New kernel (Morton + warp-coherent) achieves 759 ms/step
 
-Current Progress (step 1400):
-  - z = 3.0
-  - Seg = 0.51
-  - S_max = 0.51
-  - Avg step time: 5800ms
+Current Progress (step ~2400):
+  - z ≈ 2.6
+  - Seg ≈ 0.43
+  - S_max = 0.5261 (at step 1500, z=3.08)
+  - Avg step time: ~6000ms
+  - ETA: ~16h remaining
 
 **OBSERVATION: Early segregation onset**
-  - Segregation reaching 0.50 already at z ≈ 3.6 (step 1000)
+  - S_max=0.526 at z ≈ 3.1 (step 1500)
   - Reference BH run: S_max=0.694 at z=1.8
   - TreePM 100K validation: S_max=0.659 at z=1.88
-  - **Current run segregates EARLIER (z~3.6 vs z~2.4)**
-  - To investigate: Is this physics or a TreePM artifact?
+  - **Segregation peaks EARLIER than expected**
 
 Notes:
-  - First production-scale TreePM run
-  - BH force kernel is the bottleneck (>99% of step time)
+  - This run uses OLD code (pre-Morton optimization)
+  - Will let it finish for comparison
+  - 85M production will use new warp-coherent kernel
   - Container: 5e3c41117aba
 
 ---
 
 ## Current Run
 
-### Run: 85M_expansion
+### Run: 85M_treepm_production (FINAL)
+Date: 2026-02-28
+Status: **pending** (waiting for 2M run to finish)
+
+Parameters:
+  N particles: 85,000,000
+  eta: 1.045
+  z_init: 5.0
+  theta: 0.7 (FIX-012 validated)
+  r_cut: box/16 (~59 Mpc)
+  dt: 0.01
+  steps: 12000
+  box_size: ~947 Mpc (auto: 100 × (85M/100K)^(1/3))
+  integrator: TreePM (step_treepm_gpu_morton)
+  kernel: Morton + warp-coherent (optim-warpcoherent-v1.0)
+
+Output:
+  - frames every 500 steps
+  - snapshots every 1000 steps (last 20 kept)
+  - time_series.csv with: step,time,redshift,scale_factor,hubble,ke,ke_ratio,segregation,s_max,step_time_ms
+
+Expected Performance:
+  - ~35s/step (extrapolated from 4M benchmark: 1626ms → 35s via O(N log N))
+  - Total runtime: ~5 days on RTX 3060
+
+Binary: src/bin/janus_85m_treepm.rs
+Command:
+```bash
+docker compose run --rm dev cargo run --release --features cuda,cufft \
+  --bin janus_85m_treepm
+```
+
+Notes:
+  - Uses warp-coherent kernel (22x faster than baseline)
+  - First 85M TreePM production run
+  - Will replace 85M_expansion (which uses old BH code)
+
+---
+
+### Run: 85M_expansion (SUPERSEDED)
 Date: 2026-02-25
-Status: **running**
+Status: **superseded** by 85M_treepm_production
 
 Parameters:
   N particles: 85,000,000

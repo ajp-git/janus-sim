@@ -1,6 +1,6 @@
 # KNOWN_FIXES.md — Corrections critiques janus-sim
 # À lire AVANT toute modification de nbody_gpu.rs ou pm_kernels.cu
-# Dernière mise à jour : 23 février 2026
+# Dernière mise à jour : 28 février 2026
 
 ---
 
@@ -150,6 +150,7 @@ const GRID_SIZE: usize = 256;  // 256³ — Run A uniquement
 ```
 Date validation : 2026-02-28
 Run référence : TreePM_validation_100K (S_max=0.659 @ z=1.88)
+Optimisation finale : Morton + warp-coherent (tag optim-warpcoherent-v1.0)
 
 ✅ PARAMÈTRES VALIDÉS :
   θ = 0.7              (obligatoire pour physique correcte)
@@ -159,11 +160,26 @@ Run référence : TreePM_validation_100K (S_max=0.659 @ z=1.88)
   r_s = r_cut/3        (Gaussian splitting scale)
   virial_velocity = sqrt(N/box) × 0.3
 
+✅ OPTIMISATIONS ACTIVÉES :
+  Morton ordering      → 7.4x speedup (cache-friendly tree traversal)
+  Warp-coherent kernel → 3x additional (32 threads traverse together)
+  Fonction: step_treepm_gpu_morton() dans nbody_gpu_twopass.rs
+
+✅ PERFORMANCE MESURÉE (RTX 3060, tag optim-warpcoherent-v1.0) :
+  500K : 212 ms/step
+  2M   : 759 ms/step
+  4M   : 1626 ms/step
+  85M  : ~35s/step (extrapolation O(N log N) depuis 4M)
+
+  12000 steps @ 85M ≈ 5 jours sur RTX 3060
+
 ❌ PARAMÈTRES INVALIDÉS :
   θ = 0.5              → ségrégation trop faible (~0.40 vs 0.65)
   TreePM sans erfc     → double-comptage forces, non publiable
   PM seul (sans BH)    → ségrégation nulle (FIX-009)
   r_cut = ∞            → revient à BH pur (valide mais pas TreePM)
+  stack[16]            → 6% plus lent que stack[32] (testé 2026-02-28)
+  shmem top 1024 nodes → 2x plus lent (occupancy loss 44KB)
 
 Convention coordonnées : [-L/2, +L/2] (centré)
   - ICs : (rng - 0.5) * box_size
@@ -194,10 +210,15 @@ Conclusion : ségrégation Janus sub-Mpc, PM insuffisant
 
 ### Optimisations BH validées
 ```
-KDK baseline  : 7810 ms/step (2M)
-+ DKD         : 3868 ms/step (2.0×) ✅
-+ Morton CPU  : 2662 ms/step (2.9×) ✅
-+ Async θ     : 3228 ms/step — REJETÉ (overhead > gain en CI mixtes)
+KDK baseline        : 7810 ms/step (2M)
++ DKD               : 3868 ms/step (2.0×) ✅
++ Morton CPU        : 2662 ms/step (2.9×) ✅
++ Async θ           : 3228 ms/step — REJETÉ (overhead > gain en CI mixtes)
+
+TreePM (2026-02-28) :
+  baseline          : 16989 ms/step (2M)
+  + Morton GPU      : 2296 ms/step (7.4×) ✅
+  + warp-coherent   : 759 ms/step (22.4×) ✅ ← PRODUCTION
 ```
 
 ---

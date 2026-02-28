@@ -26,6 +26,7 @@ const SNAPSHOT_INTERVAL: usize = 1000;
 const MAX_SNAPSHOTS: usize = 20;  // Keep last 20 snapshots
 const Z_INIT: f64 = 5.0;
 const TOTAL_STEPS: usize = 12000;
+const VIRIAL_FACTOR: f64 = 0.5;  // 0.5 for large N (prevents premature collapse)
 
 #[cfg(all(feature = "cuda", feature = "cufft"))]
 struct RenderJob {
@@ -158,6 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  dt = {}", DT);
     println!("  box = {:.2} Mpc", box_size);
     println!("  integrator = TreePM (Morton + warp-coherent)");
+    println!("  virial_factor = {} (prevents premature collapse)", VIRIAL_FACTOR);
     println!("  frames every {} steps", FRAME_INTERVAL);
     println!("  snapshots every {} steps", SNAPSHOT_INTERVAL);
     println!();
@@ -212,9 +214,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("CSV: {}", csv_path);
     println!();
 
-    // Create simulation
+    // Create simulation with proper virialization
     println!("Creating simulation...");
-    let mut sim = GpuNBodyTwoPass::new(n_positive, n_negative, box_size)?;
+    let mut sim = GpuNBodyTwoPass::new_with_virial_factor(n_positive, n_negative, box_size, VIRIAL_FACTOR)?;
     sim.set_theta(THETA);
     println!("  θ = {}", THETA);
 

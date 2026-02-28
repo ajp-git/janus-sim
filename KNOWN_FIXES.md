@@ -158,7 +158,11 @@ Optimisation finale : Morton + warp-coherent (tag optim-warpcoherent-v1.0)
   PM grid = 128³       (cuFFT GPU)
   erfc splitting: BH short-range + PM k-space damping exp(-k²r_s²)
   r_s = r_cut/3        (Gaussian splitting scale)
-  virial_velocity = sqrt(N/box) × 0.3
+
+  virial_factor:
+    - 0.3 : OK pour N < 1M (référence historique)
+    - 0.5 : REQUIS pour N > 1M (prévient collapse prématuré)
+  virial_velocity = sqrt(N/box) × virial_factor
 
 ✅ OPTIMISATIONS ACTIVÉES :
   Morton ordering      → 7.4x speedup (cache-friendly tree traversal)

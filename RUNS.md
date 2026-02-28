@@ -120,7 +120,7 @@ Notes:
 
 ### Run: TreePM_2M_production
 Date: 2026-02-28
-Status: **running** (using OLD kernel, not warp-coherent)
+Status: **running** ⚠️ **PHYSICALLY INVALID**
 
 Parameters:
   N particles: 2,000,000
@@ -131,29 +131,36 @@ Parameters:
   dt: 0.01
   steps: 12000
   integrator: TreePM (step_treepm_gpu) — OLD, not Morton
-  frame_interval: 500 steps
+  virial_velocity: sqrt(N/box) × 0.3 ← **TOO COLD**
 
-Performance @ 2M (OLD kernel):
-  - step_treepm_gpu: ~6000 ms/step (after segregation)
-  - Note: New kernel (Morton + warp-coherent) achieves 759 ms/step
+⚠️ **PHYSICS PROBLEM DETECTED**:
+```
+KE/KE₀ = 850 (should be ~1.9 max with proper Hubble friction)
+Segregation onset: step 200 (z=4.69) vs expected step 1200 (z=2.4)
+```
+
+**Diagnosis**: Gravitational collapse, NOT cosmological segregation
+  - virial_velocity = sqrt(2M/271) × 0.3 = 25.7 × 0.3 = 7.7 km/s
+  - System was "cold" (insufficient KE to resist collapse)
+  - Collapsed before Hubble friction could play its role
+  - Reference 2M run used different IC generation
+
+**Root cause**: virial_velocity factor 0.3 gives insufficient velocities
+for large N in large box. System not properly virialized → immediate collapse.
+
+**Action**: Let run finish for data. Fix virial_velocity factor to 0.5 for 85M.
 
 Current Progress (step ~2400):
   - z ≈ 2.6
   - Seg ≈ 0.43
-  - S_max = 0.5261 (at step 1500, z=3.08)
+  - S_max = 0.5261 (at step 1500, z=3.08) ← NOT PHYSICAL
+  - KE/KE₀ ≈ 850 ← COLLAPSE SIGNATURE
   - Avg step time: ~6000ms
-  - ETA: ~16h remaining
-
-**OBSERVATION: Early segregation onset**
-  - S_max=0.526 at z ≈ 3.1 (step 1500)
-  - Reference BH run: S_max=0.694 at z=1.8
-  - TreePM 100K validation: S_max=0.659 at z=1.88
-  - **Segregation peaks EARLIER than expected**
 
 Notes:
-  - This run uses OLD code (pre-Morton optimization)
-  - Will let it finish for comparison
-  - 85M production will use new warp-coherent kernel
+  - Run continues for data collection
+  - Results NOT valid for publication
+  - 85M will use corrected virialization
   - Container: 5e3c41117aba
 
 ---
@@ -175,6 +182,7 @@ Parameters:
   box_size: ~947 Mpc (auto: 100 × (85M/100K)^(1/3))
   integrator: TreePM (step_treepm_gpu_morton)
   kernel: Morton + warp-coherent (optim-warpcoherent-v1.0)
+  virial_factor: 0.5 (prevents premature collapse for large N)
 
 Output:
   - frames every 500 steps

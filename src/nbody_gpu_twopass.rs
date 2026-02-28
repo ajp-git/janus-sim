@@ -1604,7 +1604,16 @@ pub struct TreeBuildTiming {
 
 #[cfg(feature = "cuda")]
 impl GpuNBodyTwoPass {
+    /// Create simulation with default virial factor (0.3)
     pub fn new(n_positive: usize, n_negative: usize, box_size: f64) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_virial_factor(n_positive, n_negative, box_size, 0.3)
+    }
+
+    /// Create simulation with custom virial factor
+    /// virial_velocity = sqrt(N/box) × virial_factor
+    /// - 0.3 = original value (may be too cold for large N)
+    /// - 0.5 = recommended for N > 1M (prevents premature collapse)
+    pub fn new_with_virial_factor(n_positive: usize, n_negative: usize, box_size: f64, virial_factor: f64) -> Result<Self, Box<dyn std::error::Error>> {
         use std::time::Instant;
 
         println!("  [1/6] Initializing CUDA device...");
@@ -1648,9 +1657,10 @@ impl GpuNBodyTwoPass {
         let mut vel_data = Vec::with_capacity(n_total * 3);
         let mut signs_data: Vec<i8> = Vec::with_capacity(n_total);
 
-        // Initial velocity scale matching reference BH implementation
-        // virial_velocity = sqrt(N/box) × 0.3 gives proper KE for virialization
-        let virial_velocity = ((n_total as f64) / box_size).sqrt() * 0.3;
+        // Initial velocity scale: virial_velocity = sqrt(N/box) × virial_factor
+        // Factor 0.3 was found too cold for large N (causes premature collapse)
+        // Factor 0.5 recommended for N > 1M
+        let virial_velocity = ((n_total as f64) / box_size).sqrt() * virial_factor;
 
         // Generate + particles first (like reference)
         for _ in 0..n_positive {
@@ -1679,13 +1689,12 @@ impl GpuNBodyTwoPass {
         }
 
         println!("         Generated: N+ = {}, N- = {}", n_positive, n_negative);
-        println!("         virial_velocity = {:.4}", virial_velocity);
+        println!("         virial_velocity = {:.4} (factor = {:.2})", virial_velocity, virial_factor);
         println!("         done ({:.2}s)", t0.elapsed().as_secs_f64());
 
-        // NOTE: No alpha scaling applied. The reference GpuNBodySimulation uses
-        // virial_velocity = sqrt(N/box)*0.3 directly without additional scaling.
-        // Exact PE_binding virialization over-stabilizes the system and prevents
-        // gravitational collapse (segregation).
+        // NOTE: virial_factor controls initial KE. Too small → premature collapse.
+        // 0.3 works for small N (<1M), 0.5 recommended for large N (>1M).
+        // Exact PE_binding virialization over-stabilizes and prevents segregation.
 
         // Allocate GPU buffers
         println!("  [4/5] Copying data to GPU...");

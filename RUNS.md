@@ -120,7 +120,7 @@ Notes:
 
 ### Run: TreePM_2M_production
 Date: 2026-02-28
-Status: **running** ⚠️ **PHYSICALLY INVALID**
+Status: **killed** (step ~2500) ⚠️ **PHYSICALLY INVALID**
 
 Parameters:
   N particles: 2,000,000
@@ -148,20 +148,17 @@ Segregation onset: step 200 (z=4.69) vs expected step 1200 (z=2.4)
 **Root cause**: virial_velocity factor 0.3 gives insufficient velocities
 for large N in large box. System not properly virialized → immediate collapse.
 
-**Action**: Let run finish for data. Fix virial_velocity factor to 0.5 for 85M.
+**Action**: Run killed at step ~2500. Data steps 100-2500 conserved for documentation.
 
-Current Progress (step ~2400):
-  - z ≈ 2.6
-  - Seg ≈ 0.43
+Final State (step ~2500):
+  - z ≈ 2.5
   - S_max = 0.5261 (at step 1500, z=3.08) ← NOT PHYSICAL
   - KE/KE₀ ≈ 850 ← COLLAPSE SIGNATURE
-  - Avg step time: ~6000ms
 
 Notes:
-  - Run continues for data collection
-  - Results NOT valid for publication
-  - 85M will use corrected virialization
-  - Container: 5e3c41117aba
+  - **Killed**: virial_factor=0.3 invalide, données suffisantes
+  - Partial data in output/treepm_2m_production/
+  - 85M production uses corrected virial_factor=0.5
 
 ---
 

@@ -1,8 +1,9 @@
 //! Janus 60M particle simulation with TreePM + Morton + warp-coherent
 //!
-//! ICs: Multi-mode Zel'dovich P(k) + virialized
+//! ICs: Multi-mode Zel'dovich P(k) + correct virialization
 //!   - Positions: grid + FFT-based P(k) displacement spectrum
-//!   - Velocities: random, scaled by virial_factor = 1.5 (box=400 calibration)
+//!   - Velocities: Zel'dovich (∝ displacement), scaled by α = √(|PE_bind|/2KE)
+//!   - Validated on 100K box=400: α=8.33, Seg@40=0.0065, KE stable
 //!
 //! TreePM using optimized step_treepm_gpu_morton:
 //!   - Morton ordering: 7.4x speedup
@@ -18,6 +19,7 @@ use janus::nbody_gpu_twopass::GpuNBodyTwoPass;
 #[cfg(all(feature = "cuda", feature = "cufft"))]
 use janus::friedmann::{JanusParams, CosmoInterpolator};
 use rand::prelude::*;
+use rand::seq::SliceRandom;
 use rand_distr::Normal;
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::f64::consts::PI;
@@ -37,7 +39,7 @@ const SNAPSHOT_INTERVAL: usize = 50;   // Snapshots every 50 steps
 const MAX_SNAPSHOTS: usize = 30;       // Keep last 30 snapshots
 const Z_INIT: f64 = 5.0;
 const TOTAL_STEPS: usize = 12000;
-const VIRIAL_FACTOR: f64 = 1.5;  // 1.5 for box=400: prevents premature collapse (Seg<0.005@z=5)
+const SOFTENING: f64 = 0.1;  // Plummer softening for PE_binding calculation
 
 // Power spectrum parameters (validated in treepm_zeldovich_multimode: onset z=2.65)
 const N_S: f64 = 0.96;   // Spectral index
@@ -86,7 +88,97 @@ fn ifft_3d(data: &mut [Complex<f64>], ifft: &std::sync::Arc<dyn rustfft::Fft<f64
     data.iter().map(|c| c.re * norm).collect()
 }
 
-/// Generate multi-mode Zel'dovich ICs with P(k) spectrum + virialized velocities
+/// Compute PE_binding for same-sign pairs (O(N²) but only for initialization)
+/// Uses sampling for N > 50000 to avoid excessive computation time
+#[cfg(all(feature = "cuda", feature = "cufft"))]
+fn compute_pe_binding_sampled(pos: &[f32], signs: &[i8], box_size: f64, softening: f64, sample_size: usize) -> f64 {
+    let n = signs.len();
+    let half_box = box_size / 2.0;
+    let soft_sq = softening * softening;
+
+    // If small enough, compute exactly
+    if n <= sample_size {
+        let mut pe = 0.0_f64;
+        for i in 0..n {
+            let xi = pos[i * 3] as f64;
+            let yi = pos[i * 3 + 1] as f64;
+            let zi = pos[i * 3 + 2] as f64;
+            let si = signs[i];
+            for j in (i + 1)..n {
+                if signs[j] != si { continue; }
+                let xj = pos[j * 3] as f64;
+                let yj = pos[j * 3 + 1] as f64;
+                let zj = pos[j * 3 + 2] as f64;
+                let mut dx = xj - xi;
+                let mut dy = yj - yi;
+                let mut dz = zj - zi;
+                if dx > half_box { dx -= box_size; } else if dx < -half_box { dx += box_size; }
+                if dy > half_box { dy -= box_size; } else if dy < -half_box { dy += box_size; }
+                if dz > half_box { dz -= box_size; } else if dz < -half_box { dz += box_size; }
+                let r_sq = dx*dx + dy*dy + dz*dz;
+                let r_soft = (r_sq + soft_sq).sqrt();
+                pe -= 1.0 / r_soft;
+            }
+        }
+        return pe;
+    }
+
+    // Sample particles for large N
+    let mut rng = rand::rng();
+    let indices: Vec<usize> = (0..n).collect();
+    let sample: Vec<usize> = indices.choose_multiple(&mut rng, sample_size).cloned().collect();
+
+    let mut pe_sample = 0.0_f64;
+    let mut n_pairs = 0usize;
+
+    for (ii, &i) in sample.iter().enumerate() {
+        let xi = pos[i * 3] as f64;
+        let yi = pos[i * 3 + 1] as f64;
+        let zi = pos[i * 3 + 2] as f64;
+        let si = signs[i];
+        for &j in &sample[(ii + 1)..] {
+            if signs[j] != si { continue; }
+            let xj = pos[j * 3] as f64;
+            let yj = pos[j * 3 + 1] as f64;
+            let zj = pos[j * 3 + 2] as f64;
+            let mut dx = xj - xi;
+            let mut dy = yj - yi;
+            let mut dz = zj - zi;
+            if dx > half_box { dx -= box_size; } else if dx < -half_box { dx += box_size; }
+            if dy > half_box { dy -= box_size; } else if dy < -half_box { dy += box_size; }
+            if dz > half_box { dz -= box_size; } else if dz < -half_box { dz += box_size; }
+            let r_sq = dx*dx + dy*dy + dz*dz;
+            let r_soft = (r_sq + soft_sq).sqrt();
+            pe_sample -= 1.0 / r_soft;
+            n_pairs += 1;
+        }
+    }
+
+    // Scale up to full system
+    // Same-sign pairs in sample: sample_size*(sample_size-1)/2 * 0.5 (factor 0.5 for half same sign)
+    // Same-sign pairs in full: n*(n-1)/2 * 0.5
+    let n_sample_pairs_total = sample_size * (sample_size - 1) / 2;
+    let n_full_pairs_total = n * (n - 1) / 2;
+    let scale_factor = n_full_pairs_total as f64 / n_sample_pairs_total as f64;
+
+    pe_sample * scale_factor
+}
+
+/// Compute current kinetic energy
+#[cfg(all(feature = "cuda", feature = "cufft"))]
+fn compute_ke(vel: &[f32]) -> f64 {
+    let n = vel.len() / 3;
+    let mut ke = 0.0_f64;
+    for i in 0..n {
+        let vx = vel[i * 3] as f64;
+        let vy = vel[i * 3 + 1] as f64;
+        let vz = vel[i * 3 + 2] as f64;
+        ke += 0.5 * (vx*vx + vy*vy + vz*vz);
+    }
+    ke
+}
+
+/// Generate multi-mode Zel'dovich ICs with P(k) spectrum + correct virialization
 /// - Positions: grid + FFT-based P(k) displacement spectrum
 /// - Velocities: random, scaled by virial_velocity = sqrt(N/box) × virial_factor
 #[cfg(all(feature = "cuda", feature = "cufft"))]
@@ -210,12 +302,10 @@ fn generate_zeldovich_ics(n_total: usize, box_size: f64, seed: u64) -> (Vec<f32>
     let scale = if max_disp > 1e-10 { target_disp / max_disp } else { 1.0 };
     println!("  Max displacement: {:.6e} Mpc → scaling to {:.4} Mpc", max_disp, target_disp);
 
-    // Virialized velocities
-    let virial_velocity = ((n3 as f64) / box_size).sqrt() * VIRIAL_FACTOR;
-    println!("  Virialized velocities: virial_velocity = {:.4} (factor = {:.2})",
-        virial_velocity, VIRIAL_FACTOR);
+    // Initial velocity scale (will be rescaled by α)
+    let v_scale = 1.0;
 
-    // Generate particles
+    // Generate particles with Zel'dovich velocities
     println!("  Placing {} particles...", n3);
     let n_positive = (n3 as f64 / (1.0 + ETA)) as usize;
 
@@ -232,9 +322,13 @@ fn generate_zeldovich_ics(n_total: usize, box_size: f64, seed: u64) -> (Vec<f32>
                 let y0 = (iy as f64 + 0.5) * spacing - half_box;
                 let z0 = (iz as f64 + 0.5) * spacing - half_box;
 
-                let mut x = x0 + psi_x[idx] * scale;
-                let mut y = y0 + psi_y[idx] * scale;
-                let mut z = z0 + psi_z[idx] * scale;
+                let dx = psi_x[idx] * scale;
+                let dy = psi_y[idx] * scale;
+                let dz = psi_z[idx] * scale;
+
+                let mut x = x0 + dx;
+                let mut y = y0 + dy;
+                let mut z = z0 + dz;
 
                 while x > half_box { x -= box_size; }
                 while x < -half_box { x += box_size; }
@@ -247,9 +341,10 @@ fn generate_zeldovich_ics(n_total: usize, box_size: f64, seed: u64) -> (Vec<f32>
                 positions.push(y as f32);
                 positions.push(z as f32);
 
-                let vx = (rng.random::<f64>() - 0.5) * virial_velocity;
-                let vy = (rng.random::<f64>() - 0.5) * virial_velocity;
-                let vz = (rng.random::<f64>() - 0.5) * virial_velocity;
+                // Zel'dovich velocities (proportional to displacement)
+                let vx = dx * v_scale;
+                let vy = dy * v_scale;
+                let vz = dz * v_scale;
                 velocities.push(vx as f32);
                 velocities.push(vy as f32);
                 velocities.push(vz as f32);
@@ -267,6 +362,31 @@ fn generate_zeldovich_ics(n_total: usize, box_size: f64, seed: u64) -> (Vec<f32>
     let actual_pos = signs.iter().filter(|&&s| s > 0).count();
     let actual_neg = signs.iter().filter(|&&s| s < 0).count();
     println!("  Generated: N+ = {}, N- = {}", actual_pos, actual_neg);
+
+    // Compute PE_binding for virialization (sample 50K particles for speed)
+    println!("  Computing PE_binding (sampled O(N²))...");
+    let pe_binding = compute_pe_binding_sampled(&positions, &signs, box_size, SOFTENING, 50000);
+    println!("  PE_binding = {:.4e}", pe_binding);
+
+    // Compute current KE
+    let ke_current = compute_ke(&velocities);
+    println!("  KE_current = {:.4e}", ke_current);
+
+    // Calculate α = √(|PE_binding| / 2KE)
+    let ke_target = pe_binding.abs() / 2.0;
+    let alpha = if ke_current > 1e-20 { (ke_target / ke_current).sqrt() } else { 1.0 };
+    println!("  KE_target = {:.4e}", ke_target);
+    println!("  α = {:.4}", alpha);
+
+    // Rescale velocities by α
+    for v in velocities.iter_mut() {
+        *v *= alpha as f32;
+    }
+
+    // Verify final KE
+    let ke_final = compute_ke(&velocities);
+    let virial_error = (2.0 * ke_final - pe_binding.abs()).abs() / pe_binding.abs() * 100.0;
+    println!("  KE_final = {:.4e} (virial error: {:.4}%)", ke_final, virial_error);
 
     (positions, velocities, signs)
 }
@@ -402,7 +522,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  dt = {}", DT);
     println!("  box = {:.2} Mpc", box_size);
     println!("  integrator = TreePM (Morton + warp-coherent)");
-    println!("  ICs = Zel'dovich + virialized (virial_factor = {})", VIRIAL_FACTOR);
+    println!("  ICs = Zel'dovich + virialized (α = √|PE_bind|/2KE)");
     println!("  frames every {} steps", FRAME_INTERVAL);
     println!("  snapshots every {} steps", SNAPSHOT_INTERVAL);
     println!();

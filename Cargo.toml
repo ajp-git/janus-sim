@@ -545,3 +545,8 @@ required-features = ["cuda", "cufft"]
 name = "test_virial_factor"
 path = "src/bin/test_virial_factor.rs"
 required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "validate_virial_100k_box400"
+path = "src/bin/validate_virial_100k_box400.rs"
+required-features = ["cuda", "cufft"]

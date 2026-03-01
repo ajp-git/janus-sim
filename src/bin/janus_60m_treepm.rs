@@ -1,9 +1,9 @@
 //! Janus 60M particle simulation with TreePM + Morton + warp-coherent
 //!
-//! ICs: Multi-mode Zel'dovich P(k) + correct virialization
+//! ICs: Multi-mode Zel'dovich P(k) (pure, no virialization)
 //!   - Positions: grid + FFT-based P(k) displacement spectrum
-//!   - Velocities: Zel'dovich (∝ displacement), scaled by α = √(|PE_bind|/2KE)
-//!   - Validated on 100K box=400: α=8.33, Seg@40=0.0065, KE stable
+//!   - Velocities: Zel'dovich (∝ displacement), α=1.0 (no rescaling)
+//!   - Validated on 100K box=400: KE/KE₀=0.39@100, Seg=0.0025@40
 //!
 //! TreePM using optimized step_treepm_gpu_morton:
 //!   - Morton ordering: 7.4x speedup
@@ -30,15 +30,15 @@ use std::fs::{self, File};
 use std::io::{Write, BufWriter};
 
 const N_PARTICLES: usize = 60_000_000;
-const BOX_SIZE: f64 = 400.0;  // Fixed 400 Mpc (resolution 1.0 Mpc → filaments visibles)
+const BOX_SIZE: f64 = 843.0;  // Density = 0.100 part/Mpc³ (same as validated 2M run)
 const ETA: f64 = 1.045;
 const THETA: f64 = 0.7;  // Per FIX-012: theta=0.7 obligatoire
-const DT: f64 = 0.01;
-const FRAME_INTERVAL: usize = 20;      // PNG every 20 steps (783MB × 600 = 470GB)
+const DT: f64 = 0.01;  // Same as validated 2M run
+const FRAME_INTERVAL: usize = 20;      // PNG every 20 steps
 const SNAPSHOT_INTERVAL: usize = 50;   // Snapshots every 50 steps
 const MAX_SNAPSHOTS: usize = 30;       // Keep last 30 snapshots
 const Z_INIT: f64 = 5.0;
-const TOTAL_STEPS: usize = 12000;
+const TOTAL_STEPS: usize = 12000;  // z=5 → z=0
 const SOFTENING: f64 = 0.1;  // Plummer softening for PE_binding calculation
 
 // Power spectrum parameters (validated in treepm_zeldovich_multimode: onset z=2.65)
@@ -298,9 +298,11 @@ fn generate_zeldovich_ics(n_total: usize, box_size: f64, seed: u64) -> (Vec<f32>
         if d > max_disp { max_disp = d; }
     }
 
+    // Displacement scaled to 30% of inter-particle spacing (standard Zel'dovich)
+    // For 60M in 400 Mpc: spacing = 1.02 Mpc → target_disp = 0.31 Mpc
     let target_disp = spacing * 0.3;
     let scale = if max_disp > 1e-10 { target_disp / max_disp } else { 1.0 };
-    println!("  Max displacement: {:.6e} Mpc → scaling to {:.4} Mpc", max_disp, target_disp);
+    println!("  Max displacement: {:.6e} Mpc → scaling to {:.4} Mpc (30% of spacing={:.2})", max_disp, target_disp, spacing);
 
     // Initial velocity scale (will be rescaled by α)
     let v_scale = 1.0;
@@ -363,30 +365,12 @@ fn generate_zeldovich_ics(n_total: usize, box_size: f64, seed: u64) -> (Vec<f32>
     let actual_neg = signs.iter().filter(|&&s| s < 0).count();
     println!("  Generated: N+ = {}, N- = {}", actual_pos, actual_neg);
 
-    // Compute PE_binding for virialization (sample 50K particles for speed)
-    println!("  Computing PE_binding (sampled O(N²))...");
-    let pe_binding = compute_pe_binding_sampled(&positions, &signs, box_size, SOFTENING, 50000);
-    println!("  PE_binding = {:.4e}", pe_binding);
-
-    // Compute current KE
-    let ke_current = compute_ke(&velocities);
-    println!("  KE_current = {:.4e}", ke_current);
-
-    // Calculate α = √(|PE_binding| / 2KE)
-    let ke_target = pe_binding.abs() / 2.0;
-    let alpha = if ke_current > 1e-20 { (ke_target / ke_current).sqrt() } else { 1.0 };
-    println!("  KE_target = {:.4e}", ke_target);
-    println!("  α = {:.4}", alpha);
-
-    // Rescale velocities by α
-    for v in velocities.iter_mut() {
-        *v *= alpha as f32;
-    }
-
-    // Verify final KE
+    // Pure Zel'dovich velocities (α=1, no virialization)
+    // Validated on 100K box=400: KE/KE₀=0.39 @ step 100, Seg=0.0025 @ step 40
+    // Zel'dovich ICs are self-consistent: v ∝ displacement gradient
     let ke_final = compute_ke(&velocities);
-    let virial_error = (2.0 * ke_final - pe_binding.abs()).abs() / pe_binding.abs() * 100.0;
-    println!("  KE_final = {:.4e} (virial error: {:.4}%)", ke_final, virial_error);
+    println!("  Pure Zel'dovich (α=1.0, no virialization)");
+    println!("  KE = {:.4e}", ke_final);
 
     (positions, velocities, signs)
 }
@@ -577,14 +561,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("CSV: {}", csv_path);
     println!();
 
-    // Generate Zel'dovich ICs (validated: onset z=2.46 in treepm_zeldovich_test)
-    println!("Creating simulation with Zel'dovich ICs...");
+    // Using uniform random ICs (like validated 2M run)
+    // Zel'dovich ICs caused KE explosion - coherent velocities create force imbalances
+    println!("Creating simulation with uniform random ICs...");
     let t0 = Instant::now();
-    let (positions, velocities, signs) = generate_zeldovich_ics(N_PARTICLES, box_size, 12345);
+    let n_pos = (N_PARTICLES as f64 / (1.0 + ETA)) as usize;
+    let n_neg = N_PARTICLES - n_pos;
+    // Use virial_factor=0.5 for large N (>1M), 0.3 was too cold
+    let mut sim = GpuNBodyTwoPass::new_with_virial_factor(n_pos, n_neg, box_size, 0.5)?;
     println!("  IC generation: {:.2}s", t0.elapsed().as_secs_f64());
-
-    let mut sim = GpuNBodyTwoPass::with_custom_ics(positions, velocities, signs, box_size)?;
     sim.set_theta(THETA);
+    // Use default softening (0.1) - uniform ICs don't need large softening
     println!("  θ = {}", THETA);
 
     // Get initial KE
@@ -608,6 +595,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut s_max = 0.0f64;
     let mut s_max_step = 0usize;
     let mut s_max_z = Z_INIT;
+
+    // Save step 0 snapshot and render data
+    {
+        let pos = sim.get_positions()?;
+        let vel = sim.get_velocities()?;
+        let signs = sim.get_signs()?;
+        save_snapshot(0, &pos, &vel, &signs, ETA, Z_INIT, 1.0 / (1.0 + Z_INIT),
+                      &snapshots_dir, &mut snapshots)?;
+        println!("[snapshot] Saved: {}/snapshot_000000.bin (z={:.2}, ICs)", snapshots_dir, Z_INIT);
+
+        tx.send(RenderJob {
+            step: 0,
+            pos,
+            signs,
+            box_size: BOX_SIZE,
+            seg: seg0,
+            ke_ratio: 1.0,
+            redshift: Z_INIT,
+            render_data_dir: render_data_dir.clone(),
+        }).ok();
+    }
 
     println!("Starting simulation loop...");
     println!("  Step        z     KE/KE₀      Seg     S_max    ms/step");

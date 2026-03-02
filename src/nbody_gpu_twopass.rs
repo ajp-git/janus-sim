@@ -1915,6 +1915,7 @@ impl GpuNBodyTwoPass {
     }
 
     pub fn set_theta(&mut self, theta: f64) { self.theta = theta; }
+    pub fn set_softening(&mut self, softening: f64) { self.softening = softening; }
 
     /// Build tree for particles of given sign, returning timing breakdown
     fn build_single_sign_tree(&mut self, _sign: i32, n_sign: usize) -> Result<TreeBuildTiming, Box<dyn std::error::Error>> {
@@ -4109,6 +4110,148 @@ impl GpuNBodyTwoPass {
             .map(|v| 0.5 * ((v[0] as f64).powi(2) + (v[1] as f64).powi(2) + (v[2] as f64).powi(2)))
             .sum();
         Ok(ke)
+    }
+
+    /// Compute PE_binding using sampled same-sign pairs only
+    /// This is the correct Janus virialization (NOT total PE which includes repulsive pairs)
+    pub fn potential_energy_binding_sampled(&self, n_sample: usize) -> Result<f64, Box<dyn std::error::Error>> {
+        use rayon::prelude::*;
+
+        let pos_cpu = self.device.dtoh_sync_copy(&self.pos)?;
+        let signs_cpu = self.device.dtoh_sync_copy(&self.signs)?;
+
+        // Separate indices by sign
+        let positive: Vec<usize> = (0..self.n_particles)
+            .filter(|&i| signs_cpu[i] > 0)
+            .collect();
+        let negative: Vec<usize> = (0..self.n_particles)
+            .filter(|&i| signs_cpu[i] < 0)
+            .collect();
+
+        let n_pos = positive.len();
+        let n_neg = negative.len();
+
+        // Sample from each population using stride sampling
+        let sample_pos: Vec<usize> = if n_pos <= n_sample {
+            positive.clone()
+        } else {
+            let stride = n_pos / n_sample;
+            (0..n_sample).map(|i| positive[i * stride]).collect()
+        };
+        let sample_neg: Vec<usize> = if n_neg <= n_sample {
+            negative.clone()
+        } else {
+            let stride = n_neg / n_sample;
+            (0..n_sample).map(|i| negative[i * stride]).collect()
+        };
+
+        let ns_pos = sample_pos.len();
+        let ns_neg = sample_neg.len();
+
+        println!("  PE sampling: {} of {} positive, {} of {} negative",
+            ns_pos, n_pos, ns_neg, n_neg);
+
+        let soft2 = (self.softening * self.softening) as f64;
+
+        // Compute PE for positive sample (same-sign pairs = attractive = negative PE)
+        let pe_pos_sample: f64 = sample_pos.par_iter()
+            .enumerate()
+            .map(|(idx_i, &i)| {
+                let px = pos_cpu[i * 3] as f64;
+                let py = pos_cpu[i * 3 + 1] as f64;
+                let pz = pos_cpu[i * 3 + 2] as f64;
+                let mut pe_i = 0.0;
+                for (idx_j, &j) in sample_pos.iter().enumerate() {
+                    if idx_j <= idx_i { continue; }
+                    let dx = px - pos_cpu[j * 3] as f64;
+                    let dy = py - pos_cpu[j * 3 + 1] as f64;
+                    let dz = pz - pos_cpu[j * 3 + 2] as f64;
+                    let r2 = dx*dx + dy*dy + dz*dz + soft2;
+                    pe_i -= 1.0 / r2.sqrt();
+                }
+                pe_i
+            })
+            .sum();
+
+        // Compute PE for negative sample
+        let pe_neg_sample: f64 = sample_neg.par_iter()
+            .enumerate()
+            .map(|(idx_i, &i)| {
+                let px = pos_cpu[i * 3] as f64;
+                let py = pos_cpu[i * 3 + 1] as f64;
+                let pz = pos_cpu[i * 3 + 2] as f64;
+                let mut pe_i = 0.0;
+                for (idx_j, &j) in sample_neg.iter().enumerate() {
+                    if idx_j <= idx_i { continue; }
+                    let dx = px - pos_cpu[j * 3] as f64;
+                    let dy = py - pos_cpu[j * 3 + 1] as f64;
+                    let dz = pz - pos_cpu[j * 3 + 2] as f64;
+                    let r2 = dx*dx + dy*dy + dz*dz + soft2;
+                    pe_i -= 1.0 / r2.sqrt();
+                }
+                pe_i
+            })
+            .sum();
+
+        // Scale up from sample to full population
+        let scale_pos = if ns_pos > 1 {
+            (n_pos as f64 * (n_pos - 1) as f64) / (ns_pos as f64 * (ns_pos - 1) as f64)
+        } else { 1.0 };
+        let scale_neg = if ns_neg > 1 {
+            (n_neg as f64 * (n_neg - 1) as f64) / (ns_neg as f64 * (ns_neg - 1) as f64)
+        } else { 1.0 };
+
+        let pe_binding = pe_pos_sample * scale_pos + pe_neg_sample * scale_neg;
+
+        println!("  PE_pos (scaled) = {:.4e}", pe_pos_sample * scale_pos);
+        println!("  PE_neg (scaled) = {:.4e}", pe_neg_sample * scale_neg);
+        println!("  PE_binding      = {:.4e}", pe_binding);
+
+        Ok(pe_binding)
+    }
+
+    /// Virialize using sampled PE_binding (same as validated 8M run)
+    /// This is the CORRECT Janus virialization method:
+    ///   α = √(|PE_bind|/2KE) where PE_bind = same-sign pairs only
+    /// Expected α ≈ 4-6 for proper Janus systems
+    pub fn virialize_sampled(&mut self, n_sample: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let ke = self.kinetic_energy()?;
+
+        println!("Virialization (sampled, Janus mode):");
+        println!("  KE initial    = {:.4e}", ke);
+
+        if ke < 1e-20 {
+            println!("  WARNING: KE too small, skipping virialization");
+            return Ok(());
+        }
+
+        let pe_bind = self.potential_energy_binding_sampled(n_sample)?;
+
+        if pe_bind >= 0.0 {
+            println!("  WARNING: PE_binding >= 0, no bound system to virialize");
+            return Ok(());
+        }
+
+        // Virial condition: 2KE + PE_bind = 0 → KE_target = |PE_bind|/2
+        let ke_target = pe_bind.abs() / 2.0;
+        let alpha = (ke_target / ke).sqrt();
+
+        println!("  KE target     = {:.4e}", ke_target);
+        println!("  Alpha (α)     = {:.6}", alpha);
+
+        // Scale velocities on GPU
+        let mut vel = self.device.dtoh_sync_copy(&self.vel)?;
+        for v in vel.iter_mut() {
+            *v *= alpha as f32;
+        }
+        self.vel = self.device.htod_sync_copy(&vel)?;
+
+        // Verify
+        let ke_after = self.kinetic_energy()?;
+        println!("  KE after      = {:.4e}", ke_after);
+        println!("  Expected α    ≈ 4-6 for proper Janus virialization");
+
+        Ok(())
     }
 
     /// Sum of |acceleration| for diagnostics

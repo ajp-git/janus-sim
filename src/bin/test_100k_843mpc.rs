@@ -1,59 +1,51 @@
-/// Janus 60M TreePM Production Run — Virialized ICs (exact 8M method)
+/// Test 100K with 843 Mpc box (same density as 60M target)
+/// Validates virialize_sampled approach before 60M production run
 ///
-/// Based on validated run_8m_virialized.rs:
-///   - virialize_sampled(10000) → α = √(|PE_bind|/2KE) ≈ 4-6
-///   - Same density as 8M: box scales with N^(1/3)
-///   - TreePM for 60M performance
-///
-/// Parameters:
-///   N = 60_000_000
-///   box = 843.0 Mpc (density = 0.100 part/Mpc³)
-///   softening = 1.0 Mpc (spacing ≈ 2.15 Mpc)
-///   θ = 0.7 (FIX-012 validated)
-///   dt = 0.01
-///   η = 1.045
+/// Expected:
+///   - α ≈ 4-6 (from sampled PE_binding)
+///   - KE/KE₀ < 5 at step 100
+///   - Seg onset at z ≈ 2.4
 
-#[cfg(all(feature = "cuda", feature = "cufft"))]
-use janus::nbody_gpu_twopass::GpuNBodyTwoPass;
-#[cfg(all(feature = "cuda", feature = "cufft"))]
+#[cfg(feature = "cuda")]
+use janus::nbody_gpu::GpuNBodySimulation;
+#[cfg(feature = "cuda")]
 use janus::friedmann::{JanusParams, CosmoInterpolator};
 use std::fs::{self, File};
 use std::io::{Write, BufWriter};
 use std::time::Instant;
 
-const N_PARTICLES: usize = 60_000_000;
-const BOX_SIZE: f64 = 843.0;  // Same density as 8M validated run
-const SOFTENING: f64 = 1.0;   // Adapted to spacing ~2.15 Mpc
+// Same density as 60M/843Mpc target
+// 60M / 843³ = 100K / box³ → box = 843 * (100K/60M)^(1/3) = 843 * 0.1177 = 99.2
+const N_PARTICLES: usize = 100_000;
+const BOX_SIZE: f64 = 99.2;  // Same density as 60M/843Mpc
+const SOFTENING: f64 = 0.118;  // Scale down: 1.0 * (99.2/843) = 0.118
 
 const ETA: f64 = 1.045;
 const THETA: f64 = 0.7;  // FIX-012 validated
 const DT: f64 = 0.01;
 const Z_INIT: f64 = 5.0;
-const MAX_STEPS: usize = 15000;
-const R_CUT: f64 = BOX_SIZE / 16.0;  // PM/Tree splitting scale
+const MAX_STEPS: usize = 500;  // Short test run
 
-#[cfg(all(feature = "cuda", feature = "cufft"))]
+#[cfg(feature = "cuda")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("╔════════════════════════════════════════════════════════════════╗");
-    println!("║   Janus 60M TreePM — Virialized ICs (exact 8M method)          ║");
-    println!("║   virialize_sampled(10000) → α ≈ 4-6                           ║");
+    println!("║   Test 100K @ 843Mpc density — virialize_sampled validation    ║");
     println!("╚════════════════════════════════════════════════════════════════╝\n");
 
     let n_positive = (N_PARTICLES as f64 / (1.0 + ETA)) as usize;
     let n_negative = N_PARTICLES - n_positive;
 
     println!("Parameters:");
-    println!("  N = {} ({:.1}M)", N_PARTICLES, N_PARTICLES as f64 / 1e6);
+    println!("  N = {} ({:.1}K)", N_PARTICLES, N_PARTICLES as f64 / 1e3);
     println!("  N+ = {} ({:.1}%)", n_positive, 100.0 * n_positive as f64 / N_PARTICLES as f64);
     println!("  N- = {} ({:.1}%)", n_negative, 100.0 * n_negative as f64 / N_PARTICLES as f64);
     println!("  η = {}", ETA);
-    println!("  θ = {} (FIX-012 validated)", THETA);
+    println!("  θ = {}", THETA);
     println!("  dt = {}", DT);
-    println!("  box = {:.2} Mpc", BOX_SIZE);
-    println!("  softening = {:.1} Mpc", SOFTENING);
-    println!("  r_cut = {:.1} Mpc (box/16)", R_CUT);
-    println!("  integrator = TreePM Morton + warp-coherent + Hubble");
-    println!("  ICs = virialize_sampled(10000) — exact 8M method");
+    println!("  box = {:.2} Mpc (same density as 60M/843Mpc)", BOX_SIZE);
+    println!("  softening = {:.3} Mpc", SOFTENING);
+    println!("  integrator = BVH + DKD + Hubble friction");
+    println!("  ICs = Virialized (sampled PE_binding, α≈4-6)");
     println!();
 
     // Cosmological expansion
@@ -71,37 +63,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  z_init = {:.2}", z_init_actual);
     println!("  a_init = {:.6}", a_init);
     println!("  H_init = {:.6}", h_init);
-    println!("  τ range = [{:.4}, {:.4}]", cosmo.tau_start, cosmo.tau_end);
     println!("  dτ/dt = {:.6}", dtau_per_dt);
-    println!("  Expected steps to z=0: {}", n_steps_to_z0 as usize);
     println!();
 
     // Output directory
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let output_dir = format!("/app/output/60M_virialized_{}", date);
+    let date = chrono::Local::now().format("%Y-%m-%d_%H%M%S").to_string();
+    let output_dir = format!("/app/output/test_100k_843density_{}", date);
     fs::create_dir_all(&output_dir)?;
-    fs::create_dir_all(format!("{}/snapshots", output_dir))?;
-    fs::create_dir_all(format!("{}/render_data", output_dir))?;
     println!("Output directory: {}\n", output_dir);
 
-    // Create simulation with TreePM (uses default virial_factor=0.3 for initial velocities)
-    println!("Creating TreePM simulation...");
+    // Create simulation with BVH-only (same as validated 8M run)
+    println!("Creating simulation...");
     let t0 = Instant::now();
-    let mut sim = GpuNBodyTwoPass::new(n_positive, n_negative, BOX_SIZE)?;
+    let mut sim = GpuNBodySimulation::new_bvh_only(n_positive, n_negative, BOX_SIZE)?;
     sim.set_theta(THETA);
     sim.set_softening(SOFTENING);
     println!("  Created in {:.2}s\n", t0.elapsed().as_secs_f64());
 
-    // CRITICAL: Apply virialize_sampled(10000) — exact same as 8M validated run
-    // This computes α = √(|PE_bind|/2KE) using sampled same-sign pairs
-    println!("Applying virialize_sampled(10000) — exact 8M method...");
+    // CRITICAL: Use virialize_sampled(10000) exactly like validated 8M run
+    println!("Applying virialize_sampled(10000) — same as 8M validated run...");
     let t0 = Instant::now();
     sim.virialize_sampled(10000)?;
     println!("  Virialized in {:.2}s\n", t0.elapsed().as_secs_f64());
 
     // Initial state
     let ke_init = sim.kinetic_energy()?;
-    let seg_init = sim.segregation()?;
+    let seg_init = sim.segregation_distance()?;
     println!("Initial state (after virialization):");
     println!("  KE₀ = {:.4e}", ke_init);
     println!("  S₀ = {:.6}", seg_init);
@@ -116,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tau = cosmo.tau_start;
     let mut seg_max = seg_init;
 
-    println!("Starting simulation loop...\n");
+    println!("Starting simulation loop (max {} steps)...\n", MAX_STEPS);
     println!("  Step        z     KE/KE₀      Seg     S_max    ms/step");
     println!("---------------------------------------------------------------");
 
@@ -126,13 +113,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (a, h) = cosmo.get_params_at_tau(tau);
         let z = 1.0 / a - 1.0;
 
-        // TreePM step with Hubble friction (Morton + warp-coherent)
-        sim.step_treepm_gpu_morton(DT, R_CUT, h, dtau_per_dt)?;
+        sim.step_with_expansion_dkd_gpu(DT, a, h, dtau_per_dt)?;
         tau += DT * dtau_per_dt;
 
         let step_time = t_step.elapsed().as_millis() as f64;
         let ke = sim.kinetic_energy()?;
-        let seg = sim.segregation()?;
+        let seg = sim.segregation_distance()?;
 
         let ke_ratio = ke / ke_ref;
         seg_max = seg_max.max(seg);
@@ -141,34 +127,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             step, step as f64 * DT, z, a, h, ke, ke_ratio, seg, seg_max, step_time)?;
 
         // Progress
-        if step <= 10 || step % 100 == 0 {
+        if step <= 10 || step % 50 == 0 {
             println!("  {:5}   {:.3}   {:7.4}   {:.4}   {:.4}   {:6.0}",
                 step, z, ke_ratio, seg, seg_max, step_time);
-            ts_file.flush()?;
         }
 
-        // Validation at step 100
+        // Validation checks
         if step == 100 {
             println!("\n=== VALIDATION @ step 100 ===");
             println!("  KE/KE₀ = {:.4} (expected < 5)", ke_ratio);
             if ke_ratio > 5.0 {
-                println!("  FAIL: KE/KE₀ > 5 — physics invalid");
-                println!("  Stopping run.");
-                break;
+                println!("  ❌ FAIL: KE/KE₀ > 5 — physics invalid");
             } else {
-                println!("  PASS: KE/KE₀ < 5 — continuing");
+                println!("  ✓ PASS: KE/KE₀ < 5");
             }
             println!();
         }
 
-        // Stop conditions
         if ke.is_nan() || ke.is_infinite() || ke_ratio > 100.0 {
             println!("\n=== STOPPING: KE explosion (KE/KE₀ = {:.1}) ===", ke_ratio);
             break;
         }
 
         if z < 0.01 {
-            println!("\n=== Reached z ≈ 0, simulation complete ===");
+            println!("\n=== Reached z ≈ 0 ===");
             break;
         }
     }
@@ -176,7 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ts_file.flush()?;
 
     println!("\n═══════════════════════════════════════════════════════════════");
-    println!("Results:");
+    println!("Test complete:");
     println!("  S_max = {:.6}", seg_max);
     println!("  Output: {}", ts_filename);
     println!("═══════════════════════════════════════════════════════════════");
@@ -184,8 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(all(feature = "cuda", feature = "cufft")))]
+#[cfg(not(feature = "cuda"))]
 fn main() {
-    eprintln!("This binary requires --features cuda,cufft");
-    std::process::exit(1);
+    println!("CUDA feature not enabled!");
 }

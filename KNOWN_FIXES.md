@@ -193,48 +193,65 @@ Convention coordonnées : [-L/2, +L/2] (centré)
   - Visualisation : pos += box/2 pour afficher en [0, L]
 ```
 
-### [FIX-013] Limite VRAM RTX 3060 12GB — N_max = 63M particules
+### [FIX-013] Limite VRAM RTX 3060 12GB — BH pur vs TreePM
 ```
-Date validation : 2026-02-28
-Mesure empirique avec test_vram_limit.rs (GPU 100% libre)
+Date validation : 2026-03-02
+Mesure empirique avec test_vram.rs (GPU 100% libre)
 
 ⚠️ IMPORTANT: Tuer tous les processus GPU parasites avant mesure!
    nvidia-smi → sudo kill -9 <pid> pour chaque processus
 
-MESURES RÉELLES (TreePM step complet, GPU clean) :
+═══════════════════════════════════════════════════════════════
+BH PUR (GpuNBodySimulation::new_bvh_only)
+═══════════════════════════════════════════════════════════════
+MESURES (2026-03-02, GPU clean) :
+  N=30M → OK  ✅
+  N=32M → OK  ✅ MAX
+  N=33M → OOM ❌
+  N=35M → OOM ❌
+
+✅ N_max BH pur = 32M particules
+✅ Recommandé production = 30M (marge 5%)
+
+Raison : BH pur construit un arbre COMPLET (~2.5×N nœuds)
+  - Chaque particule dans l'arbre
+  - Pas de coupure r_cut
+  - ~370 bytes/particule
+
+═══════════════════════════════════════════════════════════════
+TreePM (GpuNBodyTwoPass)
+═══════════════════════════════════════════════════════════════
+MESURES (2026-02-28, GPU clean) :
   N=30M →  5.77 GB (188 bytes/particle) ✅
   N=40M →  7.58 GB (190 bytes/particle) ✅
   N=50M →  9.39 GB (189 bytes/particle) ✅
   N=60M → 11.17 GB (188 bytes/particle) ✅
-  N=62M → 11.55 GB (188 bytes/particle) ✅
   N=63M → 11.74 GB (188 bytes/particle) ✅ MAX
-  N=64M → OOM at buffer allocation ❌
-  N=65M → OOM at buffer allocation ❌
+  N=64M → OOM ❌
 
-Formule empirique : VRAM(N) ≈ 0.1 GB + N × 188 bytes
+✅ N_max TreePM = 63M particules
+✅ Recommandé production = 60M (marge 0.8 GB)
 
-Composants mesurés (N=60M) :
-  Particles (pos+vel+sign)    : 2.94 GB
-  Extract buffers             : 0.98 GB
-  Morton sort buffers         : 0.86 GB
-  BVH single-sign (61M nodes) : 3.92 GB
-  cuFFT overhead              : ~0.06 GB (négligeable)
-  Total step peak             : 11.17 GB
+Raison : TreePM construit un arbre PARTIEL (r < r_cut)
+  - Seules les interactions courte portée dans l'arbre
+  - Longue portée via grilles FFT (PM)
+  - ~188 bytes/particule
 
-✅ N_max RTX 3060 12GB = 63M particules
-✅ Recommandé production  = 60M (marge 0.8 GB)
+═══════════════════════════════════════════════════════════════
+PARADOXE RÉSOLU
+═══════════════════════════════════════════════════════════════
+TreePM est PLUS efficace en mémoire que BH pur pour grand N :
+  - BH pur  : arbre complet ~370 bytes/particule → N_max = 32M
+  - TreePM  : arbre partiel ~188 bytes/particule → N_max = 63M
 
-Performance @ 60M: ~30s/step → 100h (4.2 jours) pour 12000 steps
+MAIS TreePM introduit discontinuité de force à r_cut qui
+destabilise certaines configurations (KE explosion step ~15).
 
-❌ 64M+ : CUDA_ERROR_OUT_OF_MEMORY au GPU buffer allocation
-❌ 85M  : impossible sur RTX 3060 (nécessite ~16 GB)
+Choix selon priorité :
+  - Stabilité garantie  → BH pur (N ≤ 30M)
+  - Maximum N           → TreePM (N ≤ 60M, si stable)
 
-Pour 85M : nécessite GPU 16GB+ (RTX 4080, A4000)
-Pour 100M+ : nécessite GPU 24GB+ (RTX 4090, A5000, A100)
-
-Note IC génération :
-  FFT Zel'dovich utilise CPU RAM (rustfft), pas VRAM
-  60M : grille 391³ ≈ 0.5 GB × 3 champs = 1.5 GB CPU RAM → OK
+Performance @ 30M BH pur: estimé ~5s/step → 17h pour 12000 steps
 ```
 
 ---

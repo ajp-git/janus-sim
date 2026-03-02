@@ -193,6 +193,46 @@ Notes:
 
 ---
 
+## Killed Runs
+
+### Run: 30M_bh_pure
+Date: 2026-03-02
+Status: **killed** (step 2130, z=2.55)
+
+Parameters:
+  N particles: 30,000,000
+  eta: 1.045
+  z_init: 5.0
+  theta: 0.7
+  dt: 0.01
+  steps: 12000
+  box_size: 690.0 Mpc
+  softening: 0.1 Mpc
+  integrator: Pure Barnes-Hut (step_with_expansion_dkd_gpu)
+
+  **ICs: Uniform + virialize_sampled(10000)**
+
+Results at kill:
+  - Step: 2130 (z = 2.55)
+  - KE/KE₀ = 1.75
+  - Seg = 0.029
+  - Runtime: ~8 hours (~13.6s/step)
+
+**Why killed:** No added value vs 8M run
+  - Similar behavior to 8M but 4× slower
+  - VRAM-limited to 32M max (BH pure uses ~370 bytes/particle)
+  - TreePM allows 60M+ but is unstable (FIX-013)
+
+Data preserved:
+  - time_series.csv → /mnt/T2/janus-sim/output/30M_partial_killed.csv
+  - render_data: 106 .bin files (steps 0-2100)
+  - frames: 106 × 2 formats (25d + dens)
+  - videos: janus_30m_25d.mp4, janus_30m_dens.mp4
+
+Binary: src/bin/janus_30m_bh.rs
+
+---
+
 ## Current Run
 
 ### Run: janus_60m_final

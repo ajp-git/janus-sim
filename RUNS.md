@@ -195,7 +195,52 @@ Notes:
 
 ## Current Run
 
-### Run: 85M_treepm_production (FINAL)
+### Run: janus_60m_final
+Date: 2026-03-02
+Status: **running**
+
+Parameters:
+  N particles: 60,000,000
+  eta: 1.045
+  z_init: 5.0
+  theta: 0.7 (FIX-012 validated)
+  r_cut: box/16 (52.7 Mpc)
+  dt: 0.01
+  steps: 12000
+  box_size: 843.0 Mpc
+  softening: 1.0 Mpc
+  integrator: TreePM (step_treepm_gpu_morton)
+  kernel: Morton + warp-coherent
+
+  **ICs: Uniform + virialize_sampled(10000)**
+    - Positions: uniform random
+    - Velocities: uniform random, scaled by α from PE_binding
+    - α = √(|PE_bind|/2KE) ≈ 4-6 (same as validated 8M run)
+
+Validation:
+  - test_100k_843mpc.rs: KE/KE₀ = 0.95 @ step 100 ✅ (expected < 5)
+  - Commit: ac2fe4e (fix(60M): Use exact 8M virialization method)
+
+Output:
+  - Log: /mnt/T2/janus-sim/output/janus_60m_final.log
+  - Data: /app/output/60M_virialized_2026-03-02/
+  - time_series.csv updated every step
+
+Expected Performance:
+  - ~50s/step (TreePM Morton + warp-coherent)
+  - Total runtime: ~7 days on RTX 3060
+
+Binary: src/bin/janus_60m_treepm.rs
+Container: janus-sim-dev-run-bcd418cb5446
+
+Notes:
+  - First 60M run with correct virialization (same as 8M validated)
+  - Previous attempts failed: Zel'dovich α=127, virial_factor=0.8 → KE explosion
+  - **DO NOT TOUCH unless emergency**
+
+---
+
+### Run: 85M_treepm_production (SUPERSEDED)
 Date: 2026-02-28
 Status: **ready to launch** (Zel'dovich ICs validated)
 

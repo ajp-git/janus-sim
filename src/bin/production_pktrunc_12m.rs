@@ -24,9 +24,9 @@ const L_BOX: f64 = 492.0;          // Mpc (n_side × 2.15 = 492.35)
 const Z_INIT: f64 = 5.0;
 const SOFTENING: f64 = 0.65;       // Mpc
 
-// P(k) truncation
-const K_MIN: f64 = 2.0 * PI / 150.0;   // suppress λ > 150 Mpc
-const K_MAX: f64 = 2.0 * PI / 15.0;    // suppress λ < 15 Mpc
+// P(k) truncation — v2 fenêtre élargie
+const K_MIN: f64 = 2.0 * PI / 200.0;   // suppress λ > 200 Mpc
+const K_MAX: f64 = 2.0 * PI / 8.0;     // suppress λ < 8 Mpc
 
 // Simulation parameters
 const DT: f64 = 0.01;
@@ -348,7 +348,7 @@ fn main() {
     println!("═══════════════════════════════════════════════════════════\n");
 
     let seed = 42u64;
-    let output_dir = "/app/output/production_pktrunc_12m";
+    let output_dir = "/app/output/production_pktrunc_12m_v2";
     let snapshots_dir = format!("{}/snapshots", output_dir);
     fs::create_dir_all(&snapshots_dir).expect("Failed to create snapshots dir");
 

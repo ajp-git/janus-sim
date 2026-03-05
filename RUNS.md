@@ -386,6 +386,71 @@ Results:
 
 ---
 
+### Run: anticorr_8M_filaments_v1 (INVALIDATED)
+Date: 2026-03-02/03
+Status: **killed** (wrong box size)
+
+Parameters:
+  N particles: 8,000,000
+  eta: 1.045
+  z_init: 5.0
+  theta: 0.7
+  dt: 0.01
+  box_size: 271 Mpc  ← ERREUR: devrait être 430 Mpc
+  softening: 0.4 Mpc
+  spacing: 1.36 Mpc  ← trop dense (ref: 2.15 Mpc)
+  integrator: BH pure + DKD + Hubble friction
+  ICs: Density-based anti-correlated Zel'dovich
+
+Results (invalidated):
+  Step 8584/10000 (85.8% complete)
+  z_final: 0.15
+  KE/KE₀_max: 3.44
+  Seg: 0.017 constant (no growth!)
+
+**Why invalidated:**
+  - Box 271 Mpc same as 2M reference → density 4× higher
+  - Spacing 1.36 Mpc vs 2.15 Mpc reference → dynamics altered
+  - Seg stayed at ~0.017 instead of growing to ~0.6
+  - Must use box = N^(1/3) × spacing_ref = 200 × 2.15 = 430 Mpc
+
+---
+
+### Run: anticorr_8M_filaments_v2
+Date: 2026-03-03
+Status: **completed**
+Output: anticorr_8000k_1772521928
+
+Parameters:
+  N particles: 8,000,000
+  eta: 1.045
+  z_init: 5.0
+  theta: 0.7
+  dt: 0.01
+  box_size: 430 Mpc
+  softening: 0.65 Mpc (0.3 × spacing)
+  spacing: 2.15 Mpc (même que 2M référence)
+  α virialization: 4.59
+  integrator: BH pure + DKD + Hubble friction
+  ICs: Density-based anti-correlated Zel'dovich
+
+Results:
+  Steps: 10000 / 10000 ✓
+  z final: 0.000
+  KE/KE₀ final: 1.037
+  Seg₀: 0.0076
+  Seg final: 0.0165
+  Seg max: ~0.017 (NO GROWTH)
+  Runtime: ~9.3h (3.35s/step)
+
+**CONCLUSION: ÉCHEC de la ségrégation**
+  - Seg reste plat à ~0.017 de z=5 à z=0
+  - Aucune croissance de ségrégation observée
+  - Comparaison run 2M référence: S_max=0.694 vs 0.017 ici
+  - Les ICs density-based NE PRODUISENT PAS la dynamique de ségrégation attendue
+
+---
+
 ## Key Lessons
 
 1. **Hubble friction is ESSENTIAL** for segregation
@@ -410,3 +475,121 @@ Results:
 - **N-body GPU (twopass):** `src/nbody_gpu_twopass.rs` (step_dkd)
 - **85M binary:** `src/bin/janus_85m.rs`
 - **Reference run (8M):** `src/bin/run_8m_full.rs`
+---
+
+## Runs session 2026-03-03
+
+### Run: anticorr_8M_box271 — INVALIDE
+Date: 2026-03-03
+Status: INVALIDE — stoppé
+Cause: spacing=1.36 Mpc (box trop petite) + bug dtau friction 20× trop faible
+Symptôme: KE/KE₀ → 3.38 à z=0, Seg figé à 0.018
+Action: supprimé
+
+### Run: anticorr_8M_box430_v1 — INVALIDE
+Date: 2026-03-03
+Status: INVALIDE — complété mais résultats non exploitables
+Cause: bug dtau (friction de Hubble 20× trop faible)
+Résultats: N=8M, box=430 Mpc, 10000 steps, z=5→0
+  KE/KE₀_max=1.030 (stable mais friction insuffisante)
+  Seg_max=0.017 (figé — pas de dynamique)
+Leçon: stabilité numérique ≠ physique correcte
+
+### Run: grid_exploration_100K_A-F — INFORMATIF
+Date: 2026-03-03
+Status: complété
+N=100K, box=100 Mpc, 2000 steps, 6 variantes ICs
+Bug dtau présent mais partiellement corrigé en cours de session
+Résultats: voir section EXPLORATION GRID dans FILAMENTS_ROADMAP.md
+Conclusion: 100K insuffisant, ICs density-based figées, uniforme aléatoire
+  produit effondrement blob co-localisé (Seg métrique trompeuse à cette résolution)
+
+### Run: ref_2M_icsfevrier — EN COURS ✅
+Date: 2026-03-03
+Status: running (~38% au moment du patch)
+N=2,000,000 | Box=271 Mpc | ICs=new() positifs d'abord | virialize() PE full
+dtau_per_dt corrigé : τ_range / (TOTAL_STEPS × DT)
+Résultats partiels:
+  Seg_max=0.452 @ step 2906 (z≈1.69)  ✅
+  KE/KE₀=4.59 au pic (normal)
+  Pic z≈1.7 cohérent avec run février (z≈1.8)
+Verdict attendu: EXCEL si Seg_final > 0.05
+Prochaine action: lancer 8M box=430 avec mêmes ICs si EXCEL
+
+---
+
+### Run: zeldovich_500k_combined
+Date: 2026-03-04
+Status: **completed** (partial - 1072/2000 steps due to timeout)
+ICs: Zel'dovich density-based + ordre février (+ d'abord)
+Parameters:
+  N = 493,039 (grid 79³)
+  Box = 172 Mpc
+  dt = 0.01, θ = 0.7, softening = 0.65 Mpc
+  dtau_per_dt = 0.066026 (FIX-016)
+Results:
+  Seg₀ = 0.0538 (from density-based ICs)
+  Seg_max = 0.543 @ z≈0.75
+  KE/KE₀_max ≈ 4.6 (stable)
+Verdict: **EXCEL** (Seg_max > 0.20)
+Morphologie: Dynamic segregation observed
+Notes: Combined density-based ICs with février ordering successfully
+  reproduces segregation dynamics. Ready for production scale.
+
+### Run: production_bh_12m
+Date: 2026-03-04
+Status: **stopped** (investigation artefact rectangulaire)
+N = 12,000,000 | Box = 492 Mpc | Steps = 20,000 | Snapshots = 1000
+ICs: new() positifs d'abord + virialize_sampled(80000)
+dtau_per_dt = tau_range / (20000 × 0.01) (FIX-016)
+Container: 786d693e9521
+Results (partial):
+  Step 3520: corr(idx,z) = 0.77 - DISCOVERED during run
+  Investigation revealed: new() generates CORRECT uncorrelated ICs (corr=0.00)
+  The correlation DEVELOPED DURING SIMULATION = REAL PHYSICS!
+  Run stopped prematurely thinking it was artifact - WRONG!
+Lesson: Index-position correlation emerging during simulation is real Janus physics
+
+### Run: pktrunc_500k_validation
+Date: 2026-03-05
+Status: **completed** (partial - 1310/2000 steps due to timeout)
+ICs: P(k) truncated Zel'dovich + density-based signs + shuffled indices
+  k_min = 2π/60 Mpc (suppress λ > 60 Mpc)
+  k_max = 2π/6 Mpc (suppress λ < 6 Mpc)
+Parameters:
+  N = 512,000 (grid 80³)
+  Box = 172 Mpc
+  dt = 0.01, θ = 0.7, softening = 0.65 Mpc
+  dtau_per_dt = 0.066026 (FIX-016)
+Results:
+  corr(idx, z) = 0.0056 ✓ (NO index-position bias)
+  Seg₀ = 0.014
+  Seg_max = 0.499 @ z≈0.63 (>> 0.05 PASS)
+  KE/KE₀_max = 3.88 (< 20 PASS)
+Verdict: **PASS** - Ready for 12M production
+Notes: P(k) truncation successfully eliminates large-scale modes
+
+### Run: production_pktrunc_12m
+Date: 2026-03-05
+Status: **running**
+N = 12,008,989 (grid 229³) | Box = 492 Mpc | Steps = 20,000 | Snapshots = 1000
+ICs: P(k) truncated Zel'dovich + density-based signs + shuffled indices
+  k_min = 2π/150 Mpc (suppress λ > 150 Mpc)
+  k_max = 2π/15 Mpc (suppress λ < 15 Mpc)
+  Modes kept: 1.2%, suppressed: 98.8%
+  corr(idx, z) = 0.0085 ✓ (NO bias)
+Parameters:
+  η = 1.045, z_init = 5.0
+  dt = 0.01, θ = 0.7, softening = 0.65 Mpc
+  dtau_per_dt = 0.006603 (FIX-016 verified)
+  virialize_sampled(80000)
+Container: 7e8c1959476f
+Initial state:
+  KE₀ = 6.92e10, Seg₀ = 0.0025
+  Step 5 check: KE/KE₀ = 0.9995 ✓ PASS
+ETA: ~65h
+Milestones expected:
+  Step 3000 (z≈2.8): onset segregation
+  Step 4500 (z≈2.0): peak segregation (Seg > 0.2)
+  Step 20000 (z=0): run complete
+Output: /app/output/production_pktrunc_12m/

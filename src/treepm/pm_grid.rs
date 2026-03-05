@@ -117,6 +117,19 @@ impl PmGrid {
     ///   G_pm(k) = -4πG/k² * exp(-k²r_s²)
     /// This suppresses short-range forces (high k), leaving only long-range.
     pub fn solve_poisson_with_splitting(&mut self, g_constant: f64, r_s: Option<f64>) {
+        self.solve_poisson_filtered(g_constant, r_s, None);
+    }
+
+    /// Solve Poisson with k_min filter to suppress large-scale modes (dipole, etc.)
+    ///
+    /// k_min: minimum k mode to keep (modes with |k| < k_min are zeroed)
+    /// Use k_min = 2 to remove dipole (k=1) and monopole (k=0)
+    pub fn solve_poisson_with_k_filter(&mut self, g_constant: f64, k_min: usize) {
+        self.solve_poisson_filtered(g_constant, None, Some(k_min));
+    }
+
+    /// Core Poisson solver with optional r_s splitting and k_min filter
+    fn solve_poisson_filtered(&mut self, g_constant: f64, r_s: Option<f64>, k_min: Option<usize>) {
         let n = self.grid_size;
         let n3 = n * n * n;
 
@@ -184,7 +197,20 @@ impl PmGrid {
 
                         let k2 = (ki * ki + kj * kj + kk * kk) * dk * dk;
 
-                        if k2 > 1e-10 {
+                        // Compute |k| in grid units (integer distance from origin)
+                        let k_int = (ki.abs() as usize).max(kj.abs() as usize).max(kk.abs() as usize);
+
+                        // Filter: zero out modes with |k| < k_min
+                        let filtered = if let Some(kmin) = k_min {
+                            k_int < kmin
+                        } else {
+                            k2 < 1e-10  // Only filter k=0 if no k_min specified
+                        };
+
+                        if filtered {
+                            // Zero out this mode (monopole, dipole, etc.)
+                            data[idx] = Complex64::new(0.0, 0.0);
+                        } else if k2 > 1e-10 {
                             // G(k) = -4πG / k²
                             let mut green = -4.0 * PI * g_constant / k2;
 
@@ -195,7 +221,6 @@ impl PmGrid {
 
                             data[idx] *= green;
                         } else {
-                            // k=0 mode: set to zero (removes mean)
                             data[idx] = Complex64::new(0.0, 0.0);
                         }
                     }

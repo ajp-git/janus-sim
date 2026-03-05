@@ -555,3 +555,40 @@ required-features = ["cuda", "cufft"]
 name = "test_zeldovich_pure"
 path = "src/bin/test_zeldovich_pure.rs"
 required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "test_double_box"
+path = "src/bin/test_double_box.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "filaments_12m"
+path = "src/bin/filaments_12m.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "filaments_18m"
+path = "src/bin/filaments_18m.rs"
+required-features = ["cuda"]
+
+
+[[bin]]
+name = "test_kfilter_512k"
+path = "src/bin/test_kfilter_512k.rs"
+
+
+[[bin]]
+name = "test_nodipole_512k"
+path = "src/bin/test_nodipole_512k.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_nodipole_gpu_512k"
+path = "src/bin/test_nodipole_gpu_512k.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "nodipole_zeldovich_4m"
+path = "src/bin/nodipole_zeldovich_4m.rs"
+required-features = ["cuda", "cufft"]
+

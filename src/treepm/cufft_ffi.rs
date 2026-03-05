@@ -26,6 +26,13 @@ extern "C" {
         box_size: f64, g_constant: f64, r_s: f64,
     ) -> i32;
 
+    /// Apply Green's function with k_min filter
+    fn cufft_apply_green_filtered(
+        d_data: *mut c_void,
+        nx: i32, ny: i32, nz: i32,
+        box_size: f64, g_constant: f64, r_s: f64, k_min: i32,
+    ) -> i32;
+
     /// Allocate GPU memory
     fn cufft_alloc(size_bytes: usize) -> *mut c_void;
 
@@ -50,6 +57,14 @@ extern "C" {
         d_phi: *mut f64,
         nx: i32, ny: i32, nz: i32,
         box_size: f64, g_constant: f64, r_s: f64,
+    ) -> i32;
+
+    /// Solve Poisson with k_min filter
+    fn cufft_solve_device_filtered(
+        d_rho: *mut f64,
+        d_phi: *mut f64,
+        nx: i32, ny: i32, nz: i32,
+        box_size: f64, g_constant: f64, r_s: f64, k_min: i32,
     ) -> i32;
 }
 
@@ -183,6 +198,80 @@ impl CuFFTPoisson {
         Ok(phi)
     }
 
+    /// Solve Poisson equation with k_min filter to suppress large-scale modes
+    ///
+    /// # Arguments
+    /// * `rho` - Density grid (host memory)
+    /// * `g_constant` - Gravitational constant
+    /// * `r_s` - Gaussian splitting scale (0 for no splitting)
+    /// * `k_min` - Minimum k index to keep (3 = filter k=0,1,2)
+    pub fn solve_filtered(&mut self, rho: &[f64], g_constant: f64, r_s: f64, k_min: usize) -> Result<Vec<f64>, String> {
+        let n_real = self.nx * self.ny * self.nz;
+
+        if rho.len() != n_real {
+            return Err(format!("Input size mismatch: {} vs {}", rho.len(), n_real));
+        }
+
+        // Copy density to GPU
+        let ret = unsafe {
+            cufft_copy_h2d(
+                self.d_rho as *mut c_void,
+                rho.as_ptr() as *const c_void,
+                n_real * 8,
+            )
+        };
+        if ret != 0 {
+            return Err("H2D copy failed".to_string());
+        }
+
+        // Forward FFT: rho -> rho_k
+        let ret = unsafe { cufft_exec_r2c(self.d_rho, self.d_rho_k) };
+        if ret != 0 {
+            return Err("Forward FFT failed".to_string());
+        }
+
+        // Apply Green's function with k_min filter
+        let ret = unsafe {
+            cufft_apply_green_filtered(
+                self.d_rho_k,
+                self.nx as i32, self.ny as i32, self.nz as i32,
+                self.box_size, g_constant, r_s, k_min as i32,
+            )
+        };
+        if ret != 0 {
+            return Err("Green's function failed".to_string());
+        }
+
+        // Inverse FFT: phi_k -> phi
+        let ret = unsafe { cufft_exec_c2r(self.d_rho_k, self.d_phi) };
+        if ret != 0 {
+            return Err("Inverse FFT failed".to_string());
+        }
+
+        // Normalize
+        let ret = unsafe {
+            cufft_normalize(self.d_phi, self.nx as i32, self.ny as i32, self.nz as i32)
+        };
+        if ret != 0 {
+            return Err("Normalization failed".to_string());
+        }
+
+        // Copy result back to host
+        let mut phi = vec![0.0f64; n_real];
+        let ret = unsafe {
+            cufft_copy_d2h(
+                phi.as_mut_ptr() as *mut c_void,
+                self.d_phi as *const c_void,
+                n_real * 8,
+            )
+        };
+        if ret != 0 {
+            return Err("D2H copy failed".to_string());
+        }
+
+        Ok(phi)
+    }
+
     /// Memory usage in bytes
     pub fn memory_bytes(&self) -> usize {
         let n_real = self.nx * self.ny * self.nz;
@@ -214,6 +303,35 @@ pub unsafe fn solve_device(
     );
     if ret != 0 {
         return Err("cufft_solve_device failed".to_string());
+    }
+    Ok(())
+}
+
+/// Solve Poisson equation with k_min filter (suppresses large-scale modes)
+///
+/// # Arguments
+/// * `k_min` - Minimum k index to keep. Use 3 to filter out k=0,1,2 (dipole suppression)
+///
+/// # Safety
+/// Caller must ensure d_rho and d_phi are valid device pointers to
+/// grid_size³ f64 arrays.
+#[cfg(feature = "cufft")]
+pub unsafe fn solve_device_filtered(
+    d_rho: *mut f64,
+    d_phi: *mut f64,
+    grid_size: usize,
+    box_size: f64,
+    g_constant: f64,
+    r_s: f64,
+    k_min: usize,
+) -> Result<(), String> {
+    let ret = cufft_solve_device_filtered(
+        d_rho, d_phi,
+        grid_size as i32, grid_size as i32, grid_size as i32,
+        box_size, g_constant, r_s, k_min as i32,
+    );
+    if ret != 0 {
+        return Err("cufft_solve_device_filtered failed".to_string());
     }
     Ok(())
 }

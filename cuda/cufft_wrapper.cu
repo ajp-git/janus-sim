@@ -33,6 +33,20 @@ static int plan_nx = 0, plan_ny = 0, plan_nz = 0;
 
 extern "C" {
 
+// Forward declarations
+int cufft_apply_green_filtered(
+    cufftDoubleComplex* d_data,
+    int nx, int ny, int nz,
+    double box_size, double g_constant, double r_s, int k_min
+);
+
+int cufft_solve_device_filtered(
+    double* d_rho,
+    double* d_phi,
+    int nx, int ny, int nz,
+    double box_size, double g_constant, double r_s, int k_min
+);
+
 /**
  * Initialize cuFFT plans for 3D grid
  *
@@ -121,16 +135,20 @@ void cufft_cleanup() {
  *
  * phi_k = -4*pi*G / k² * rho_k * exp(-k²*r_s²)
  *
+ * With optional k_min filter: modes with max(|kx|,|ky|,|kz|) < k_min are zeroed.
+ * This suppresses large-scale modes (dipole, etc.)
+ *
  * @param d_rho_k: Input density in k-space (modified in place to phi_k)
  * @param nx, ny, nz: Grid dimensions
  * @param dk: k-space spacing (2*pi / box_size)
  * @param g_constant: Gravitational constant
  * @param r_s: Gaussian splitting scale (0 for no splitting)
+ * @param k_min: Minimum k index to keep (0 = no filter, 3 = filter k=0,1,2)
  */
 __global__ void apply_green_kernel(
     cufftDoubleComplex* d_data,
     int nx, int ny, int nz,
-    double dk, double g_constant, double r_s
+    double dk, double g_constant, double r_s, int k_min
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int nz_complex = nz / 2 + 1;
@@ -143,11 +161,29 @@ __global__ void apply_green_kernel(
     int ky = (idx / nz_complex) % ny;
     int kx = idx / (nz_complex * ny);
 
-    // Compute k values with correct Nyquist handling
-    double kx_val = (kx <= nx/2) ? kx * dk : (kx - nx) * dk;
-    double ky_val = (ky <= ny/2) ? ky * dk : (ky - ny) * dk;
-    double kz_val = kz * dk;  // R2C: kz only goes to nz/2
+    // Compute integer k indices (handle negative frequencies)
+    int kx_idx = (kx <= nx/2) ? kx : kx - nx;
+    int ky_idx = (ky <= ny/2) ? ky : ky - ny;
+    int kz_idx = kz;  // R2C: kz only goes to nz/2
 
+    // k_max = max(|kx|, |ky|, |kz|) for this mode
+    int kx_abs = (kx_idx >= 0) ? kx_idx : -kx_idx;
+    int ky_abs = (ky_idx >= 0) ? ky_idx : -ky_idx;
+    int kz_abs = (kz_idx >= 0) ? kz_idx : -kz_idx;
+    int k_max = (kx_abs > ky_abs) ? kx_abs : ky_abs;
+    k_max = (k_max > kz_abs) ? k_max : kz_abs;
+
+    // Filter: zero out modes with k_max < k_min (removes dipole, etc.)
+    if (k_max < k_min) {
+        d_data[idx].x = 0.0;
+        d_data[idx].y = 0.0;
+        return;
+    }
+
+    // Compute k values
+    double kx_val = kx_idx * dk;
+    double ky_val = ky_idx * dk;
+    double kz_val = kz_idx * dk;
     double k2 = kx_val * kx_val + ky_val * ky_val + kz_val * kz_val;
 
     // Skip DC component
@@ -172,12 +208,25 @@ __global__ void apply_green_kernel(
 }
 
 /**
- * Launch Green's function kernel
+ * Launch Green's function kernel (with k_min filter)
+ *
+ * @param k_min: Minimum k index to keep. Use 0 for no filter, 3 to remove k=0,1,2.
  */
 int cufft_apply_green(
     cufftDoubleComplex* d_data,
     int nx, int ny, int nz,
     double box_size, double g_constant, double r_s
+) {
+    return cufft_apply_green_filtered(d_data, nx, ny, nz, box_size, g_constant, r_s, 0);
+}
+
+/**
+ * Launch Green's function kernel with k_min filter
+ */
+int cufft_apply_green_filtered(
+    cufftDoubleComplex* d_data,
+    int nx, int ny, int nz,
+    double box_size, double g_constant, double r_s, int k_min
 ) {
     int nz_complex = nz / 2 + 1;
     int total = nx * ny * nz_complex;
@@ -187,7 +236,7 @@ int cufft_apply_green(
 
     double dk = 2.0 * 3.14159265358979323846 / box_size;
 
-    apply_green_kernel<<<blocks, threads>>>(d_data, nx, ny, nz, dk, g_constant, r_s);
+    apply_green_kernel<<<blocks, threads>>>(d_data, nx, ny, nz, dk, g_constant, r_s, k_min);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     return 0;
@@ -290,6 +339,20 @@ int cufft_solve_device(
     int nx, int ny, int nz,
     double box_size, double g_constant, double r_s
 ) {
+    return cufft_solve_device_filtered(d_rho, d_phi, nx, ny, nz, box_size, g_constant, r_s, 0);
+}
+
+/**
+ * Solve Poisson with k_min filter to suppress large-scale modes
+ *
+ * @param k_min: Minimum k index to keep (0 = no filter, 3 = filter k=0,1,2)
+ */
+int cufft_solve_device_filtered(
+    double* d_rho,
+    double* d_phi,
+    int nx, int ny, int nz,
+    double box_size, double g_constant, double r_s, int k_min
+) {
     // Ensure plans exist
     if (plan_r2c == 0) {
         int ret = cufft_init_3d(nx, ny, nz);
@@ -314,11 +377,11 @@ int cufft_solve_device(
     CUFFT_CHECK(cufftExecD2Z(plan_r2c, d_phi, internal_kspace));
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Apply Green's function
+    // Apply Green's function with k_min filter
     double dk = 2.0 * 3.14159265358979323846 / box_size;
     int threads = 256;
     int blocks = (n_complex + threads - 1) / threads;
-    apply_green_kernel<<<blocks, threads>>>(internal_kspace, nx, ny, nz, dk, g_constant, r_s);
+    apply_green_kernel<<<blocks, threads>>>(internal_kspace, nx, ny, nz, dk, g_constant, r_s, k_min);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Inverse FFT: k-space -> phi

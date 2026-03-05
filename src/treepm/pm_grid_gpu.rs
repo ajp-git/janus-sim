@@ -1,105 +1,85 @@
 //! GPU-accelerated PM Grid using cuFFT
 //!
-//! Uses cudarc + cuFFT for GPU-accelerated Poisson solver.
-//! Falls back to CPU if CUDA not available.
+//! Complete implementation with:
+//! - Forward FFT (D2Z): rho -> rho_k
+//! - Green's function with k_min filter
+//! - Inverse FFT (Z2D): phi_k -> phi
+//! - CIC force interpolation
 
-#[cfg(feature = "cuda")]
-use cudarc::cufft::{CudaComplex64, CudaFFTPlan, CudaFFTDirection};
-#[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaSlice, DeviceRepr, LaunchConfig, LaunchAsync};
-#[cfg(feature = "cuda")]
-use std::sync::Arc;
+#[cfg(feature = "cufft")]
+use super::cufft_ffi::CuFFTPoisson;
 
-use rustfft::num_complex::Complex64;
 use std::f64::consts::PI;
 
-/// GPU-accelerated PM Grid
-#[cfg(feature = "cuda")]
+/// GPU-accelerated PM Grid with k_min filter support
+#[cfg(feature = "cufft")]
 pub struct PmGridGpu {
     pub grid_size: usize,
     pub box_size: f64,
     pub cell_size: f64,
 
-    // GPU device
-    device: Arc<CudaDevice>,
+    // cuFFT Poisson solver (separate for + and -)
+    solver_plus: CuFFTPoisson,
+    solver_minus: CuFFTPoisson,
 
-    // GPU buffers for density (f64)
-    rho_plus_d: CudaSlice<f64>,
-    rho_minus_d: CudaSlice<f64>,
+    // Host buffers for density and potential
+    pub rho_plus: Vec<f64>,
+    pub rho_minus: Vec<f64>,
+    pub phi_plus: Vec<f64>,
+    pub phi_minus: Vec<f64>,
 
-    // GPU buffers for complex FFT
-    rho_plus_k: CudaSlice<CudaComplex64>,
-    rho_minus_k: CudaSlice<CudaComplex64>,
-
-    // GPU buffers for potential
-    phi_plus_d: CudaSlice<f64>,
-    phi_minus_d: CudaSlice<f64>,
-
-    // FFT plans
-    fft_plan: CudaFFTPlan,
+    // k-space filter: modes with |k_idx| < k_min are zeroed
+    k_min: usize,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cufft")]
 impl PmGridGpu {
     /// Create new GPU PM grid
-    pub fn new(grid_size: usize, box_size: f64) -> Result<Self, Box<dyn std::error::Error>> {
-        let device = CudaDevice::new(0)?;
+    /// k_min: minimum k index to keep (use 3 to filter k=0,1,2)
+    pub fn new(grid_size: usize, box_size: f64, k_min: usize) -> Result<Self, Box<dyn std::error::Error>> {
         let n3 = grid_size * grid_size * grid_size;
-        let n3_complex = grid_size * grid_size * (grid_size / 2 + 1);  // R2C output size
 
-        // Allocate GPU buffers
-        let rho_plus_d = device.alloc_zeros::<f64>(n3)?;
-        let rho_minus_d = device.alloc_zeros::<f64>(n3)?;
-        let rho_plus_k = device.alloc_zeros::<CudaComplex64>(n3_complex)?;
-        let rho_minus_k = device.alloc_zeros::<CudaComplex64>(n3_complex)?;
-        let phi_plus_d = device.alloc_zeros::<f64>(n3)?;
-        let phi_minus_d = device.alloc_zeros::<f64>(n3)?;
-
-        // Create 3D R2C FFT plan
-        let fft_plan = CudaFFTPlan::new_3d(
-            &device,
-            grid_size as i32,
-            grid_size as i32,
-            grid_size as i32,
-            cudarc::cufft::CudaFFTType::D2Z,  // Double precision Real to Complex
-        )?;
+        // Create two cuFFT solvers (one for each density field)
+        let solver_plus = CuFFTPoisson::new(grid_size, box_size)
+            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
+        let solver_minus = CuFFTPoisson::new(grid_size, box_size)
+            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
 
         Ok(Self {
             grid_size,
             box_size,
             cell_size: box_size / grid_size as f64,
-            device,
-            rho_plus_d,
-            rho_minus_d,
-            rho_plus_k,
-            rho_minus_k,
-            phi_plus_d,
-            phi_minus_d,
-            fft_plan,
+            solver_plus,
+            solver_minus,
+            rho_plus: vec![0.0; n3],
+            rho_minus: vec![0.0; n3],
+            phi_plus: vec![0.0; n3],
+            phi_minus: vec![0.0; n3],
+            k_min,
         })
     }
 
     /// Clear density grids
-    pub fn clear(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let n3 = self.grid_size * self.grid_size * self.grid_size;
-        let zeros = vec![0.0f64; n3];
-        self.device.htod_sync_copy_into(&zeros, &mut self.rho_plus_d)?;
-        self.device.htod_sync_copy_into(&zeros, &mut self.rho_minus_d)?;
-        Ok(())
+    pub fn clear(&mut self) {
+        self.rho_plus.fill(0.0);
+        self.rho_minus.fill(0.0);
     }
 
-    /// Assign mass to grid (CPU side, then upload)
-    pub fn assign_mass_batch(&mut self, particles: &[(f64, f64, f64, f64, i8)]) -> Result<(), Box<dyn std::error::Error>> {
+    /// CIC mass assignment for a batch of particles
+    pub fn assign_mass(&mut self, positions: &[f64], signs: &[i8], mass: f64) {
         let n = self.grid_size;
-        let n3 = n * n * n;
         let half = self.box_size / 2.0;
         let gs = n as f64;
+        let n_particles = signs.len();
 
-        // CPU-side CIC assignment
-        let mut rho_plus = vec![0.0f64; n3];
-        let mut rho_minus = vec![0.0f64; n3];
+        self.clear();
 
-        for &(x, y, z, mass, sign) in particles {
+        for i in 0..n_particles {
+            let x = positions[i * 3 + 0];
+            let y = positions[i * 3 + 1];
+            let z = positions[i * 3 + 2];
+            let sign = signs[i];
+
             let gx = ((x + half) / self.box_size * gs).rem_euclid(gs);
             let gy = ((y + half) / self.box_size * gs).rem_euclid(gs);
             let gz = ((z + half) / self.box_size * gs).rem_euclid(gs);
@@ -116,7 +96,7 @@ impl PmGridGpu {
             let wy = [1.0 - fy, fy];
             let wz = [1.0 - fz, fz];
 
-            let grid = if sign > 0 { &mut rho_plus } else { &mut rho_minus };
+            let grid = if sign > 0 { &mut self.rho_plus } else { &mut self.rho_minus };
 
             for di in 0..2 {
                 for dj in 0..2 {
@@ -130,87 +110,151 @@ impl PmGridGpu {
                 }
             }
         }
+    }
 
-        // Upload to GPU
-        self.device.htod_sync_copy_into(&rho_plus, &mut self.rho_plus_d)?;
-        self.device.htod_sync_copy_into(&rho_minus, &mut self.rho_minus_d)?;
+    /// Solve Poisson equation using GPU FFT with k_min filter
+    pub fn solve_poisson(&mut self, g_constant: f64) -> Result<(), Box<dyn std::error::Error>> {
+        // Solve for positive density
+        self.phi_plus = self.solver_plus.solve_filtered(&self.rho_plus, g_constant, 0.0, self.k_min)
+            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
+
+        // Solve for negative density
+        self.phi_minus = self.solver_minus.solve_filtered(&self.rho_minus, g_constant, 0.0, self.k_min)
+            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
 
         Ok(())
     }
 
-    /// Solve Poisson equation on GPU with cuFFT
-    pub fn solve_poisson_gpu(&mut self, g_constant: f64, r_s: Option<f64>) -> Result<(), Box<dyn std::error::Error>> {
+    /// Interpolate force at particle position using CIC
+    /// Returns (Fx, Fy, Fz) for Janus interaction rules
+    pub fn interpolate_force(&self, x: f64, y: f64, z: f64, sign: i8) -> (f64, f64, f64) {
         let n = self.grid_size;
+        let half = self.box_size / 2.0;
+        let gs = n as f64;
+        let h = self.cell_size;
 
-        // Forward FFT: rho -> rho_k
-        self.fft_plan.exec_d2z(&self.rho_plus_d, &mut self.rho_plus_k)?;
-        self.fft_plan.exec_d2z(&self.rho_minus_d, &mut self.rho_minus_k)?;
+        let gx = ((x + half) / self.box_size * gs).rem_euclid(gs);
+        let gy = ((y + half) / self.box_size * gs).rem_euclid(gs);
+        let gz = ((z + half) / self.box_size * gs).rem_euclid(gs);
 
-        // Apply Green's function in k-space (on CPU for now, GPU kernel TODO)
-        let n3_complex = n * n * (n / 2 + 1);
-        let mut rho_plus_k_host = vec![CudaComplex64 { x: 0.0, y: 0.0 }; n3_complex];
-        let mut rho_minus_k_host = vec![CudaComplex64 { x: 0.0, y: 0.0 }; n3_complex];
+        let ix = gx.floor() as usize;
+        let iy = gy.floor() as usize;
+        let iz = gz.floor() as usize;
 
-        self.device.dtoh_sync_copy_into(&self.rho_plus_k, &mut rho_plus_k_host)?;
-        self.device.dtoh_sync_copy_into(&self.rho_minus_k, &mut rho_minus_k_host)?;
+        let fx = gx - ix as f64;
+        let fy = gy - iy as f64;
+        let fz = gz - iz as f64;
 
-        // Apply Green's function
-        let dk = 2.0 * PI / self.box_size;
-        let r_s_sq = r_s.map(|r| r * r);
+        let wx = [1.0 - fx, fx];
+        let wy = [1.0 - fy, fy];
+        let wz = [1.0 - fz, fz];
 
-        for kz in 0..n {
-            for ky in 0..n {
-                for kx in 0..(n / 2 + 1) {
-                    let idx = kx + (n / 2 + 1) * (ky + n * kz);
+        // Janus force rule:
+        // Particle +: F = -∇φ_plus + ∇φ_minus (attracted by +, repelled by -)
+        // Particle -: F = -∇φ_minus + ∇φ_plus (attracted by -, repelled by +)
+        let (phi_attract, phi_repel) = if sign > 0 {
+            (&self.phi_plus, &self.phi_minus)
+        } else {
+            (&self.phi_minus, &self.phi_plus)
+        };
 
-                    let kx_val = if kx <= n / 2 { kx as f64 } else { (kx as i64 - n as i64) as f64 } * dk;
-                    let ky_val = if ky <= n / 2 { ky as f64 } else { (ky as i64 - n as i64) as f64 } * dk;
-                    let kz_val = if kz <= n / 2 { kz as f64 } else { (kz as i64 - n as i64) as f64 } * dk;
+        let mut force = (0.0f64, 0.0f64, 0.0f64);
 
-                    let k2 = kx_val * kx_val + ky_val * ky_val + kz_val * kz_val;
+        for di in 0..2 {
+            for dj in 0..2 {
+                for dk in 0..2 {
+                    let ci = (ix + di) % n;
+                    let cj = (iy + dj) % n;
+                    let ck = (iz + dk) % n;
 
-                    if k2 < 1e-20 {
-                        rho_plus_k_host[idx] = CudaComplex64 { x: 0.0, y: 0.0 };
-                        rho_minus_k_host[idx] = CudaComplex64 { x: 0.0, y: 0.0 };
-                        continue;
-                    }
+                    let weight = wx[di] * wy[dj] * wz[dk];
 
-                    let mut green = -4.0 * PI * g_constant / k2;
+                    // Neighboring cells for gradient
+                    let ci_p = (ci + 1) % n;
+                    let ci_m = (ci + n - 1) % n;
+                    let cj_p = (cj + 1) % n;
+                    let cj_m = (cj + n - 1) % n;
+                    let ck_p = (ck + 1) % n;
+                    let ck_m = (ck + n - 1) % n;
 
-                    // Gaussian splitting
-                    if let Some(rs2) = r_s_sq {
-                        green *= (-k2 * rs2).exp();
-                    }
+                    // Central difference gradient for attractive potential
+                    let dphi_attract_dx = (phi_attract[ci_p + n * (cj + n * ck)]
+                        - phi_attract[ci_m + n * (cj + n * ck)]) / (2.0 * h);
+                    let dphi_attract_dy = (phi_attract[ci + n * (cj_p + n * ck)]
+                        - phi_attract[ci + n * (cj_m + n * ck)]) / (2.0 * h);
+                    let dphi_attract_dz = (phi_attract[ci + n * (cj + n * ck_p)]
+                        - phi_attract[ci + n * (cj + n * ck_m)]) / (2.0 * h);
 
-                    rho_plus_k_host[idx].x *= green;
-                    rho_plus_k_host[idx].y *= green;
-                    rho_minus_k_host[idx].x *= green;
-                    rho_minus_k_host[idx].y *= green;
+                    // Central difference gradient for repulsive potential
+                    let dphi_repel_dx = (phi_repel[ci_p + n * (cj + n * ck)]
+                        - phi_repel[ci_m + n * (cj + n * ck)]) / (2.0 * h);
+                    let dphi_repel_dy = (phi_repel[ci + n * (cj_p + n * ck)]
+                        - phi_repel[ci + n * (cj_m + n * ck)]) / (2.0 * h);
+                    let dphi_repel_dz = (phi_repel[ci + n * (cj + n * ck_p)]
+                        - phi_repel[ci + n * (cj + n * ck_m)]) / (2.0 * h);
+
+                    // F = -∇φ_attract + ∇φ_repel
+                    force.0 += weight * (-dphi_attract_dx + dphi_repel_dx);
+                    force.1 += weight * (-dphi_attract_dy + dphi_repel_dy);
+                    force.2 += weight * (-dphi_attract_dz + dphi_repel_dz);
                 }
             }
         }
 
-        // Upload back to GPU
-        self.device.htod_sync_copy_into(&rho_plus_k_host, &mut self.rho_plus_k)?;
-        self.device.htod_sync_copy_into(&rho_minus_k_host, &mut self.rho_minus_k)?;
+        force
+    }
 
-        // Inverse FFT: rho_k -> phi
-        // Note: cuFFT Z2D requires separate plan, for now use full complex
-        // TODO: proper inverse FFT
-
-        Ok(())
+    /// Memory usage in bytes
+    pub fn memory_bytes(&self) -> usize {
+        let n3 = self.grid_size * self.grid_size * self.grid_size;
+        4 * n3 * std::mem::size_of::<f64>() + 2 * self.solver_plus.memory_bytes()
     }
 }
 
-/// Fallback CPU implementation (same as pm_grid.rs)
+// ═══════════════════════════════════════════════════════════════════════════
+// Fallback CPU implementation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// CPU PM Grid (uses pm_grid.rs implementation)
 pub struct PmGridCpu {
     pub inner: super::pm_grid::PmGrid,
+    k_min: usize,
 }
 
 impl PmGridCpu {
-    pub fn new(grid_size: usize, box_size: f64) -> Self {
+    pub fn new(grid_size: usize, box_size: f64, k_min: usize) -> Self {
         Self {
             inner: super::pm_grid::PmGrid::new(grid_size, box_size),
+            k_min,
         }
+    }
+
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    pub fn assign_mass(&mut self, positions: &[f64], signs: &[i8], mass: f64) {
+        let n = signs.len();
+        for i in 0..n {
+            self.inner.assign_mass(
+                positions[i * 3 + 0],
+                positions[i * 3 + 1],
+                positions[i * 3 + 2],
+                mass,
+                signs[i],
+            );
+        }
+    }
+
+    pub fn solve_poisson(&mut self, g_constant: f64) {
+        self.inner.solve_poisson_with_k_filter(g_constant, self.k_min);
+    }
+
+    pub fn interpolate_force(&self, x: f64, y: f64, z: f64, sign: i8) -> (f64, f64, f64) {
+        self.inner.interpolate_force(x, y, z, sign)
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        self.inner.memory_bytes()
     }
 }

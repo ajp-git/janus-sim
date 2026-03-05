@@ -1578,6 +1578,7 @@ pub struct GpuNBodyTwoPass {
     phi_plus: CudaSlice<f64>,   // [grid³] positive potential
     phi_minus: CudaSlice<f64>,  // [grid³] negative potential
     pm_grid_size: usize,        // PM grid dimension (128)
+    pm_k_min: usize,            // k-space filter: modes with |k| < k_min are zeroed (dipole suppression)
     // Parameters
     n_particles: usize,
     n_positive: usize,
@@ -1784,6 +1785,7 @@ impl GpuNBodyTwoPass {
             bvh_node_pos, bvh_node_mass, bvh_node_types, bvh_atomic,
             pm_forces,
             rho_plus, rho_minus, phi_plus, phi_minus, pm_grid_size,
+            pm_k_min: 0,  // Default: no k-space filtering
             n_particles: n_total,
             n_positive,
             n_negative,
@@ -1903,6 +1905,7 @@ impl GpuNBodyTwoPass {
             bvh_node_pos, bvh_node_mass, bvh_node_types, bvh_atomic,
             pm_forces,
             rho_plus, rho_minus, phi_plus, phi_minus, pm_grid_size,
+            pm_k_min: 0,  // Default: no k-space filtering
             n_particles: n_total,
             n_positive,
             n_negative,
@@ -1913,6 +1916,9 @@ impl GpuNBodyTwoPass {
             step_count: 0,
         })
     }
+
+    /// Set k-space filter minimum index (k_min=3 suppresses dipole modes k=0,1,2)
+    pub fn set_pm_k_min(&mut self, k_min: usize) { self.pm_k_min = k_min; }
 
     pub fn set_theta(&mut self, theta: f64) { self.theta = theta; }
     pub fn set_softening(&mut self, softening: f64) { self.softening = softening; }
@@ -3798,18 +3804,29 @@ impl GpuNBodyTwoPass {
         // PM k-space damping: exp(-k²×r_s²) → affects scales > r_s
         // BH real-space: should use erfc(r/(2r_s)) → affects scales < r_s
         let r_s = r_cut / 3.0;
+        let k_min = self.pm_k_min;
         unsafe {
-            // Solve rho_plus → phi_plus
-            crate::treepm::cufft_ffi::solve_device(
-                rho_plus_ptr, phi_plus_ptr,
-                grid, self.box_size, g_constant, r_s,
-            )?;
-
-            // Solve rho_minus → phi_minus
-            crate::treepm::cufft_ffi::solve_device(
-                rho_minus_ptr, phi_minus_ptr,
-                grid, self.box_size, g_constant, r_s,
-            )?;
+            if k_min > 0 {
+                // With k-space filter: suppress large-scale modes (dipole, etc.)
+                crate::treepm::cufft_ffi::solve_device_filtered(
+                    rho_plus_ptr, phi_plus_ptr,
+                    grid, self.box_size, g_constant, r_s, k_min,
+                )?;
+                crate::treepm::cufft_ffi::solve_device_filtered(
+                    rho_minus_ptr, phi_minus_ptr,
+                    grid, self.box_size, g_constant, r_s, k_min,
+                )?;
+            } else {
+                // No filter: standard TreePM
+                crate::treepm::cufft_ffi::solve_device(
+                    rho_plus_ptr, phi_plus_ptr,
+                    grid, self.box_size, g_constant, r_s,
+                )?;
+                crate::treepm::cufft_ffi::solve_device(
+                    rho_minus_ptr, phi_minus_ptr,
+                    grid, self.box_size, g_constant, r_s,
+                )?;
+            }
         }
 
         // ===== GPU CIC GATHER =====
@@ -4031,15 +4048,29 @@ impl GpuNBodyTwoPass {
         let phi_minus_ptr = get_device_ptr(&self.phi_minus) as *mut f64;
 
         let r_s = r_cut / 3.0;
+        let k_min = self.pm_k_min;
         unsafe {
-            crate::treepm::cufft_ffi::solve_device(
-                rho_plus_ptr, phi_plus_ptr,
-                grid, self.box_size, g_constant, r_s,
-            )?;
-            crate::treepm::cufft_ffi::solve_device(
-                rho_minus_ptr, phi_minus_ptr,
-                grid, self.box_size, g_constant, r_s,
-            )?;
+            if k_min > 0 {
+                // With k-space filter: suppress large-scale modes (dipole, etc.)
+                crate::treepm::cufft_ffi::solve_device_filtered(
+                    rho_plus_ptr, phi_plus_ptr,
+                    grid, self.box_size, g_constant, r_s, k_min,
+                )?;
+                crate::treepm::cufft_ffi::solve_device_filtered(
+                    rho_minus_ptr, phi_minus_ptr,
+                    grid, self.box_size, g_constant, r_s, k_min,
+                )?;
+            } else {
+                // No filter: standard TreePM
+                crate::treepm::cufft_ffi::solve_device(
+                    rho_plus_ptr, phi_plus_ptr,
+                    grid, self.box_size, g_constant, r_s,
+                )?;
+                crate::treepm::cufft_ffi::solve_device(
+                    rho_minus_ptr, phi_minus_ptr,
+                    grid, self.box_size, g_constant, r_s,
+                )?;
+            }
         }
 
         // ===== GPU CIC GATHER =====

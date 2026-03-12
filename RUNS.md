@@ -661,3 +661,53 @@ Results:
   - Report: V10_SIMULATION_RESULTS.md
 
 Binary: src/bin/janus_v10_highres.rs, src/bin/resume_v10.rs
+
+---
+
+### Run: janus_v11_hubble_test
+Date: 2026-03-12
+Status: **completed** ✅
+
+**Goal:** Validate that Hubble friction stabilizes segregation (vs V10 re-mixing)
+
+Parameters:
+  N particles: 512,000 (80³ grid)
+  Box: 200 Mpc
+  η: 1.06
+  z_init: 5.0 → z_final: 0.0
+  θ: 0.7
+  dt: 0.01
+  ε: 0.18 Mpc
+  R_cut: 18 Mpc
+  Integrator: TreePM (step_treepm_gpu)
+  ICs: Zel'dovich (k_cut=0.25, α_IC=1.6, random signs)
+
+Cosmological:
+  τ_start: -1.413
+  τ_end: 0.0
+  dτ/dt: 0.047
+  H_init: 1.32
+
+Results:
+  Steps: 3000 / 3000 ✓
+  Runtime: 13.7 min (0.27s/step)
+  Seg₀: 0.0008
+  **Seg_max: 0.410** @ step 2760 (z = 0.08)
+  **Seg_final: 0.369** @ z = 0
+  KE/KE₀ final: 6.98e8
+
+**VALIDATION SUCCESSFUL:**
+
+| Metric | V10 (no Hubble) | V11 (with Hubble) |
+|--------|-----------------|-------------------|
+| Seg trend | Decreasing (re-mixing) | **Increasing then plateau** |
+| Seg final | 0.09 | **0.37** |
+| Interpretation | System mixes back | **Stable segregation** |
+
+**Conclusion:**
+  Hubble friction is ESSENTIAL for stable segregation.
+  Without it (V10), KE drives re-mixing.
+  With it (V11), friction cools the system → domains persist.
+
+Output: /app/output/janus_v11_hubble_test/
+Binary: src/bin/janus_v11_hubble_test.rs

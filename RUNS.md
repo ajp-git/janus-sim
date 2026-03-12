@@ -756,3 +756,40 @@ Results:
 
 Output: /app/output/janus_v12_box_test/
 Binary: src/bin/janus_v12_box_test.rs
+
+---
+
+### A/B Test: V11 Optimized
+Date: 2026-03-12
+Status: **completed** — ❌ REJECTED
+
+**Goal:** Test numerical optimizations for performance improvement
+
+Optimizations tested:
+  1. Adaptive θ: 0.5 (step<500) → 0.7 (500-1500) → 0.9 (step≥1500)
+  2. Reduced R_cut: 15 Mpc (was 18 Mpc)
+
+**Performance Results:**
+  - Reference: ~300 ms/step, 13.7 min total
+  - Optimized: 241 ms/step, 12.0 min total
+  - **Speedup: 1.25x**
+
+**Physics Comparison (final state, step 3000):**
+
+| Metric | Reference | Optimized | Diff | Threshold | Status |
+|--------|-----------|-----------|------|-----------|--------|
+| σ_P | 0.372 | 0.339 | 8.9% | 2% | ❌ FAIL |
+| L_J | 5.52 | 5.56 | 0.9% | 5% | ✅ PASS |
+| ξ | 31.3 | 28.1 | 10.0% | 5% | ❌ FAIL |
+
+**Verdict: ❌ REJECTED**
+  - Optimizations alter physics beyond acceptable thresholds
+  - Domains are smaller (ξ -10%) and less contrasted (σ_P -9%)
+  - Speedup (1.25x) does not justify physics deviation
+
+**Recommendation:**
+  - Adaptive θ alone may be acceptable (needs separate test)
+  - R_cut = 15 Mpc is too aggressive for this resolution
+
+Binary: src/bin/janus_v11_optimized.rs
+Output: /app/output/janus_v11_optimized/

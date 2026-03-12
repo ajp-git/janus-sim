@@ -1570,6 +1570,17 @@ pub struct GpuNBodyTwoPass {
     bvh_node_mass: CudaSlice<f32>,  // 1×f32 per node (FP32 for speed)
     bvh_node_types: CudaSlice<i32>,
     bvh_atomic: CudaSlice<i32>,
+    // Cached BVH for tree reuse optimization (A/B testing)
+    bvh_pos_node_pos: CudaSlice<f32>,    // cached positive tree node positions
+    bvh_pos_node_mass: CudaSlice<f32>,   // cached positive tree node masses
+    bvh_pos_left: CudaSlice<i32>,        // cached positive tree structure
+    bvh_pos_right: CudaSlice<i32>,
+    bvh_pos_node_types: CudaSlice<i32>,
+    bvh_neg_node_pos: CudaSlice<f32>,    // cached negative tree node positions
+    bvh_neg_node_mass: CudaSlice<f32>,   // cached negative tree node masses
+    bvh_neg_left: CudaSlice<i32>,        // cached negative tree structure
+    bvh_neg_right: CudaSlice<i32>,
+    bvh_neg_node_types: CudaSlice<i32>,
     // TreePM hybrid buffers
     pm_forces: CudaSlice<f32>,  // [n_total × 3] PM long-range forces
     // PM grid buffers (GPU cuFFT integration)
@@ -1588,6 +1599,9 @@ pub struct GpuNBodyTwoPass {
     box_size: f64,
     time: f64,
     step_count: usize,
+    // Tree rebuild control (for A/B testing)
+    tree_rebuild_interval: usize,  // 1 = every step (default), N = every N steps
+    last_tree_rebuild_step: usize, // track when tree was last rebuilt
 }
 
 /// Timing breakdown for tree build phases (in milliseconds)
@@ -1746,6 +1760,18 @@ impl GpuNBodyTwoPass {
         let bvh_node_types = device.alloc_zeros::<i32>(n_bvh)?;
         let bvh_atomic = device.alloc_zeros::<i32>(n_bvh)?;
 
+        // Cached BVH for tree reuse (A/B testing) - stores both positive and negative trees
+        let bvh_pos_node_pos = device.alloc_zeros::<f32>(n_bvh * 7)?;
+        let bvh_pos_node_mass = device.alloc_zeros::<f32>(n_bvh)?;
+        let bvh_pos_left = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_pos_right = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_pos_node_types = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_neg_node_pos = device.alloc_zeros::<f32>(n_bvh * 7)?;
+        let bvh_neg_node_mass = device.alloc_zeros::<f32>(n_bvh)?;
+        let bvh_neg_left = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_neg_right = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_neg_node_types = device.alloc_zeros::<i32>(n_bvh)?;
+
         // TreePM hybrid buffers
         let pm_forces = device.alloc_zeros::<f32>(n_total * 3)?;  // PM long-range forces
 
@@ -1783,6 +1809,8 @@ impl GpuNBodyTwoPass {
             pos_sorted, vel_sorted, signs_sorted, radix_hist_all,
             bvh_left, bvh_right, bvh_parent, bvh_rl, bvh_rr,
             bvh_node_pos, bvh_node_mass, bvh_node_types, bvh_atomic,
+            bvh_pos_node_pos, bvh_pos_node_mass, bvh_pos_left, bvh_pos_right, bvh_pos_node_types,
+            bvh_neg_node_pos, bvh_neg_node_mass, bvh_neg_left, bvh_neg_right, bvh_neg_node_types,
             pm_forces,
             rho_plus, rho_minus, phi_plus, phi_minus, pm_grid_size,
             pm_k_min: 0,  // Default: no k-space filtering
@@ -1794,6 +1822,8 @@ impl GpuNBodyTwoPass {
             box_size,
             time: 0.0,
             step_count: 0,
+            tree_rebuild_interval: 1,  // default: rebuild every step
+            last_tree_rebuild_step: 0,
         })
     }
 
@@ -1882,6 +1912,18 @@ impl GpuNBodyTwoPass {
         let bvh_node_types = device.alloc_zeros::<i32>(n_bvh)?;
         let bvh_atomic = device.alloc_zeros::<i32>(n_bvh)?;
 
+        // Cached BVH for tree reuse (A/B testing)
+        let bvh_pos_node_pos = device.alloc_zeros::<f32>(n_bvh * 7)?;
+        let bvh_pos_node_mass = device.alloc_zeros::<f32>(n_bvh)?;
+        let bvh_pos_left = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_pos_right = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_pos_node_types = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_neg_node_pos = device.alloc_zeros::<f32>(n_bvh * 7)?;
+        let bvh_neg_node_mass = device.alloc_zeros::<f32>(n_bvh)?;
+        let bvh_neg_left = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_neg_right = device.alloc_zeros::<i32>(n_bvh)?;
+        let bvh_neg_node_types = device.alloc_zeros::<i32>(n_bvh)?;
+
         let pm_forces = device.alloc_zeros::<f32>(n_total * 3)?;
 
         let pm_grid_size = 128usize;
@@ -1903,6 +1945,8 @@ impl GpuNBodyTwoPass {
             pos_sorted, vel_sorted, signs_sorted, radix_hist_all,
             bvh_left, bvh_right, bvh_parent, bvh_rl, bvh_rr,
             bvh_node_pos, bvh_node_mass, bvh_node_types, bvh_atomic,
+            bvh_pos_node_pos, bvh_pos_node_mass, bvh_pos_left, bvh_pos_right, bvh_pos_node_types,
+            bvh_neg_node_pos, bvh_neg_node_mass, bvh_neg_left, bvh_neg_right, bvh_neg_node_types,
             pm_forces,
             rho_plus, rho_minus, phi_plus, phi_minus, pm_grid_size,
             pm_k_min: 0,  // Default: no k-space filtering
@@ -1914,11 +1958,20 @@ impl GpuNBodyTwoPass {
             box_size,
             time: 0.0,
             step_count: 0,
+            tree_rebuild_interval: 1,  // default: rebuild every step
+            last_tree_rebuild_step: 0,
         })
     }
 
     /// Set k-space filter minimum index (k_min=3 suppresses dipole modes k=0,1,2)
     pub fn set_pm_k_min(&mut self, k_min: usize) { self.pm_k_min = k_min; }
+
+    /// Set tree rebuild interval for A/B testing
+    /// interval=1 (default): rebuild tree every step
+    /// interval=N: rebuild tree every N steps, reuse tree otherwise
+    pub fn set_tree_rebuild_interval(&mut self, interval: usize) {
+        self.tree_rebuild_interval = interval.max(1);  // minimum 1
+    }
 
     pub fn set_theta(&mut self, theta: f64) { self.theta = theta; }
     pub fn set_softening(&mut self, softening: f64) { self.softening = softening; }
@@ -3570,6 +3623,192 @@ impl GpuNBodyTwoPass {
         Ok(())
     }
 
+    /// Compute short-range forces REUSING CACHED trees (no rebuild)
+    /// Used for A/B testing tree rebuild frequency optimization
+    /// REQUIRES: build_and_cache_trees() was called previously
+    /// WARNING: Cached tree nodes contain positions from last rebuild - may be stale
+    pub fn compute_short_range_forces_reuse_tree(&mut self, _r_cut: f64) -> Result<(), Box<dyn std::error::Error>> {
+        let n = self.n_particles;
+
+        let blocks = (n + 255) / 256;
+
+        let warp_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 4096,
+        };
+
+        // Reset acceleration
+        let reset_f32_k = self.device.get_func("twopass", "reset_f32")
+            .ok_or("reset_f32 not found")?;
+        let acc_blocks = (n * 3 + 255) / 256;
+        let acc_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (acc_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            reset_f32_k.launch(acc_cfg, (&mut self.acc, (n * 3) as i32))?;
+        }
+        self.device.synchronize()?;
+
+        // Use warp-coherent kernel with CACHED trees (no rebuild)
+        let forces_wc_k = self.device.get_func("twopass", "forces_twopass_warpcoherent")
+            .ok_or("forces_twopass_warpcoherent not found")?;
+
+        // Force + using CACHED positive tree
+        unsafe {
+            forces_wc_k.clone().launch(warp_cfg, (
+                &self.pos, &self.signs,
+                &self.bvh_pos_node_pos, &self.bvh_pos_node_mass,
+                &self.bvh_pos_left, &self.bvh_pos_right, &self.bvh_pos_node_types,
+                &mut self.acc,
+                n as i32, 1i32, self.theta as f32, self.softening as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Force - using CACHED negative tree
+        unsafe {
+            forces_wc_k.launch(warp_cfg, (
+                &self.pos, &self.signs,
+                &self.bvh_neg_node_pos, &self.bvh_neg_node_mass,
+                &self.bvh_neg_left, &self.bvh_neg_right, &self.bvh_neg_node_types,
+                &mut self.acc,
+                n as i32, -1i32, self.theta as f32, self.softening as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        Ok(())
+    }
+
+    /// Build both trees AND cache them for later reuse
+    /// Call this on rebuild steps, then use compute_short_range_forces_reuse_tree on other steps
+    pub fn build_and_cache_trees(&mut self, r_cut: f64) -> Result<(), Box<dyn std::error::Error>> {
+        let n = self.n_particles;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let warp_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 4096,
+        };
+
+        // Reset acceleration
+        let reset_f32_k = self.device.get_func("twopass", "reset_f32")
+            .ok_or("reset_f32 not found")?;
+        let acc_blocks = (n * 3 + 255) / 256;
+        let acc_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (acc_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            reset_f32_k.launch(acc_cfg, (&mut self.acc, (n * 3) as i32))?;
+        }
+        self.device.synchronize()?;
+
+        let forces_wc_k = self.device.get_func("twopass", "forces_twopass_warpcoherent")
+            .ok_or("forces_twopass_warpcoherent not found")?;
+        let reset_i32_k = self.device.get_func("twopass", "reset_i32")
+            .ok_or("reset_i32 not found")?;
+        let extract_k = self.device.get_func("twopass", "extract_by_sign")
+            .ok_or("extract_by_sign not found")?;
+
+        // === PASS 1: Build positive tree and cache it ===
+        unsafe {
+            reset_i32_k.clone().launch(LaunchConfig {
+                block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+            }, (&mut self.extract_count, 1))?;
+            extract_k.clone().launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.pos_sign, &mut self.idx_map,
+                n as i32, 1i32, &mut self.extract_count,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let _ = self.build_single_sign_tree(1, self.n_positive)?;
+
+        // Cache positive tree
+        self.cache_current_tree_to_positive()?;
+
+        // Compute forces with positive tree
+        unsafe {
+            forces_wc_k.clone().launch(warp_cfg, (
+                &self.pos, &self.signs,
+                &self.bvh_pos_node_pos, &self.bvh_pos_node_mass,
+                &self.bvh_pos_left, &self.bvh_pos_right, &self.bvh_pos_node_types,
+                &mut self.acc,
+                n as i32, 1i32, self.theta as f32, self.softening as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // === PASS 2: Build negative tree and cache it ===
+        unsafe {
+            reset_i32_k.launch(LaunchConfig {
+                block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+            }, (&mut self.extract_count, 1))?;
+            extract_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.pos_sign, &mut self.idx_map,
+                n as i32, -1i32, &mut self.extract_count,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let _ = self.build_single_sign_tree(-1, self.n_negative)?;
+
+        // Cache negative tree
+        self.cache_current_tree_to_negative()?;
+
+        // Compute forces with negative tree
+        unsafe {
+            forces_wc_k.launch(warp_cfg, (
+                &self.pos, &self.signs,
+                &self.bvh_neg_node_pos, &self.bvh_neg_node_mass,
+                &self.bvh_neg_left, &self.bvh_neg_right, &self.bvh_neg_node_types,
+                &mut self.acc,
+                n as i32, -1i32, self.theta as f32, self.softening as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        Ok(())
+    }
+
+    /// Copy current tree to positive cache
+    fn cache_current_tree_to_positive(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let n_bvh = 2 * self.n_positive.max(self.n_negative) - 1;
+        // Device-to-device copy
+        self.device.dtod_copy(&self.bvh_node_pos, &mut self.bvh_pos_node_pos)?;
+        self.device.dtod_copy(&self.bvh_node_mass, &mut self.bvh_pos_node_mass)?;
+        self.device.dtod_copy(&self.bvh_left, &mut self.bvh_pos_left)?;
+        self.device.dtod_copy(&self.bvh_right, &mut self.bvh_pos_right)?;
+        self.device.dtod_copy(&self.bvh_node_types, &mut self.bvh_pos_node_types)?;
+        self.device.synchronize()?;
+        Ok(())
+    }
+
+    /// Copy current tree to negative cache
+    fn cache_current_tree_to_negative(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let n_bvh = 2 * self.n_positive.max(self.n_negative) - 1;
+        // Device-to-device copy
+        self.device.dtod_copy(&self.bvh_node_pos, &mut self.bvh_neg_node_pos)?;
+        self.device.dtod_copy(&self.bvh_node_mass, &mut self.bvh_neg_node_mass)?;
+        self.device.dtod_copy(&self.bvh_left, &mut self.bvh_neg_left)?;
+        self.device.dtod_copy(&self.bvh_right, &mut self.bvh_neg_right)?;
+        self.device.dtod_copy(&self.bvh_node_types, &mut self.bvh_neg_node_types)?;
+        self.device.synchronize()?;
+        Ok(())
+    }
+
     /// Get acceleration buffer for adding PM long-range forces
     pub fn get_acc_mut(&mut self) -> &mut CudaSlice<f32> {
         &mut self.acc
@@ -3886,6 +4125,175 @@ impl GpuNBodyTwoPass {
         if self.step_count <= 5 || self.step_count % 100 == 0 {
             eprintln!("  TreePM GPU step {}: PM {}ms + BH {}ms = {}ms",
                       self.step_count, pm_ms, bh_ms, pm_ms + bh_ms);
+        }
+
+        Ok(())
+    }
+
+    /// TreePM step with tree caching optimization for A/B testing
+    /// On rebuild steps: builds both trees and caches them
+    /// On non-rebuild steps: reuses cached trees (faster but potentially less accurate)
+    ///
+    /// rebuild_tree: true = build fresh trees, false = use cached trees
+    #[cfg(feature = "cufft")]
+    pub fn step_treepm_gpu_cached(
+        &mut self,
+        dt: f64,
+        r_cut: f64,
+        hubble: f64,
+        dtau_per_dt: f64,
+        rebuild_tree: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Instant;
+        let n = self.n_particles;
+        let grid = self.pm_grid_size;
+        let grid_cells = grid * grid * grid;
+        let box_half = (self.box_size / 2.0) as f32;
+        let half_dt = (dt / 2.0) as f32;
+        let cell_size = (self.box_size / grid as f64) as f32;
+        let inv_cell_size = (grid as f64 / self.box_size) as f32;
+        let g_constant = 1.0;
+
+        let blocks = (n + 255) / 256;
+        let grid_blocks = (grid_cells + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let grid_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (grid_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // ===== DRIFT (dt/2) =====
+        let drift_k = self.device.get_func("twopass", "drift_f32")
+            .ok_or("drift_f32 not found")?;
+        unsafe {
+            drift_k.clone().launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== GPU CIC SCATTER =====
+        let t_pm = Instant::now();
+
+        let reset_grid_k = self.device.get_func("twopass", "reset_f64_grid")
+            .ok_or("reset_f64_grid not found")?;
+        unsafe {
+            reset_grid_k.clone().launch(grid_cfg, (&mut self.rho_plus, grid_cells as i32))?;
+            reset_grid_k.launch(grid_cfg, (&mut self.rho_minus, grid_cells as i32))?;
+        }
+        self.device.synchronize()?;
+
+        let scatter_k = self.device.get_func("twopass", "cic_scatter")
+            .ok_or("cic_scatter not found")?;
+        unsafe {
+            scatter_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.rho_plus, &mut self.rho_minus,
+                n as i32, grid as i32, box_half, inv_cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== cuFFT POISSON SOLVE =====
+        let rho_plus_ptr = get_device_ptr(&self.rho_plus) as *mut f64;
+        let rho_minus_ptr = get_device_ptr(&self.rho_minus) as *mut f64;
+        let phi_plus_ptr = get_device_ptr(&self.phi_plus) as *mut f64;
+        let phi_minus_ptr = get_device_ptr(&self.phi_minus) as *mut f64;
+
+        let r_s = r_cut / 3.0;
+        let k_min = self.pm_k_min;
+        unsafe {
+            if k_min > 0 {
+                crate::treepm::cufft_ffi::solve_device_filtered(
+                    rho_plus_ptr, phi_plus_ptr,
+                    grid, self.box_size, g_constant, r_s, k_min,
+                )?;
+                crate::treepm::cufft_ffi::solve_device_filtered(
+                    rho_minus_ptr, phi_minus_ptr,
+                    grid, self.box_size, g_constant, r_s, k_min,
+                )?;
+            } else {
+                crate::treepm::cufft_ffi::solve_device(
+                    rho_plus_ptr, phi_plus_ptr,
+                    grid, self.box_size, g_constant, r_s,
+                )?;
+                crate::treepm::cufft_ffi::solve_device(
+                    rho_minus_ptr, phi_minus_ptr,
+                    grid, self.box_size, g_constant, r_s,
+                )?;
+            }
+        }
+
+        // ===== GPU CIC GATHER =====
+        let gather_k = self.device.get_func("twopass", "cic_gather")
+            .ok_or("cic_gather not found")?;
+        unsafe {
+            gather_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &self.phi_plus, &self.phi_minus,
+                &mut self.pm_forces,
+                n as i32, grid as i32, box_half, inv_cell_size, cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let pm_ms = t_pm.elapsed().as_millis();
+
+        // ===== GPU BH SHORT-RANGE with CACHING =====
+        let t_bh = Instant::now();
+        if rebuild_tree {
+            // Build fresh trees and cache them
+            self.build_and_cache_trees(r_cut)?;
+        } else {
+            // Reuse cached trees (skip tree build)
+            self.compute_short_range_forces_reuse_tree(r_cut)?;
+        }
+        let bh_ms = t_bh.elapsed().as_millis();
+
+        // Add PM long-range forces
+        let add_pm_k = self.device.get_func("twopass", "add_pm_forces")
+            .ok_or("add_pm_forces not found")?;
+        unsafe {
+            add_pm_k.launch(cfg, (
+                &mut self.acc, &self.pm_forces, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== KICK (dt) =====
+        let kick_k = self.device.get_func("twopass", "kick_f32")
+            .ok_or("kick_f32 not found")?;
+        unsafe {
+            kick_k.launch(cfg, (
+                &mut self.vel, &self.acc,
+                dt as f32, n as i32,
+                hubble as f32, dtau_per_dt as f32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== DRIFT (dt/2) =====
+        unsafe {
+            drift_k.launch(cfg, (
+                &mut self.pos, &self.vel,
+                half_dt, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        self.time += dt;
+        self.step_count += 1;
+
+        // Timing info
+        if self.step_count <= 5 || self.step_count % 100 == 0 {
+            let tree_mode = if rebuild_tree { "REBUILD" } else { "REUSE" };
+            eprintln!("  TreePM GPU step {} [{}]: PM {}ms + BH {}ms = {}ms",
+                      self.step_count, tree_mode, pm_ms, bh_ms, pm_ms + bh_ms);
         }
 
         Ok(())

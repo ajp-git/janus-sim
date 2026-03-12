@@ -836,3 +836,54 @@ Optimizations tested:
 
 Binary: src/bin/janus_v11_theta_adaptive.rs
 Output: /app/output/janus_v11_theta_adaptive/
+
+---
+
+### A/B Test: V11 Tree Rebuild B2 (Interval=3)
+Date: 2026-03-12
+Status: **completed** — ❌ REJECTED
+
+**Goal:** Test if reducing tree rebuild frequency improves performance
+
+Optimization tested:
+  - Tree rebuild every 3 steps (instead of every step)
+  - Steps 1,4,7,...: rebuild both trees + cache them
+  - Steps 2,3,5,6,...: reuse cached trees
+
+**Performance Results:**
+  - Rebuild steps: avg 286 ms/step
+  - Reuse steps: avg 280 ms/step
+  - **Speedup: 1.02x** (only 2% faster — negligible!)
+  - Total time: 14.2 min (0.28s/step)
+
+**Why speedup is negligible:**
+  - Tree BUILDING is not the bottleneck
+  - Tree TRAVERSAL dominates (~90% of BH time)
+  - Traversing a stale tree takes the same time as a fresh one
+
+**Physics Comparison (final state, step 3000):**
+
+| Metric | Reference | TreeRebuild | Diff | Threshold | Status |
+|--------|-----------|-------------|------|-----------|--------|
+| σ_P | 0.372 | 0.393 | 5.7% | 2% | ❌ FAIL |
+| L_J | 5.52 | 4.66 | 15.5% | 5% | ❌ FAIL |
+| ξ | 31.3 | 28.1 | 10.0% | 5% | ❌ FAIL |
+
+**Temporal evolution:**
+  - Step 1000: σ_P deviation -12.9%, L_J deviation 17.5%
+  - Step 2000: σ_P deviation -7.9%, ξ deviation -9.1%
+  - Step 3000: All metrics fail thresholds
+
+**Verdict: ❌ REJECTED**
+  - Physics deviation MUCH too large (all metrics fail)
+  - Performance gain negligible (1.02x not worth complexity)
+  - Stale trees cause significant force calculation errors
+  - Tree rebuild is cheap; traversal is expensive
+
+**Recommendation:**
+  - Do NOT reduce tree rebuild frequency
+  - Optimize tree traversal instead (warp-coherent kernel already in use)
+  - Consider adaptive timestep to reduce total steps
+
+Binary: src/bin/janus_v11_tree_rebuild_B2.rs
+Output: /app/output/janus_v11_tree_rebuild_B2/

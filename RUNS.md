@@ -793,3 +793,46 @@ Optimizations tested:
 
 Binary: src/bin/janus_v11_optimized.rs
 Output: /app/output/janus_v11_optimized/
+
+---
+
+### A/B Test: V11 Theta Adaptive (Isolated)
+Date: 2026-03-12
+Status: **completed** — ❌ REJECTED
+
+**Goal:** Test if adaptive θ ALONE (without R_cut change) is acceptable
+
+Optimizations tested:
+  - Adaptive θ ONLY: 0.5 (step<500) → 0.7 (500-1500) → 0.9 (step≥1500)
+  - R_cut = 18 Mpc (SAME as reference — no change)
+
+**Performance Results:**
+  - Reference: ~300 ms/step, 13.7 min total
+  - θ-Adaptive: 237 ms/step, 11.8 min total
+  - **Speedup: 1.27x**
+
+**Physics Comparison (final state, step 3000):**
+
+| Metric | Reference | θ-Adaptive | Diff | Threshold | Status |
+|--------|-----------|------------|------|-----------|--------|
+| σ_P | 0.372 | 0.359 | 3.5% | 2% | ❌ FAIL |
+| L_J | 5.52 | 5.44 | 1.3% | 5% | ✅ PASS |
+| ξ | 31.3 | 31.3 | 0.0% | 5% | ✅ PASS |
+
+**Temporal evolution:**
+  - Step 1000 (θ=0.7, same as ref): σ_P deviation -0.2% ✅
+  - Step 2000 (θ=0.9 active): σ_P deviation 4.8% ❌
+  - Step 3000 (θ=0.9): σ_P deviation 3.5% ❌
+
+**Interpretation:**
+  - θ=0.9 phase introduces systematic error in σ_P
+  - Error accumulates even though L_J and ξ stay within bounds
+  - Polarization contrast (σ_P) is sensitive to force accuracy
+
+**Verdict: ❌ REJECTED**
+  - Adaptive θ alone still fails σ_P threshold (3.5% > 2%)
+  - θ=0.9 too aggressive for accurate short-range forces
+  - Recommend: constant θ=0.7 for production runs
+
+Binary: src/bin/janus_v11_theta_adaptive.rs
+Output: /app/output/janus_v11_theta_adaptive/

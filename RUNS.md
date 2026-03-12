@@ -711,3 +711,48 @@ Results:
 
 Output: /app/output/janus_v11_hubble_test/
 Binary: src/bin/janus_v11_hubble_test.rs
+
+---
+
+### Run: janus_v12_box_test
+Date: 2026-03-12
+Status: **completed** ✅
+
+**Goal:** Test if characteristic scale ξ is intrinsic or box artifact
+
+Parameters:
+  N particles: 1,000,000 (100³ grid)
+  Box: 400 Mpc (2× V11)
+  η: 1.06
+  z_init: 5.0 → z_final: 0.0
+  θ: 0.7
+  dt: 0.01
+  ε: 0.18 Mpc
+  R_cut: 18 Mpc
+  Integrator: TreePM (step_treepm_gpu)
+  ICs: Zel'dovich (same as V11)
+
+Results:
+  Steps: 3000 / 3000 ✓
+  Runtime: 38.8 min (0.78s/step)
+  Seg₀: 0.0003
+  **Seg_max: 0.457** @ step 2250 (z ≈ 0.32)
+  **Seg_final: 0.438** @ z = 0
+
+**Scale Analysis:**
+
+| Metric | V11 (L=200) | V12 (L=400) | Ratio |
+|--------|-------------|-------------|-------|
+| ξ final | 31 Mpc | 50 Mpc | 1.61 |
+| L_J final | 5.5 Mpc | 37.5 Mpc | 6.8 |
+| ξ/L_J | 5.7 | 1.3 | - |
+
+**Interpretation:**
+  - ξ increases but does NOT double (50 vs 62 if pure artifact)
+  - L_J is much larger → V12 has lower spatial resolution
+  - ξ/L_J ratio very different suggests resolution mismatch
+  - **CONCLUSION:** Partial scaling. Need higher resolution (8M in 400 Mpc)
+    to conclusively determine if ξ is intrinsic or artifact.
+
+Output: /app/output/janus_v12_box_test/
+Binary: src/bin/janus_v12_box_test.rs

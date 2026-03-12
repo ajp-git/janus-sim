@@ -3398,7 +3398,7 @@ impl GpuNBodySimulation {
         let ke = self.kinetic_energy()?;
         let pe_bind = self.potential_energy_binding()?;
 
-        println!("Virialization (GPU, Janus mode):");
+        println!("Virialization (CPU tree, Janus mode):");
         println!("  KE initial    = {:.4e}", ke);
         println!("  PE binding    = {:.4e}", pe_bind);
 

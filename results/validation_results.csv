@@ -1,0 +1,3 @@
+run_id,n_particles,epsilon,k_min,hubble,eta,runtime_s,steps,ms_per_step,seg_final,seg_max,dipole_suppressed,sigma_rho,sigma_p,r_ratio,void_fraction,sheet_fraction,filament_fraction,node_fraction,ke_final,pe_final,virial_ratio,early_stop_reason
+run_001_20260306_080156,512000,0.1500,3,0.0100,1.0450,1479.9,5000,295.2,0.167004,0.167697,true,2.660800,0.757444,3.5129,0.0643,0.2791,0.6498,0.0069,1.377342e9,-2.800241e8,9.8373,completed
+run_002_20260306_082637,512000,0.2500,3,0.0100,1.0450,3174.7,5000,634.1,0.167434,0.203482,true,3.352464,0.733129,4.5728,0.1817,0.3763,0.4365,0.0056,2.166338e9,-3.267979e8,13.2580,completed

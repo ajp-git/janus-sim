@@ -4285,6 +4285,139 @@ impl GpuNBodyTwoPass {
         Ok(())
     }
 
+    /// Fast PM-based virialization using FFT potential
+    /// Complexity: O(N + N_grid³ log N_grid) instead of O(N²)
+    #[cfg(feature = "cufft")]
+    pub fn virialize_pm(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::treepm::cufft_ffi;
+
+        let ke = self.kinetic_energy()?;
+        println!("Virialization (PM-based, fast):");
+        println!("  KE initial    = {:.4e}", ke);
+
+        if ke < 1e-20 {
+            println!("  WARNING: KE too small, skipping virialization");
+            return Ok(());
+        }
+
+        let n = self.n_particles;
+        let grid = self.pm_grid_size;
+        let grid3 = grid * grid * grid;
+        let cell_size = self.box_size / grid as f64;
+        let cell_vol = cell_size.powi(3);
+
+        // Step 1: Reset density grids
+        let cfg = LaunchConfig::for_num_elems(grid3 as u32);
+        unsafe {
+            let reset_k1 = self.device.get_func("twopass", "reset_f64_grid")
+                .ok_or("reset_f64_grid not found")?;
+            reset_k1.launch(cfg, (&self.rho_plus, grid3))?;
+            let reset_k2 = self.device.get_func("twopass", "reset_f64_grid")
+                .ok_or("reset_f64_grid not found")?;
+            reset_k2.launch(cfg, (&self.rho_minus, grid3))?;
+        }
+        self.device.synchronize()?;
+
+        // Step 2: CIC scatter particles to density grids
+        let cfg_n = LaunchConfig::for_num_elems(n as u32);
+        unsafe {
+            let scatter_k = self.device.get_func("twopass", "cic_scatter")
+                .ok_or("cic_scatter not found")?;
+            scatter_k.launch(cfg_n, (
+                &self.pos,
+                &self.signs,
+                &self.rho_plus,
+                &self.rho_minus,
+                n,
+                grid,
+                self.box_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Step 3: Solve Poisson via cuFFT
+        let rho_plus_ptr = get_device_ptr(&self.rho_plus) as *mut f64;
+        let rho_minus_ptr = get_device_ptr(&self.rho_minus) as *mut f64;
+        let phi_plus_ptr = get_device_ptr(&self.phi_plus) as *mut f64;
+        let phi_minus_ptr = get_device_ptr(&self.phi_minus) as *mut f64;
+
+        let g_constant = 1.0;  // Normalized units
+        let r_s = self.box_size / 2.0;  // PM softening scale
+
+        unsafe {
+            cufft_ffi::solve_device(
+                rho_plus_ptr, phi_plus_ptr,
+                grid, self.box_size, g_constant, r_s,
+            )?;
+            cufft_ffi::solve_device(
+                rho_minus_ptr, phi_minus_ptr,
+                grid, self.box_size, g_constant, r_s,
+            )?;
+        }
+        self.device.synchronize()?;
+
+        // Step 4: Compute PE_binding from grid integral
+        // PE_binding = (1/2) × Σ (rho_+ × phi_+ + rho_- × phi_-) × cell_vol
+        let rho_plus_cpu = self.device.dtoh_sync_copy(&self.rho_plus)?;
+        let rho_minus_cpu = self.device.dtoh_sync_copy(&self.rho_minus)?;
+        let phi_plus_cpu = self.device.dtoh_sync_copy(&self.phi_plus)?;
+        let phi_minus_cpu = self.device.dtoh_sync_copy(&self.phi_minus)?;
+
+        let pe_plus: f64 = rho_plus_cpu.iter().zip(phi_plus_cpu.iter())
+            .map(|(&rho, &phi)| rho * phi)
+            .sum();
+        let pe_minus: f64 = rho_minus_cpu.iter().zip(phi_minus_cpu.iter())
+            .map(|(&rho, &phi)| rho * phi)
+            .sum();
+
+        let pe_binding = 0.5 * (pe_plus + pe_minus) * cell_vol;
+
+        println!("  PE+ (grid)    = {:.4e}", pe_plus * cell_vol * 0.5);
+        println!("  PE- (grid)    = {:.4e}", pe_minus * cell_vol * 0.5);
+        println!("  PE_binding    = {:.4e}", pe_binding);
+
+        if pe_binding >= 0.0 {
+            println!("  WARNING: PE_binding >= 0, no bound system to virialize");
+            return Ok(());
+        }
+
+        // Step 5: Scale velocities for virial equilibrium
+        let ke_target = pe_binding.abs() / 2.0;
+        let alpha = (ke_target / ke).sqrt();
+
+        println!("  KE target     = {:.4e}", ke_target);
+        println!("  Alpha (α)     = {:.6}", alpha);
+
+        // Cap alpha to allow quasi-virialization
+        // For PE_binding ~ 7e8 and KE_init ~ 2e-5:
+        //   Full virial: α ~ 4e6 (too extreme for tree stability)
+        //   Partial: α = 10000 gives KE ~ 2.3, which is still small vs PE
+        // The simulation will gradually virialize during evolution
+        let alpha_capped = alpha.min(10000.0);
+        if alpha != alpha_capped {
+            println!("  WARNING: α capped from {:.2e} to {:.0}", alpha, alpha_capped);
+            println!("  (partial virialization - system will equilibrate during run)");
+        }
+
+        let mut vel = self.device.dtoh_sync_copy(&self.vel)?;
+        for v in vel.iter_mut() {
+            *v *= alpha_capped as f32;
+        }
+        self.vel = self.device.htod_sync_copy(&vel)?;
+
+        let ke_after = self.kinetic_energy()?;
+        println!("  KE after      = {:.4e}", ke_after);
+
+        Ok(())
+    }
+
+    /// Zero all velocities (cold start)
+    pub fn zero_velocities(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let zeros = vec![0.0f32; self.n_particles * 3];
+        self.vel = self.device.htod_sync_copy(&zeros)?;
+        Ok(())
+    }
+
     /// Sum of |acceleration| for diagnostics
     pub fn acceleration_sum(&self) -> Result<f64, Box<dyn std::error::Error>> {
         let acc_cpu = self.device.dtoh_sync_copy(&self.acc)?;

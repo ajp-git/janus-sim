@@ -569,27 +569,95 @@ Results:
 Verdict: **PASS** - Ready for 12M production
 Notes: P(k) truncation successfully eliminates large-scale modes
 
-### Run: production_pktrunc_12m
+### Run: production_pktrunc_12m (v1 — STOPPÉ)
+Date: 2026-03-05
+Status: **stopped** — fenêtre P(k) trop restrictive
+k_min = 2π/150, k_max = 2π/15 → seulement 1.2% modes
+Remplacé par: production_pktrunc_12m_v2
+
+### Run: production_pktrunc_12m_v2
 Date: 2026-03-05
 Status: **running**
 N = 12,008,989 (grid 229³) | Box = 492 Mpc | Steps = 20,000 | Snapshots = 1000
-ICs: P(k) truncated Zel'dovich + density-based signs + shuffled indices
-  k_min = 2π/150 Mpc (suppress λ > 150 Mpc)
-  k_max = 2π/15 Mpc (suppress λ < 15 Mpc)
-  Modes kept: 1.2%, suppressed: 98.8%
-  corr(idx, z) = 0.0085 ✓ (NO bias)
+ICs: P(k) truncated Zel'dovich v2 + density-based signs + shuffled indices
+  k_min = 2π/200 Mpc (suppress λ > 200 Mpc)
+  k_max = 2π/8 Mpc (suppress λ < 8 Mpc)
+  Modes kept: 8.1% (vs 1.2% v1)
+  corr(idx, z) = 0.0113 < 0.02 ✓
 Parameters:
   η = 1.045, z_init = 5.0
   dt = 0.01, θ = 0.7, softening = 0.65 Mpc
   dtau_per_dt = 0.006603 (FIX-016 verified)
   virialize_sampled(80000)
-Container: 7e8c1959476f
+Container: fc535d11603f
 Initial state:
-  KE₀ = 6.92e10, Seg₀ = 0.0025
-  Step 5 check: KE/KE₀ = 0.9995 ✓ PASS
-ETA: ~65h
+  KE₀ = 6.91e10, Seg₀ = 0.0068
+  Step 5 check: KE/KE₀ = 0.9993 ✓ PASS
+ETA: ~35h
 Milestones expected:
   Step 3000 (z≈2.8): onset segregation
   Step 4500 (z≈2.0): peak segregation (Seg > 0.2)
   Step 20000 (z=0): run complete
-Output: /app/output/production_pktrunc_12m/
+Output: /app/output/production_pktrunc_12m_v2/
+
+---
+
+### Run: janus_v10_highres + resume
+Date: 2026-03-09 to 2026-03-12
+Status: **stopped** (step 2700/3000)
+
+Parameters:
+  N particles: 19,902,511 (~20M)
+  Box: 200 Mpc
+  η: 1.06
+  H: 0.012
+  θ: 0.5 → 0.7 (step 500+) → 0.8 (resume)
+  dt: 0.003 → 0.005 → 0.01 (adaptive)
+  ε: 0.18 Mpc
+  Grid (PM): 256³
+  k_min: 2
+  Integrator: TreePM (step_treepm_gpu)
+  ICs: Zel'dovich (k_cut=0.25, α_IC=1.6)
+
+Results:
+  Steps completed: 2700 (original 2100 + resume 600)
+  Seg₀: 0.007
+  Seg_max: **0.32** @ step 2100
+  Seg_final: **0.09** @ step 2700
+  KE range: 1.1e5 → 6.9e12
+  Runtime: ~40h (original) + 14h (resume)
+
+**Key Scientific Findings:**
+
+1. **Two characteristic scales discovered:**
+   - L_J = 0.83 Mpc (interface thickness)
+   - ξ = 13.1 Mpc (coherence/domain size)
+   - Ratio ξ/L_J ≈ 16
+
+2. **Power law dynamics:**
+   - σ_P ∝ t^{-0.16}
+   - L_J ∝ t^{-0.18}
+   - ξ ∝ t^{-0.26}
+   - Correlation σ_P vs L_J: r = 0.998
+
+3. **NOT standard coarsening:**
+   - Domains SHRINK (ξ decreases), not grow
+   - System evolves toward homogeneity
+   - Segregation peaked at 0.32 then decreased to 0.09
+
+4. **Self-similarity tests:**
+   - Gradient PDF collapse: partial (not strict)
+   - Power spectrum scaling: approximate
+
+**Interpretation:**
+  Interface-driven mixing dynamics. The Janus system does NOT form
+  stable segregated domains at this resolution/parameters. Instead,
+  initial segregation (Seg=0.32) is followed by re-mixing (Seg=0.09).
+
+**Outputs:**
+  - Snapshots: snap_000500.bin, snap_001000.bin, snap_002000.bin
+  - Analysis: analysis_v10_snapshot{500,1000,2000}/
+  - Video: janus_particles_rotation_4k.mp4 (239 MB, 2M particles)
+  - Report: V10_SIMULATION_RESULTS.md
+
+Binary: src/bin/janus_v10_highres.rs, src/bin/resume_v10.rs

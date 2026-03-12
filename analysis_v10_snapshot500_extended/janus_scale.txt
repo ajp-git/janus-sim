@@ -1,0 +1,13 @@
+Characteristic Janus Scale Analysis
+====================================
+
+<P²> = 0.778926
+<|∇P|²> = 0.667312 Mpc⁻²
+
+L_J = sqrt(<P²> / <|∇P|²>) = 1.0804 Mpc
+
+Interpretation:
+  This is the characteristic scale over which
+  polarization varies significantly.
+
+  L_J / cell_size = 1.38

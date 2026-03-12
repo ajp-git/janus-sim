@@ -20,21 +20,21 @@ use janus::nbody_gpu::GpuNBodySimulation;
 #[cfg(feature = "cuda")]
 use janus::friedmann::{JanusParams, CosmoInterpolator};
 
-// Phase B parameters (from FILAMENTS_ROADMAP.md)
-const N_PARTICLES: usize = 500_000;
-const BOX_SIZE: f64 = 100.0;          // Mpc
+// Phase C parameters (8M production - same density as 2M reference)
+const N_PARTICLES: usize = 8_000_000;
+const BOX_SIZE: f64 = 430.0;          // Mpc (8M^(1/3) × 2.15 = 200 × 2.15)
 const Z_INIT: f64 = 5.0;              // Same as validated runs
 const THETA: f64 = 0.7;               // FIX-012 validated
 const DT: f64 = 0.01;                 // Same as 2M reference
-const TOTAL_STEPS: usize = 2000;
-const SOFTENING: f64 = 0.3;           // 0.3 × spacing (spacing≈1.26 Mpc for 500K)
+const TOTAL_STEPS: usize = 10000;     // z=5 → z=0
+const SOFTENING: f64 = 0.65;          // 0.3 × spacing (spacing=2.15 Mpc)
 
 // P(k) spectrum
 const N_S: f64 = 0.96;                // Spectral index
 const K_PEAK: f64 = 0.02;             // Mpc⁻¹, coherence scale ~50 Mpc
 
 // Output intervals
-const RENDER_INTERVAL: usize = 20;
+const RENDER_INTERVAL: usize = 50;    // Every 50 steps for 20M (200 render files)
 const CSV_INTERVAL: usize = 1;
 
 /// Generate anti-correlated Zel'dovich ICs
@@ -463,13 +463,16 @@ fn main() {
     let eta = 1.045;
     let params = JanusParams::from_eta(eta);
     let cosmo = CosmoInterpolator::new(&params, Z_INIT);
-    let dtau = (cosmo.tau_end - cosmo.tau_start) / TOTAL_STEPS as f64;
+    let dtau_per_step = (cosmo.tau_end - cosmo.tau_start) / TOTAL_STEPS as f64;
+    // dtau_per_dt: FIXED convention from February - 10000 steps cover z=5→0
+    let dtau_per_dt = (cosmo.tau_end - cosmo.tau_start).abs() / (10000.0 * DT);
 
     println!("\nCosmology:");
     println!("  η = {}", eta);
     println!("  z_init = {}, z_final = 0", Z_INIT);
     println!("  τ_start = {:.4}, τ_end = {:.4}", cosmo.tau_start, cosmo.tau_end);
-    println!("  dτ/step = {:.6}", dtau);
+    println!("  dτ/step = {:.6}", dtau_per_step);
+    println!("  dτ/dt = {:.6} (February convention)", dtau_per_dt);
 
     // Open CSV
     let csv_path = format!("{}/time_series.csv", output_dir);
@@ -503,12 +506,12 @@ fn main() {
         let step_start = Instant::now();
 
         // Get cosmological parameters
-        tau += dtau;
+        tau += dtau_per_step;
         let (a, h) = cosmo.get_params_at_tau(tau);
         let z = 1.0 / a - 1.0;
 
         // Step with Hubble friction
-        sim.step_with_expansion_dkd_gpu(DT, a, h, dtau)
+        sim.step_with_expansion_dkd_gpu(DT, a, h, dtau_per_dt)
             .expect("Step failed");
 
         let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;

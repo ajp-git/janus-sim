@@ -592,3 +592,18 @@ name = "nodipole_zeldovich_4m"
 path = "src/bin/nodipole_zeldovich_4m.rs"
 required-features = ["cuda", "cufft"]
 
+[[bin]]
+name = "exploration_v4"
+path = "src/bin/exploration_v4.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "v9_gpu_search"
+path = "src/bin/v9_gpu_search.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "janus_v10_highres"
+path = "src/bin/janus_v10_highres.rs"
+required-features = ["cuda", "cufft"]
+

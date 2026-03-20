@@ -159,6 +159,9 @@ num-complex = "0.4"
 # Date/time for output directories
 chrono = "0.4"
 
+# CLI argument parsing
+clap = { version = "4.4", features = ["derive"] }
+
 [dev-dependencies]
 approx = "0.5"
 
@@ -607,3 +610,74 @@ name = "janus_v10_highres"
 path = "src/bin/janus_v10_highres.rs"
 required-features = ["cuda", "cufft"]
 
+[[bin]]
+name = "janus_seg_eta_scan"
+path = "src/bin/janus_seg_eta_scan.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "janus_seg_boxsize"
+path = "src/bin/janus_seg_boxsize.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "janus_v13_cosmic_web"
+path = "src/bin/janus_v13_cosmic_web.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "janus_v13_1M"
+path = "src/bin/janus_v13_1M.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "janus_v13_500Mpc"
+path = "src/bin/janus_v13_500Mpc.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "janus_v13_500Mpc_resume"
+path = "src/bin/janus_v13_500Mpc_resume.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "janus_v13_500Mpc_15M"
+path = "src/bin/janus_v13_500Mpc_15M.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "janus_v13_15M_resume"
+path = "src/bin/janus_v13_15M_resume.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "zoom_exploration"
+path = "src/bin/zoom_exploration.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "zoom_phase1"
+path = "src/bin/zoom_phase1.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "janus_v14_3M_kmin20"
+path = "src/bin/janus_v14_3M_kmin20.rs"
+required-features = ["cuda", "cufft"]
+
+
+[[bin]]
+name = "janus_v15_500Mpc_15M"
+path = "src/bin/janus_v15_500Mpc_15M.rs"
+
+[[bin]]
+name = "janus_v16_500Mpc_30M"
+path = "src/bin/janus_v16_500Mpc_30M.rs"
+
+[[bin]]
+name = "janus_v16_resume"
+path = "src/bin/janus_v16_resume.rs"
+
+[[bin]]
+name = "lcdm_control_3M_kmin20"
+path = "src/bin/lcdm_control_3M_kmin20.rs"

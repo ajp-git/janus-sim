@@ -1,192 +1,201 @@
 #!/usr/bin/env python3
 """
-Render Janus simulation binary data to PNG frames.
+Janus 85M - Python frame renderer
+Watches for .bin files and renders PNG frames
 
-Input:  render_data/step_XXXXXX.bin (60M × 13 bytes: x,y,z f32 + sign i8)
-Output: frames/frame_XXXXXX.png
+Usage: python3 render_frames.py <output_dir> [--once]
+  output_dir: e.g., /app/output/85M_2026-02-25
+  --once: Process existing files and exit (don't watch)
 
-Format: 2048×2048 total, 3 panels (XY | XZ | YZ)
-        Black background, blue(+) / red(-) density
+Reads from: <output_dir>/render_data/step_XXXXXX.bin
+Writes to:  <output_dir>/frames/frame_XXXXXX.png
 """
 
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 import struct
 import sys
-import os
-from pathlib import Path
 import time
+from pathlib import Path
 
-# Try to import matplotlib with Agg backend (no display)
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
+# Image dimensions
+VIEW_SIZE = 1280
+IMG_WIDTH = 3840
+IMG_HEIGHT = 1280
 
-def read_render_bin(filepath):
-    """Read binary render data file."""
-    with open(filepath, 'rb') as f:
-        # Header: step(u32) + box_size(f64) + seg(f64) + ke_ratio(f64) + redshift(f64) + n(u32)
-        step = struct.unpack('<I', f.read(4))[0]
-        box_size = struct.unpack('<d', f.read(8))[0]
-        seg = struct.unpack('<d', f.read(8))[0]
-        ke_ratio = struct.unpack('<d', f.read(8))[0]
-        redshift = struct.unpack('<d', f.read(8))[0]
-        n = struct.unpack('<I', f.read(4))[0]
+# Colors (RGB, 0-1 range)
+COLOR_POS = np.array([0.27, 0.53, 1.0], dtype=np.float32)   # #4488FF (blue)
+COLOR_NEG = np.array([1.0, 0.27, 0.13], dtype=np.float32)   # #FF4422 (red)
 
-        # Positions: N × 3 × f32
-        pos_data = np.frombuffer(f.read(n * 3 * 4), dtype=np.float32).reshape(n, 3)
+def compute_alpha(n_particles):
+    """Compute alpha based on particle count for balanced brightness"""
+    particles_per_pixel = n_particles / (VIEW_SIZE * VIEW_SIZE)
+    # Target ~0.4 average brightness
+    return min(0.15, 0.4 / max(particles_per_pixel, 1))
 
-        # Signs: N × i8
-        signs = np.frombuffer(f.read(n), dtype=np.int8)
 
-    return {
-        'step': step,
-        'box_size': box_size,
-        'seg': seg,
-        'ke_ratio': ke_ratio,
-        'redshift': redshift,
-        'n': n,
-        'pos': pos_data,
-        'signs': signs
-    }
+def render_frame(bin_path: Path, frames_dir: Path) -> bool:
+    """Render a single frame from binary data"""
+    try:
+        with open(bin_path, 'rb') as f:
+            # Header: step(u32) + box_size(f64) + seg(f64) + ke_ratio(f64) + redshift(f64) + n(u32)
+            step = struct.unpack('<I', f.read(4))[0]
+            box_size = struct.unpack('<d', f.read(8))[0]
+            seg = struct.unpack('<d', f.read(8))[0]
+            ke_ratio = struct.unpack('<d', f.read(8))[0]
+            redshift = struct.unpack('<d', f.read(8))[0]
+            n = struct.unpack('<I', f.read(4))[0]
 
-def create_density_map(pos, signs, box_size, grid_size=1024):
-    """Create density histograms for positive and negative particles."""
-    half_box = box_size / 2.0
+            # pos: N×3×f32
+            pos = np.frombuffer(f.read(n * 3 * 4), dtype=np.float32).reshape(n, 3)
 
-    # Separate positive and negative
-    pos_plus = pos[signs > 0]
-    pos_minus = pos[signs < 0]
+            # signs: N×i8
+            signs = np.frombuffer(f.read(n), dtype=np.int8)
 
-    # Bins for histogram
-    bins = np.linspace(-half_box, half_box, grid_size + 1)
+        # Check if frame already exists
+        out_path = frames_dir / f"frame_{step:06d}.png"
+        if out_path.exists():
+            print(f"[skip] frame_{step:06d}.png already exists")
+            return True
 
-    # XY projection
-    h_plus_xy, _, _ = np.histogram2d(pos_plus[:, 0], pos_plus[:, 1], bins=[bins, bins])
-    h_minus_xy, _, _ = np.histogram2d(pos_minus[:, 0], pos_minus[:, 1], bins=[bins, bins])
+        # Compute alpha based on particle count
+        alpha = compute_alpha(n)
+        print(f"[render] Processing step {step:06d}: z={redshift:.2f}, N={n}, S={seg:.3e}, KE/KE0={ke_ratio:.4f}")
 
-    # XZ projection
-    h_plus_xz, _, _ = np.histogram2d(pos_plus[:, 0], pos_plus[:, 2], bins=[bins, bins])
-    h_minus_xz, _, _ = np.histogram2d(pos_minus[:, 0], pos_minus[:, 2], bins=[bins, bins])
+        # Create RGBA buffer (black background with full alpha)
+        buf = np.zeros((IMG_HEIGHT, IMG_WIDTH, 4), dtype=np.float32)
+        buf[:, :, 3] = 1.0  # Opaque black background
 
-    # YZ projection
-    h_plus_yz, _, _ = np.histogram2d(pos_plus[:, 1], pos_plus[:, 2], bins=[bins, bins])
-    h_minus_yz, _, _ = np.histogram2d(pos_minus[:, 1], pos_minus[:, 2], bins=[bins, bins])
+        # Coordinate mapping
+        box_min = -box_size / 2.0
+        scale = (VIEW_SIZE - 1) / box_size
 
-    return {
-        'xy': (h_plus_xy, h_minus_xy),
-        'xz': (h_plus_xz, h_minus_xz),
-        'yz': (h_plus_yz, h_minus_yz)
-    }
+        # Separate positive and negative particles
+        pos_mask = signs > 0
+        pos_plus = pos[pos_mask]
+        pos_minus = pos[~pos_mask]
 
-def render_frame(data, output_path, grid_size=1024):
-    """Render a single frame with 3 projections."""
-    t0 = time.time()
+        # Render positive particles (blue)
+        if len(pos_plus) > 0:
+            render_particles(buf, pos_plus, COLOR_POS, box_min, scale, 0, alpha)           # XY
+            render_particles_xz(buf, pos_plus, COLOR_POS, box_min, scale, VIEW_SIZE, alpha)     # XZ
+            render_particles_yz(buf, pos_plus, COLOR_POS, box_min, scale, 2*VIEW_SIZE, alpha)   # YZ
 
-    # Create density maps
-    density = create_density_map(data['pos'], data['signs'], data['box_size'], grid_size)
+        # Render negative particles (red)
+        if len(pos_minus) > 0:
+            render_particles(buf, pos_minus, COLOR_NEG, box_min, scale, 0, alpha)          # XY
+            render_particles_xz(buf, pos_minus, COLOR_NEG, box_min, scale, VIEW_SIZE, alpha)    # XZ
+            render_particles_yz(buf, pos_minus, COLOR_NEG, box_min, scale, 2*VIEW_SIZE, alpha)  # YZ
 
-    # Create figure: 3 panels side by side (2048x768 total)
-    fig, axes = plt.subplots(1, 3, figsize=(20.48, 7.68), facecolor='black')
-    fig.subplots_adjust(left=0.03, right=0.97, top=0.90, bottom=0.08, wspace=0.08)
+        # Convert to uint8
+        img_data = (buf * 255).clip(0, 255).astype(np.uint8)
+        img = Image.fromarray(img_data, mode='RGBA')
 
-    projections = [('xy', 'X', 'Y'), ('xz', 'X', 'Z'), ('yz', 'Y', 'Z')]
+        # Draw title
+        draw = ImageDraw.Draw(img)
+        title = f"Step {step:06d}  |  z = {redshift:.2f}  |  S = {seg:.3e}  |  KE/KE0 = {ke_ratio:.4f}"
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 32)
+        except:
+            font = ImageFont.load_default()
 
-    for ax, (proj, xlabel, ylabel) in zip(axes, projections):
-        h_plus, h_minus = density[proj]
+        # Black background for title
+        draw.rectangle([0, 0, 850, 45], fill=(0, 0, 0, 220))
+        draw.text((20, 8), title, fill=(255, 255, 255, 255), font=font)
 
-        # Use log scale for better visibility
-        h_plus_log = np.log10(h_plus + 1)
-        h_minus_log = np.log10(h_minus + 1)
+        # Save PNG
+        img.save(out_path)
+        print(f"[render] frame_{step:06d}.png saved")
+        return True
 
-        # Compute difference: positive values = more +, negative = more -
-        # This shows segregation as blue vs red regions
-        h_diff = h_plus_log - h_minus_log
-        h_total = h_plus_log + h_minus_log
+    except Exception as e:
+        print(f"[render] Error processing {bin_path}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
-        # Normalize difference by total density
-        h_ratio = np.divide(h_diff, h_total + 1e-10, where=(h_total > 0.1))
-        h_ratio = np.clip(h_ratio, -1, 1)
 
-        # Create RGB: blue where ratio > 0 (more +), red where ratio < 0 (more -)
-        # Brightness from total density
-        brightness = np.clip(h_total / (h_total.max() + 1e-10) * 2, 0, 1)
+def render_particles(buf, pos, color, box_min, scale, x_offset, alpha):
+    """Render XY projection"""
+    x = pos[:, 0]
+    y = pos[:, 1]
 
-        rgb = np.zeros((grid_size, grid_size, 3))
-        # Red channel: where ratio < 0 (more negative particles)
-        rgb[:, :, 0] = brightness.T * np.clip(-h_ratio.T, 0, 1)
-        # Blue channel: where ratio > 0 (more positive particles)
-        rgb[:, :, 2] = brightness.T * np.clip(h_ratio.T, 0, 1)
-        # Add some white/gray for mixed regions
-        rgb[:, :, 1] = brightness.T * (1 - np.abs(h_ratio.T)) * 0.3
+    ix = ((x - box_min) * scale).clip(0, VIEW_SIZE - 1).astype(np.int32) + x_offset
+    iy = ((y - box_min) * scale).clip(0, VIEW_SIZE - 1).astype(np.int32)
+    iy_flip = VIEW_SIZE - 1 - iy
 
-        # Boost overall brightness
-        rgb = np.clip(rgb * 1.5, 0, 1)
+    np.add.at(buf, (iy_flip, ix, 0), color[0] * alpha)
+    np.add.at(buf, (iy_flip, ix, 1), color[1] * alpha)
+    np.add.at(buf, (iy_flip, ix, 2), color[2] * alpha)
 
-        ax.imshow(rgb, origin='lower', extent=[-data['box_size']/2, data['box_size']/2,
-                                                -data['box_size']/2, data['box_size']/2])
-        ax.set_xlabel(f'{xlabel} (Mpc)', color='white', fontsize=10)
-        ax.set_ylabel(f'{ylabel} (Mpc)', color='white', fontsize=10)
-        ax.set_title(f'{xlabel}-{ylabel}', color='white', fontsize=12)
-        ax.tick_params(colors='white', labelsize=8)
-        for spine in ax.spines.values():
-            spine.set_color('white')
-        ax.set_facecolor('black')
 
-    # Main title
-    title = f"Janus 60M — Step {data['step']:06d} | z={data['redshift']:.2f} | Seg={data['seg']:.4f}"
-    fig.suptitle(title, color='white', fontsize=14, y=0.96)
+def render_particles_xz(buf, pos, color, box_min, scale, x_offset, alpha):
+    """Render XZ projection"""
+    x = pos[:, 0]
+    z = pos[:, 2]
 
-    # Save
-    plt.savefig(output_path, dpi=100, facecolor='black', edgecolor='none')
-    plt.close(fig)
+    ix = ((x - box_min) * scale).clip(0, VIEW_SIZE - 1).astype(np.int32) + x_offset
+    iz = ((z - box_min) * scale).clip(0, VIEW_SIZE - 1).astype(np.int32)
+    iz_flip = VIEW_SIZE - 1 - iz
 
-    elapsed = time.time() - t0
-    return elapsed
+    np.add.at(buf, (iz_flip, ix, 0), color[0] * alpha)
+    np.add.at(buf, (iz_flip, ix, 1), color[1] * alpha)
+    np.add.at(buf, (iz_flip, ix, 2), color[2] * alpha)
+
+
+def render_particles_yz(buf, pos, color, box_min, scale, x_offset, alpha):
+    """Render YZ projection"""
+    y = pos[:, 1]
+    z = pos[:, 2]
+
+    iy = ((y - box_min) * scale).clip(0, VIEW_SIZE - 1).astype(np.int32) + x_offset
+    iz = ((z - box_min) * scale).clip(0, VIEW_SIZE - 1).astype(np.int32)
+    iz_flip = VIEW_SIZE - 1 - iz
+
+    np.add.at(buf, (iz_flip, iy, 0), color[0] * alpha)
+    np.add.at(buf, (iz_flip, iy, 1), color[1] * alpha)
+    np.add.at(buf, (iz_flip, iy, 2), color[2] * alpha)
+
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python render_frames.py <render_data_dir> [output_dir]")
-        print("   or: python render_frames.py <single_file.bin> [output_dir]")
+        print("Usage: python3 render_frames.py <output_dir> [--once]")
+        print("  e.g.: python3 render_frames.py /app/output/85M_2026-02-25")
         sys.exit(1)
 
-    input_path = Path(sys.argv[1])
+    output_dir = Path(sys.argv[1])
+    once_mode = '--once' in sys.argv
 
-    if input_path.is_file():
-        # Single file mode
-        output_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else input_path.parent.parent / 'frames'
-        output_dir.mkdir(parents=True, exist_ok=True)
+    render_data_dir = output_dir / "render_data"
+    frames_dir = output_dir / "frames"
 
-        print(f"Rendering {input_path}...")
-        data = read_render_bin(input_path)
-        print(f"  Loaded: {data['n']:,} particles, z={data['redshift']:.2f}, Seg={data['seg']:.4f}")
+    print("=" * 60)
+    print("Janus 85M Python Frame Renderer")
+    print("=" * 60)
+    print(f"Watching: {render_data_dir}")
+    print(f"Output:   {frames_dir}")
+    print(f"Mode:     {'once' if once_mode else 'continuous'}")
+    print()
 
-        output_file = output_dir / f"frame_{data['step']:06d}.png"
-        elapsed = render_frame(data, output_file)
-        print(f"  Saved: {output_file} ({elapsed:.1f}s)")
+    render_data_dir.mkdir(parents=True, exist_ok=True)
+    frames_dir.mkdir(parents=True, exist_ok=True)
 
-    elif input_path.is_dir():
-        # Directory mode - process all .bin files
-        output_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else input_path.parent / 'frames'
-        output_dir.mkdir(parents=True, exist_ok=True)
+    while True:
+        # Find all .bin files
+        bin_files = sorted(render_data_dir.glob("step_*.bin"))
 
-        bin_files = sorted(input_path.glob('step_*.bin'))
-        print(f"Found {len(bin_files)} files to process")
+        for bin_path in bin_files:
+            t0 = time.time()
+            if render_frame(bin_path, frames_dir):
+                print(f"[render] Completed in {time.time() - t0:.1f}s")
 
-        for i, bin_file in enumerate(bin_files):
-            print(f"[{i+1}/{len(bin_files)}] Rendering {bin_file.name}...")
-            data = read_render_bin(bin_file)
-            output_file = output_dir / f"frame_{data['step']:06d}.png"
+        if once_mode:
+            if not bin_files:
+                print("No files to process")
+            break
 
-            if output_file.exists():
-                print(f"  Skipping (already exists)")
-                continue
+        time.sleep(1)
 
-            elapsed = render_frame(data, output_file)
-            print(f"  z={data['redshift']:.2f}, Seg={data['seg']:.4f} -> {output_file.name} ({elapsed:.1f}s)")
-    else:
-        print(f"Error: {input_path} not found")
-        sys.exit(1)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

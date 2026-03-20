@@ -887,3 +887,301 @@ Optimization tested:
 
 Binary: src/bin/janus_v11_tree_rebuild_B2.rs
 Output: /app/output/janus_v11_tree_rebuild_B2/
+
+---
+
+### Universality Test: Segregation vs Initial Conditions
+Date: 2026-03-12
+Status: **completed** ✅
+
+**Objective:** Test whether segregation plateau is universal or depends on initial conditions
+
+**Hypothesis:** If Janus segregation represents a physical equilibrium, the final plateau should be independent of initial velocity amplitude (α_IC).
+
+**Test Setup:**
+  - N = 512,000 particles
+  - L = 200 Mpc, η = 1.06, ε = 0.18, θ = 0.7, R_cut = 18 Mpc
+  - z_init = 5.0 → z_final = 0.0 (1000 steps)
+  - Zel'dovich ICs with same seed (42) but different α_IC
+
+**Runs:**
+| Run | α_IC | <|v|> | KE₀ | Seg_1000 |
+|-----|------|-------|-----|----------|
+| A (standard) | 1.6 | 0.0023 | 1.94 | **0.3449** |
+| B (high vel) | 3.0 | 0.0043 | 6.80 | **0.3368** |
+| C (low vel)  | 0.8 | 0.0011 | 0.48 | **0.3387** |
+
+**Statistical Analysis:**
+  - Velocity amplitude range: 0.8 – 3.0 (×3.8 variation)
+  - Initial kinetic energy range: 0.48 – 6.80 (×14.1 variation)
+  - Mean Seg_1000: **0.340 ± 0.004**
+  - Spread (max-min): 0.0081
+  - Coefficient of variation: **1.02%**
+
+**Verdict: ✅ SEGREGATION UNIVERSALITY CONFIRMED**
+
+Despite a 14× variation in initial kinetic energy, all runs converge to Seg_1000 ≈ 0.340 with only 1% scatter.
+
+**Physical Interpretation:**
+The Janus segregation plateau represents a **universal equilibrium** determined by:
+  - The mass ratio η (sets ρ̄/ρ)
+  - Gravitational interactions (attraction ++/--, repulsion +-)
+  - Hubble friction (dissipation mechanism)
+
+The plateau is NOT sensitive to:
+  - Initial velocity dispersion
+  - Initial kinetic energy
+  - Initial virial state
+
+This confirms that segregation is a robust prediction of the Janus model, not an artifact of specific initial conditions.
+
+Binary: src/bin/janus_segregation_universality.rs
+Outputs:
+  - /app/output/seg_universality_A_standard/
+  - /app/output/seg_universality_B_high_vel/
+  - /app/output/seg_universality_C_low_vel/
+
+---
+
+### Run: janus_v13_1M (L=200 Mpc)
+Date: 2026-03-13
+Status: **completed** ✅
+
+**Goal:** Baseline for L_J scale analysis at moderate resolution
+
+Parameters:
+  N particles: 1,000,000 (100³ grid)
+  Box: 200 Mpc
+  η: 1.045
+  z_init: 5.0 → z_final: 0.0
+  θ: 0.7
+  dt: 0.01
+  ε: 0.18 Mpc
+  R_cut: 18 Mpc
+  Steps: 5000
+  Integrator: TreePM (step_treepm_gpu)
+  ICs: Zel'dovich (k_cut=0.25, α_IC=1.6)
+
+Results:
+  Runtime: ~2.5h
+  Seg₀: 0.0003
+  **Seg_max: ~0.43**
+  **Seg_final: 0.29**
+
+**Scale Analysis (2 Mpc resolution):**
+
+| z | σ_P | L_J | ξ |
+|---|-----|-----|---|
+| 5.0 | 1.00 | 1.8 | 3 |
+| 2.0 | 0.34 | 5.1 | saturated (100) |
+| 0.0 | **0.37** | **3.4 Mpc** | saturated |
+
+**Key Finding:** L_J ≈ 3.4 Mpc at z=0
+  - Robust with 2 Mpc cell resolution
+  - Matches cosmic filament thickness (1-5 Mpc)
+  - ξ saturates at L/2 = 100 Mpc (box artifact)
+
+Output: /app/output/janus_v13_1M/
+Binary: src/bin/janus_v13_1M.rs
+
+---
+
+### Run: janus_v13_500Mpc (L=500 Mpc, 5M)
+Date: 2026-03-13
+Status: **completed** ✅ (resumed after crash)
+
+**Goal:** Test if L_J and σ_P scale with box size
+
+Parameters:
+  N particles: 5,000,211 (171³ grid)
+  Box: 500 Mpc
+  η: 1.045
+  z_init: 5.0 → z_final: 0.0
+  θ: 0.7
+  dt: 0.01
+  ε: 0.45 Mpc (scaled)
+  R_cut: 45 Mpc (scaled)
+  Steps: 5000
+  Integrator: TreePM (step_treepm_gpu)
+  ICs: Zel'dovich (same recipe as V13_1M)
+
+Results:
+  Runtime: ~9h (8.1s → 10s/step as structures form)
+  Seg₀: 0.0002
+  **Seg_max: 0.432** @ step ~4850 (z ≈ 0.03)
+  **Seg_final: 0.428**
+
+**Scale Analysis (2 Mpc resolution):**
+
+| z | σ_P | L_J | ξ |
+|---|-----|-----|---|
+| 5.0 | 0.57 | 2.1 | 8 |
+| 2.0 | 0.19 | 14 | saturated (250) |
+| 0.0 | **0.15** | **21 Mpc** | 78 (decreasing!) |
+
+**CRITICAL FINDING: σ_P diverges between runs!**
+
+| Metric | Run 1 (1M, L=200) | Run 2 (5M, L=500) |
+|--------|-------------------|-------------------|
+| σ_P (z=0) | 0.37 | **0.15** (2.5× lower) |
+| L_J (z=0) | 3.4 Mpc | 21 Mpc |
+| Interpretation | Strong segregation | **Diffuse segregation** |
+
+**Coarsening Analysis:**
+  - ξ grows to L/2 = 250 Mpc, then **DECREASES** to 78 Mpc
+  - This is **ANTI-coarsening**: domains shrink at late times
+  - Not standard gravitational coarsening (ξ ∝ t^{1/3})
+
+**Two Hypotheses:**
+  1. **Resolution artifact:** 5M in 500 Mpc is too sparse (0.3 part/cell at 2 Mpc)
+     → Need 15-20M to confirm
+  2. **Real physics:** Large box = more linear modes = weaker segregation
+     → Would be fundamental limitation of Janus model
+
+**Next Step:** Run L=500 Mpc, N=15-20M to discriminate hypotheses
+
+Output: /app/output/janus_v13_500Mpc/
+Binary: src/bin/janus_v13_500Mpc.rs, src/bin/janus_v13_500Mpc_resume.rs
+
+---
+
+## Analysis: L_J Convergence Test (2026-03-13)
+
+**Method:** Recalculate L_J with fixed physical resolution (2 Mpc/cell) on all snapshots
+
+**Results:**
+
+| Run | Grid | σ_P (z=0) | L_J (z=0) | Particles/cell |
+|-----|------|-----------|-----------|----------------|
+| 1M, L=200 | 100³ | 0.37 | **3.4 Mpc** | 1.0 |
+| 5M, L=500 | 250³ | 0.15 | 21 Mpc | 0.3 |
+
+**Initial Conclusion:**
+  - L_J ≈ 3-4 Mpc in Run 1 is **robust** (well-resolved)
+  - Run 2 has σ_P 2.5× lower → structures more diffuse
+  - Run 2 is under-sampled (0.3 particles/cell < 1)
+
+---
+
+## Analysis: σ_P on Populated Cells (2026-03-13) — TEST DÉCISIF
+
+**Question:** Is σ_P = 0.15 in Run 2 real physics or sparsity artifact?
+
+**Method:** Calculate σ_P only on cells with ≥1 particle (exclude empty cells)
+
+**Results at 2 Mpc/cell:**
+
+| Run | Empty cells | σ_P (all) | σ_P (populated) | <N/cell> |
+|-----|-------------|-----------|-----------------|----------|
+| 1M, L=200 | 27% | 0.37 | **0.99** | 7.4 |
+| 5M, L=500 | **97.9%** | 0.15 | **1.00** | 15.1 |
+
+**VERDICT: SPARSITY ARTIFACT ✅**
+
+Both runs show **identical physics**:
+  - Populated cells have P ≈ ±1 (COMPLETE segregation)
+  - Empty cells have P = 0 by definition
+  - σ_P = 0.15 is diluted by 97.9% empty cells
+
+**Physical Interpretation:**
+  - Janus segregation is TOTAL within clusters (P = ±1)
+  - Each populated cell is pure positive OR pure negative
+  - The low σ_P in Run 2 reflects sparse sampling, not weak segregation
+
+---
+
+## Analysis: L_J on Populated Cells (2026-03-13)
+
+**Method:** Calculate gradient only between neighboring populated cells
+
+**Results:**
+
+| Run | Cell | Pop% | σ_P | L_J |
+|-----|------|------|-----|-----|
+| 1M, L=200 | 4 Mpc | 52% | 0.94 | **5.9 Mpc** |
+| 1M, L=200 | 5 Mpc | 72% | 0.89 | **6.9 Mpc** |
+| 5M, L=500 | 4 Mpc | 4% | 1.00 | 5.3 Mpc (noisy) |
+| 5M, L=500 | 5 Mpc | 5% | 1.00 | 11.2 Mpc (noisy) |
+
+**Problem:** Run 2 too sparse for reliable gradient calculation
+  - At 4-5 Mpc/cell, only 4-5% of cells populated
+  - Most populated cells are isolated → artificial gradients
+  - Need ~50% fill rate for reliable L_J calculation
+
+**Conclusion:**
+  - **L_J ≈ 5-7 Mpc** in Run 1 (well-resolved, 50-70% filled)
+  - Run 2 cannot confirm L_J due to sparsity
+  - **15M run will resolve this** (expected ~12% fill at 4 Mpc/cell)
+
+---
+
+### Run: janus_v13_500Mpc_15M (L=500 Mpc, 15M)
+Date: 2026-03-13
+Status: **running** 🔄
+
+**Goal:** Confirm L_J ≈ 5-6 Mpc with adequate resolution in large box
+
+Parameters:
+  N particles: 15,069,223 (247³ grid)
+  Box: 500 Mpc
+  η: 1.045
+  z_init: 5.0 → z_final: 0.0
+  θ: 0.7
+  dt: 0.01
+  ε: 0.35 Mpc
+  R_cut: 40 Mpc
+  Steps: 5000
+  Integrator: TreePM (step_treepm_gpu)
+  ICs: Zel'dovich (same recipe as V13_1M/5M)
+
+Expected:
+  Runtime: ~8h (6s/step)
+  Cell fill rate: ~12% at 4 Mpc/cell (vs 4% for 5M)
+  σ_P global: ~0.25-0.30 (intermediate)
+  L_J: should converge to **5-6 Mpc** (same as Run 1)
+
+Validation Criteria:
+  - [ ] σ_P (populated) ≈ 1.0 (same as 5M)
+  - [ ] L_J at 4-5 Mpc/cell converges to 5-6 Mpc
+  - [ ] Seg_max > 0.4
+
+Output: /app/output/janus_v13_500Mpc_15M/
+Binary: src/bin/janus_v13_500Mpc_15M.rs
+Container: b0e6bdc (background)
+
+---
+
+## Key Findings (V13 Series)
+
+### 1. Segregation is TOTAL within clusters
+  - P = ±1 in populated cells (pure + or pure -)
+  - σ_P(populated) ≈ 1.0 in BOTH runs
+  - Low global σ_P is sparsity artifact, not weak segregation
+
+### 2. L_J ≈ 5-6 Mpc (preliminary)
+  - Run 1 at 50% fill rate: L_J = 5.9 Mpc
+  - Matches cosmic filament thickness (1-5 Mpc)
+  - Awaiting 15M run confirmation
+
+### 3. Anti-coarsening observed
+  - ξ increases to L/2, then DECREASES
+  - Not standard coarsening (ξ ∝ t^{1/3})
+  - Suggests domains fragment rather than merge
+
+### 4. Resolution requirements
+  - Need ~50% cell fill rate for reliable L_J
+  - 2 Mpc/cell requires ~1 particle/cell = N/L³ ≈ (L/2)³
+  - For L=500 Mpc: need N ≈ 15M minimum (achieved in 15M run)
+
+**Plots:**
+  - output/LJ_comparison_2Mpc.png
+  - output/coarsening_xi_test.png
+  - output/coarsening_analysis.png
+
+**CSV:**
+  - output/LJ_comparison_2Mpc.csv
+
+**Scripts:**
+  - scripts/test_sigma_P_masked.py
+  - scripts/test_LJ_masked.py
+  - scripts/recalc_LJ_adaptive.py

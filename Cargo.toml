@@ -140,9 +140,11 @@ cudarc = { version = "0.12", features = ["cuda-12030", "nvrtc"], optional = true
 rand = "0.9"
 rand_distr = "0.5"
 
-# Sérialisation CSV
+# Sérialisation CSV/YAML
 csv = "1.3"
 serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
 
 # Statistiques / optimisation
 argmin = "0.10"
@@ -681,3 +683,8 @@ path = "src/bin/janus_v16_resume.rs"
 [[bin]]
 name = "lcdm_control_3M_kmin20"
 path = "src/bin/lcdm_control_3M_kmin20.rs"
+
+[[bin]]
+name = "janus_optim"
+path = "src/bin/janus_optim.rs"
+required-features = ["cuda", "cufft"]

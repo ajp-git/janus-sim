@@ -1,0 +1,29 @@
+simulation:
+  box_size_mpc: 500.0
+  n_particles: 40000000
+  n_steps: 3000
+  z_start: 5.0
+  z_end: 0.0
+  seed: 42
+  theta: 0.5
+  softening_mpc: null
+
+physics:
+  eta: 0.99
+  lambda_base_mpc: 9.6
+  r_smooth_mpc: 1.92
+  lambda_floor: 0.01
+  hubble_friction: true
+  cross_force_asymmetry: 1.0
+  cross_force_z_start: 3.0
+  cross_force_z_width: 0.5
+
+pm_grid:
+  n_cells: 1024
+  k_min: 2
+
+output:
+  dir: output/publication_40M_video
+  snapshot_every_steps: 5
+  metrics_every_steps: 10
+  save_snapshots: true

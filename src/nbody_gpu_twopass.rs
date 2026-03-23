@@ -835,6 +835,120 @@ extern "C" __global__ void forces_twopass_warpcoherent(
 }
 
 // ============================================================================
+// [SCREENING] YUKAWA SCREENING FOR JANUS OPTIMIZATION
+// ============================================================================
+// Same as warpcoherent but with λ_base screening for opposite-sign forces
+// Force = (1/r²) × exp(-r/λ) × (1 + r/λ) for opposite signs
+// When λ → ∞: exp(-r/λ) → 1, so standard Janus
+// When λ → 0: exp(-r/λ) → 0, screening suppresses cross-forces
+
+extern "C" __global__ void forces_twopass_warpcoherent_screening(
+    const float* __restrict__ pos_all,
+    const signed char* __restrict__ signs_all,
+    const float* __restrict__ node_pos,
+    const float* __restrict__ node_mass,
+    const int* __restrict__ left,
+    const int* __restrict__ right,
+    const int* __restrict__ node_types,
+    float* __restrict__ acc,
+    int n_all, int tree_sign, float theta_soft_packed, float lambda_base
+    // theta_soft_packed: upper 16 bits = theta×1000, lower 16 bits = softening×1000
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    bool valid = (tid < n_all);
+    int accumulate = (tree_sign < 0) ? 1 : 0;
+
+    // Unpack theta and softening from packed value
+    int packed = __float_as_int(theta_soft_packed);
+    float theta = (float)((packed >> 16) & 0xFFFF) / 1000.0f;
+    float softening = (float)(packed & 0xFFFF) / 1000.0f;
+
+    extern __shared__ int shared_stack[];
+    int warp_id_in_block = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int* stack = shared_stack + warp_id_in_block * 128;
+
+    int safe_tid = valid ? tid : 0;
+    float px = pos_all[safe_tid*3], py = pos_all[safe_tid*3+1], pz = pos_all[safe_tid*3+2];
+    int my_sign = signs_all[safe_tid];
+    // sign_factor: +1 for attraction (same sign), -1 for repulsion (opposite)
+    int sign_same = (my_sign == tree_sign);
+
+    float ax=0, ay=0, az=0;
+    float eps2 = softening*softening;
+    float theta2 = theta*theta;
+    float inv_lambda = (lambda_base > 0.01f) ? (1.0f / lambda_base) : 0.0f;
+
+    int sp = 0;
+    if (lane == 0) stack[sp++] = 0;
+    __syncwarp(0xFFFFFFFF);
+
+    while (true) {
+        int stack_empty = (lane == 0 && sp <= 0) ? 1 : 0;
+        stack_empty = __shfl_sync(0xFFFFFFFF, stack_empty, 0);
+        if (stack_empty) break;
+
+        int node;
+        if (lane == 0) node = stack[--sp];
+        node = __shfl_sync(0xFFFFFFFF, node, 0);
+
+        if (node < 0) continue;
+        int nt = node_types[node];
+        if (nt == 0) continue;
+
+        int pb = node * 7;
+        float cx = node_pos[pb], cy = node_pos[pb+1], cz = node_pos[pb+2];
+        float hs = node_pos[pb+3];
+        float comx = node_pos[pb+4], comy = node_pos[pb+5], comz = node_pos[pb+6];
+        float m = node_mass[node];
+
+        float dx = cx-px, dy = cy-py, dz = cz-pz;
+        float r2 = dx*dx + dy*dy + dz*dz + 1e-20f;
+
+        bool should_approx = (nt == 1) || ((4.0f*hs*hs) < (theta2*r2));
+        bool all_approx = __all_sync(0xFFFFFFFF, should_approx);
+        bool all_descend = __all_sync(0xFFFFFFFF, !should_approx);
+
+        if (all_approx) {
+            if (valid) {
+                float ddx = comx-px, ddy = comy-py, ddz = comz-pz;
+                float rp2 = ddx*ddx + ddy*ddy + ddz*ddz + eps2;
+                float rp = sqrtf(rp2);
+                float irp3 = 1.0f / (rp2 * rp);
+
+                // Screening factor for opposite signs
+                float screening = 1.0f;
+                if (!sign_same && inv_lambda > 0.0f) {
+                    // Yukawa: exp(-r/λ) × (1 + r/λ) from gradient of exp(-r/λ)/r
+                    float x = rp * inv_lambda;
+                    screening = expf(-x) * (1.0f + x);
+                }
+
+                float sign_factor = sign_same ? 1.0f : -1.0f;
+                float f = sign_factor * screening * m * irp3;
+                ax += f*ddx; ay += f*ddy; az += f*ddz;
+            }
+        } else if (all_descend || true) {
+            // Descend into children
+            if (lane == 0) {
+                int lc = left[node], rc = right[node];
+                if (rc >= 0 && sp < 127) stack[sp++] = rc;
+                if (lc >= 0 && sp < 127) stack[sp++] = lc;
+            }
+        }
+        __syncwarp();
+    }
+
+    if (valid) {
+        if (accumulate) {
+            acc[tid*3] += ax; acc[tid*3+1] += ay; acc[tid*3+2] += az;
+        } else {
+            acc[tid*3] = ax; acc[tid*3+1] = ay; acc[tid*3+2] = az;
+        }
+    }
+}
+
+// ============================================================================
 // [OPT-2] SHARED MEMORY CACHED TOP NODES
 // ============================================================================
 // Cache the top 1024 BVH nodes in shared memory (~44KB)
@@ -1602,6 +1716,8 @@ pub struct GpuNBodyTwoPass {
     // Tree rebuild control (for A/B testing)
     tree_rebuild_interval: usize,  // 1 = every step (default), N = every N steps
     last_tree_rebuild_step: usize, // track when tree was last rebuilt
+    // Yukawa screening length (0 = no screening, standard Janus)
+    lambda_base: f64,
 }
 
 /// Timing breakdown for tree build phases (in milliseconds)
@@ -1644,7 +1760,7 @@ impl GpuNBodyTwoPass {
             "compute_morton_f32", "reorder_f32x3", "reorder_i32",
             "build_bvh_tp", "init_leaves_tp", "reduce_tp",
             "forces_twopass_overwrite", "forces_twopass_accumulate",
-            "forces_twopass_warpcoherent",
+            "forces_twopass_warpcoherent", "forces_twopass_warpcoherent_screening",
             "forces_twopass_shmem_overwrite", "forces_twopass_shmem_accumulate",
             "forces_direct_n2",
             "compute_morton_all", "reorder_by_idx_f32x3", "reorder_by_idx_i8",
@@ -1824,6 +1940,7 @@ impl GpuNBodyTwoPass {
             step_count: 0,
             tree_rebuild_interval: 1,  // default: rebuild every step
             last_tree_rebuild_step: 0,
+            lambda_base: 0.0,  // no screening by default
         })
     }
 
@@ -1854,7 +1971,7 @@ impl GpuNBodyTwoPass {
             "compute_morton_f32", "reorder_f32x3", "reorder_i32",
             "build_bvh_tp", "init_leaves_tp", "reduce_tp",
             "forces_twopass_overwrite", "forces_twopass_accumulate",
-            "forces_twopass_warpcoherent",
+            "forces_twopass_warpcoherent", "forces_twopass_warpcoherent_screening",
             "forces_twopass_shmem_overwrite", "forces_twopass_shmem_accumulate",
             "forces_direct_n2",
             "compute_morton_all", "reorder_by_idx_f32x3", "reorder_by_idx_i8",
@@ -1960,8 +2077,12 @@ impl GpuNBodyTwoPass {
             step_count: 0,
             tree_rebuild_interval: 1,  // default: rebuild every step
             last_tree_rebuild_step: 0,
+            lambda_base: 0.0,  // no screening by default
         })
     }
+
+    /// Set Yukawa screening length (0 = no screening, > 0 = exponential screening)
+    pub fn set_lambda_base(&mut self, lambda: f64) { self.lambda_base = lambda; }
 
     /// Set k-space filter minimum index (k_min=3 suppresses dipole modes k=0,1,2)
     pub fn set_pm_k_min(&mut self, k_min: usize) { self.pm_k_min = k_min; }
@@ -3559,66 +3680,134 @@ impl GpuNBodyTwoPass {
         // The reordering was corrupting the simulation by applying wrong velocities
         // to wrong particles after the kick step.
 
-        // Use warp-coherent kernel (all threads in warp traverse together)
-        let forces_wc_k = self.device.get_func("twopass", "forces_twopass_warpcoherent")
-            .ok_or("forces_twopass_warpcoherent not found")?;
+        // Use screening kernel if lambda_base > 0, standard kernel otherwise
+        let use_screening = self.lambda_base > 0.01;
 
         let reset_i32_k = self.device.get_func("twopass", "reset_i32")
             .ok_or("reset_i32 not found")?;
         let extract_k = self.device.get_func("twopass", "extract_by_sign")
             .ok_or("extract_by_sign not found")?;
 
-        // PASS 1: Positive particles tree
-        unsafe {
-            reset_i32_k.clone().launch(LaunchConfig {
-                block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
-            }, (&mut self.extract_count, 1))?;
-            extract_k.clone().launch(cfg, (
-                &self.pos, &self.signs,
-                &mut self.pos_sign, &mut self.idx_map,
-                n as i32, 1i32, &mut self.extract_count,
-            ))?;
-        }
-        self.device.synchronize()?;
-        let _ = self.build_single_sign_tree(1, self.n_positive)?;
+        if use_screening {
+            // Screening kernel: pack theta and softening into one float
+            // upper 16 bits = theta×1000, lower 16 bits = softening×1000
+            let theta_u16 = ((self.theta * 1000.0).round() as u32).min(0xFFFF);
+            let soft_u16 = ((self.softening * 1000.0).round() as u32).min(0xFFFF);
+            let packed_int = ((theta_u16 << 16) | soft_u16) as i32;
+            let theta_soft_packed: f32 = f32::from_bits(packed_int as u32);
+            let lambda_base_f32 = self.lambda_base as f32;
 
-        // Force + (overwrite: tree_sign=+1) with warp-coherent
-        unsafe {
-            forces_wc_k.clone().launch(warp_cfg, (
-                &self.pos, &self.signs,
-                &self.bvh_node_pos, &self.bvh_node_mass,
-                &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
-                &mut self.acc,
-                n as i32, 1i32, self.theta as f32, self.softening as f32,
-            ))?;
-        }
-        self.device.synchronize()?;
+            let forces_scr_k = self.device.get_func("twopass", "forces_twopass_warpcoherent_screening")
+                .ok_or("forces_twopass_warpcoherent_screening not found")?;
 
-        // PASS 2: Negative particles tree
-        unsafe {
-            reset_i32_k.launch(LaunchConfig {
-                block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
-            }, (&mut self.extract_count, 1))?;
-            extract_k.launch(cfg, (
-                &self.pos, &self.signs,
-                &mut self.pos_sign, &mut self.idx_map,
-                n as i32, -1i32, &mut self.extract_count,
-            ))?;
-        }
-        self.device.synchronize()?;
-        let _ = self.build_single_sign_tree(-1, self.n_negative)?;
+            // PASS 1: Positive particles tree
+            unsafe {
+                reset_i32_k.clone().launch(LaunchConfig {
+                    block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+                }, (&mut self.extract_count, 1))?;
+                extract_k.clone().launch(cfg, (
+                    &self.pos, &self.signs,
+                    &mut self.pos_sign, &mut self.idx_map,
+                    n as i32, 1i32, &mut self.extract_count,
+                ))?;
+            }
+            self.device.synchronize()?;
+            let _ = self.build_single_sign_tree(1, self.n_positive)?;
 
-        // Force - (accumulate: tree_sign=-1) with warp-coherent
-        unsafe {
-            forces_wc_k.launch(warp_cfg, (
-                &self.pos, &self.signs,
-                &self.bvh_node_pos, &self.bvh_node_mass,
-                &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
-                &mut self.acc,
-                n as i32, -1i32, self.theta as f32, self.softening as f32,
-            ))?;
+            // Force + (overwrite: tree_sign=+1) with screening
+            unsafe {
+                forces_scr_k.clone().launch(warp_cfg, (
+                    &self.pos, &self.signs,
+                    &self.bvh_node_pos, &self.bvh_node_mass,
+                    &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                    &mut self.acc,
+                    n as i32, 1i32, theta_soft_packed, lambda_base_f32,
+                ))?;
+            }
+            self.device.synchronize()?;
+
+            // PASS 2: Negative particles tree
+            unsafe {
+                reset_i32_k.launch(LaunchConfig {
+                    block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+                }, (&mut self.extract_count, 1))?;
+                extract_k.launch(cfg, (
+                    &self.pos, &self.signs,
+                    &mut self.pos_sign, &mut self.idx_map,
+                    n as i32, -1i32, &mut self.extract_count,
+                ))?;
+            }
+            self.device.synchronize()?;
+            let _ = self.build_single_sign_tree(-1, self.n_negative)?;
+
+            // Force - (accumulate: tree_sign=-1) with screening
+            unsafe {
+                forces_scr_k.launch(warp_cfg, (
+                    &self.pos, &self.signs,
+                    &self.bvh_node_pos, &self.bvh_node_mass,
+                    &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                    &mut self.acc,
+                    n as i32, -1i32, theta_soft_packed, lambda_base_f32,
+                ))?;
+            }
+            self.device.synchronize()?;
+        } else {
+            // Standard kernel (no screening, lambda_base = 0)
+            let forces_wc_k = self.device.get_func("twopass", "forces_twopass_warpcoherent")
+                .ok_or("forces_twopass_warpcoherent not found")?;
+
+            // PASS 1: Positive particles tree
+            unsafe {
+                reset_i32_k.clone().launch(LaunchConfig {
+                    block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+                }, (&mut self.extract_count, 1))?;
+                extract_k.clone().launch(cfg, (
+                    &self.pos, &self.signs,
+                    &mut self.pos_sign, &mut self.idx_map,
+                    n as i32, 1i32, &mut self.extract_count,
+                ))?;
+            }
+            self.device.synchronize()?;
+            let _ = self.build_single_sign_tree(1, self.n_positive)?;
+
+            // Force + (overwrite: tree_sign=+1) with warp-coherent
+            unsafe {
+                forces_wc_k.clone().launch(warp_cfg, (
+                    &self.pos, &self.signs,
+                    &self.bvh_node_pos, &self.bvh_node_mass,
+                    &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                    &mut self.acc,
+                    n as i32, 1i32, self.theta as f32, self.softening as f32,
+                ))?;
+            }
+            self.device.synchronize()?;
+
+            // PASS 2: Negative particles tree
+            unsafe {
+                reset_i32_k.launch(LaunchConfig {
+                    block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+                }, (&mut self.extract_count, 1))?;
+                extract_k.launch(cfg, (
+                    &self.pos, &self.signs,
+                    &mut self.pos_sign, &mut self.idx_map,
+                    n as i32, -1i32, &mut self.extract_count,
+                ))?;
+            }
+            self.device.synchronize()?;
+            let _ = self.build_single_sign_tree(-1, self.n_negative)?;
+
+            // Force - (accumulate: tree_sign=-1) with warp-coherent
+            unsafe {
+                forces_wc_k.launch(warp_cfg, (
+                    &self.pos, &self.signs,
+                    &self.bvh_node_pos, &self.bvh_node_mass,
+                    &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                    &mut self.acc,
+                    n as i32, -1i32, self.theta as f32, self.softening as f32,
+                ))?;
+            }
+            self.device.synchronize()?;
         }
-        self.device.synchronize()?;
 
         Ok(())
     }

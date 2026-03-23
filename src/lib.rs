@@ -5,7 +5,10 @@
 ///   - Petit, Margnat & Zejli (2024), EPJC 84:1226
 ///   - D'Agostini & Petit (2018), Astrophys. Space Sci. 363:139
 
+pub mod config;
+pub mod early_stop;
 pub mod friedmann;
+pub mod metrics;
 pub mod nbody;
 pub mod analysis;
 

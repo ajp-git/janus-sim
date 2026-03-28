@@ -453,7 +453,7 @@ extern "C" __global__ void init_leaves_tp(
     float* __restrict__ node_mass,  // 1×f32 per node (changed from f64)
     int* __restrict__ node_types,
     int* __restrict__ atomic,
-    int n, float box_half
+    int n, float box_half, float mass_factor
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -474,7 +474,8 @@ extern "C" __global__ void init_leaves_tp(
     node_pos[pb + 4] = x;
     node_pos[pb + 5] = y;
     node_pos[pb + 6] = z;
-    node_mass[node] = 1.0f;
+    // Mass = G × M_total / N for N-independent forces
+    node_mass[node] = mass_factor;
 
     node_types[node] = 1;
     atomic[node] = 0;
@@ -548,6 +549,11 @@ extern "C" __global__ void reduce_tp(
         node_mass[cur] = total;
 
         node_types[cur] = 2;
+
+        // CRITICAL: Ensure all writes are globally visible before signaling
+        // completion to parent. Without this, parent thread may see atomicAdd
+        // but read stale (zero) mass values from child nodes.
+        __threadfence();
 
         if (cur == 0) break;
         cur = parent[cur];
@@ -1716,8 +1722,12 @@ pub struct GpuNBodyTwoPass {
     // Tree rebuild control (for A/B testing)
     tree_rebuild_interval: usize,  // 1 = every step (default), N = every N steps
     last_tree_rebuild_step: usize, // track when tree was last rebuilt
-    // Yukawa screening length (0 = no screening, standard Janus)
-    lambda_base: f64,
+    // Yukawa screening length at z=0 (λ₀). Actual λ(z) = λ₀/√(1+z)
+    lambda_0: f64,
+    // Current redshift for computing λ(z)
+    current_z: f64,
+    // Mass factor = G × M_total / N for N-independent forces
+    mass_factor: f64,
 }
 
 /// Timing breakdown for tree build phases (in milliseconds)
@@ -1940,7 +1950,15 @@ impl GpuNBodyTwoPass {
             step_count: 0,
             tree_rebuild_interval: 1,  // default: rebuild every step
             last_tree_rebuild_step: 0,
-            lambda_base: 0.0,  // no screening by default
+            lambda_0: 0.0,  // no screening by default
+            current_z: 0.0,
+            mass_factor: {
+                let g_cosmo = 4.498e-12;  // Mpc³/(M_sun·Gyr²)
+                let rho_crit = 2.775e11;  // M_sun/Mpc³
+                let omega_m = 0.3;
+                let m_total = omega_m * rho_crit * box_size.powi(3);
+                g_cosmo * m_total / n_total as f64
+            },
         })
     }
 
@@ -2077,12 +2095,29 @@ impl GpuNBodyTwoPass {
             step_count: 0,
             tree_rebuild_interval: 1,  // default: rebuild every step
             last_tree_rebuild_step: 0,
-            lambda_base: 0.0,  // no screening by default
+            lambda_0: 0.0,  // no screening by default
+            current_z: 0.0,
+            mass_factor: {
+                let g_cosmo = 4.498e-12;  // Mpc³/(M_sun·Gyr²)
+                let rho_crit = 2.775e11;  // M_sun/Mpc³
+                let omega_m = 0.3;
+                let m_total = omega_m * rho_crit * box_size.powi(3);
+                g_cosmo * m_total / n_total as f64
+            },
         })
     }
 
-    /// Set Yukawa screening length (0 = no screening, > 0 = exponential screening)
-    pub fn set_lambda_base(&mut self, lambda: f64) { self.lambda_base = lambda; }
+    /// Set Yukawa screening length at z=0 (λ₀). Actual screening λ(z) = λ₀/√(1+z)
+    pub fn set_lambda_0(&mut self, lambda: f64) { self.lambda_0 = lambda; }
+
+    /// Set current redshift for computing λ(z) = λ₀/√(1+z)
+    pub fn set_current_z(&mut self, z: f64) { self.current_z = z; }
+
+    /// Backward compatibility alias for set_lambda_0
+    pub fn set_lambda_base(&mut self, lambda: f64) { self.lambda_0 = lambda; }
+
+    /// Get mass_factor = G × M_total / N for debugging
+    pub fn get_mass_factor(&self) -> f64 { self.mass_factor }
 
     /// Set k-space filter minimum index (k_min=3 suppresses dipole modes k=0,1,2)
     pub fn set_pm_k_min(&mut self, k_min: usize) { self.pm_k_min = k_min; }
@@ -2224,6 +2259,7 @@ impl GpuNBodyTwoPass {
         timing.reorder_ms = t_reorder.elapsed().as_millis();
 
         // Reset BVH buffers - CRITICAL: parent must be -1 for root termination
+        // Also reset node_mass to prevent stale values from previous tree build
         let t_reset = Instant::now();
         let reset_blocks = (n_nodes + 255) / 256;
         let reset_cfg = LaunchConfig {
@@ -2233,11 +2269,15 @@ impl GpuNBodyTwoPass {
         };
         let reset_k = self.device.get_func("twopass", "reset_i32")
             .ok_or("reset_i32 not found")?;
+        let reset_f32_k = self.device.get_func("twopass", "reset_f32")
+            .ok_or("reset_f32 not found for node_mass reset")?;
         let set_k = self.device.get_func("twopass", "set_i32")
             .ok_or("set_i32 not found")?;
         unsafe {
             reset_k.clone().launch(reset_cfg, (&mut self.bvh_atomic, n_nodes as i32))?;
             reset_k.clone().launch(reset_cfg, (&mut self.bvh_node_types, n_nodes as i32))?;
+            // Reset node masses to 0 to prevent stale values from previous tree
+            reset_f32_k.launch(reset_cfg, (&mut self.bvh_node_mass, n_nodes as i32))?;
             // Parent must be -1 so root (node 0) terminates correctly
             set_k.launch(reset_cfg, (&mut self.bvh_parent, n_nodes as i32, -1i32))?;
         }
@@ -2277,7 +2317,7 @@ impl GpuNBodyTwoPass {
                 &self.pos_sign,
                 &mut self.bvh_node_pos, &mut self.bvh_node_mass,
                 &mut self.bvh_node_types, &mut self.bvh_atomic,
-                n as i32, box_half,
+                n as i32, box_half, self.mass_factor as f32,
             ))?;
         }
         self.device.synchronize()?;
@@ -2397,6 +2437,12 @@ impl GpuNBodyTwoPass {
     }
 
     pub fn step_dkd(&mut self, dt: f64, hubble: f64, dtau_per_dt: f64) -> Result<(), Box<dyn std::error::Error>> {
+        // Delegate to warpcoherent version when screening is enabled (lambda_0 > 0)
+        // This ensures λ(z) = λ₀/√(1+z) scaling is applied
+        if self.lambda_0 > 0.01 {
+            return self.step_dkd_morton_warpcoherent(dt, hubble, dtau_per_dt);
+        }
+
         use std::time::Instant;
 
         self.step_count += 1;
@@ -3486,48 +3532,110 @@ impl GpuNBodyTwoPass {
         self.device.synchronize()?;
         let tree_pos = self.build_single_sign_tree(1, self.n_positive)?;
 
-        // Force + (overwrite: tree_sign=+1) with warp-coherent
-        let forces_wc_k = self.device.get_func("twopass", "forces_twopass_warpcoherent")
-            .ok_or("forces_twopass_warpcoherent not found")?;
-        unsafe {
-            forces_wc_k.clone().launch(warp_cfg, (
-                &self.pos, &self.signs,
-                &self.bvh_node_pos, &self.bvh_node_mass,
-                &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
-                &mut self.acc,
-                n as i32, 1i32, self.theta as f32, self.softening as f32,
-            ))?;
-        }
-        self.device.synchronize()?;
-        let t_force_pos_ms = t0.elapsed().as_millis();
+        // Check if screening is enabled (λ₀ > 0)
+        let use_screening = self.lambda_0 > 0.01;
+        let t_force_pos_ms: u128;
+        let t_force_neg_ms: u128;
+        let tree_neg: TreeBuildTiming;
 
-        // ===== PASS 2: Negative particles tree =====
-        let t0 = Instant::now();
-        unsafe {
-            reset_i32_k.launch(LaunchConfig {
-                block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
-            }, (&mut self.extract_count, 1))?;
-            extract_k.launch(cfg, (
-                &self.pos, &self.signs,
-                &mut self.pos_sign, &mut self.idx_map,
-                n as i32, -1i32, &mut self.extract_count,
-            ))?;
-        }
-        self.device.synchronize()?;
-        let tree_neg = self.build_single_sign_tree(-1, self.n_negative)?;
+        if use_screening {
+            // λ(z) = λ₀/√(1+z) — redshift scaling per Janus model
+            // λ(z) = λ₀ × √(1+z) — large range at high z (early repulsion), small at z=0
+            let lambda_z = self.lambda_0 * (1.0 + self.current_z).sqrt();
+            let lambda_f32 = lambda_z as f32;
+            // Pack theta and softening for screening kernel
+            let theta_u16 = ((self.theta * 1000.0).round() as u32).min(0xFFFF);
+            let soft_u16 = ((self.softening * 1000.0).round() as u32).min(0xFFFF);
+            let packed_int = ((theta_u16 << 16) | soft_u16) as i32;
+            let theta_soft_packed: f32 = f32::from_bits(packed_int as u32);
 
-        // Force - (accumulate: tree_sign=-1) with warp-coherent
-        unsafe {
-            forces_wc_k.launch(warp_cfg, (
-                &self.pos, &self.signs,
-                &self.bvh_node_pos, &self.bvh_node_mass,
-                &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
-                &mut self.acc,
-                n as i32, -1i32, self.theta as f32, self.softening as f32,
-            ))?;
+            let forces_scr_k = self.device.get_func("twopass", "forces_twopass_warpcoherent_screening")
+                .ok_or("forces_twopass_warpcoherent_screening not found")?;
+
+            // Force + with screening
+            unsafe {
+                forces_scr_k.clone().launch(warp_cfg, (
+                    &self.pos, &self.signs,
+                    &self.bvh_node_pos, &self.bvh_node_mass,
+                    &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                    &mut self.acc,
+                    n as i32, 1i32, theta_soft_packed, lambda_f32,
+                ))?;
+            }
+            self.device.synchronize()?;
+            t_force_pos_ms = t0.elapsed().as_millis();
+
+            // ===== PASS 2: Negative particles tree (with screening) =====
+            let t0 = Instant::now();
+            unsafe {
+                reset_i32_k.launch(LaunchConfig {
+                    block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+                }, (&mut self.extract_count, 1))?;
+                extract_k.launch(cfg, (
+                    &self.pos, &self.signs,
+                    &mut self.pos_sign, &mut self.idx_map,
+                    n as i32, -1i32, &mut self.extract_count,
+                ))?;
+            }
+            self.device.synchronize()?;
+            tree_neg = self.build_single_sign_tree(-1, self.n_negative)?;
+
+            // Force - with screening
+            unsafe {
+                forces_scr_k.launch(warp_cfg, (
+                    &self.pos, &self.signs,
+                    &self.bvh_node_pos, &self.bvh_node_mass,
+                    &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                    &mut self.acc,
+                    n as i32, -1i32, theta_soft_packed, lambda_f32,
+                ))?;
+            }
+            self.device.synchronize()?;
+            t_force_neg_ms = t0.elapsed().as_millis();
+        } else {
+            // No screening: use standard warp-coherent kernel
+            let forces_wc_k = self.device.get_func("twopass", "forces_twopass_warpcoherent")
+                .ok_or("forces_twopass_warpcoherent not found")?;
+            unsafe {
+                forces_wc_k.clone().launch(warp_cfg, (
+                    &self.pos, &self.signs,
+                    &self.bvh_node_pos, &self.bvh_node_mass,
+                    &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                    &mut self.acc,
+                    n as i32, 1i32, self.theta as f32, self.softening as f32,
+                ))?;
+            }
+            self.device.synchronize()?;
+            t_force_pos_ms = t0.elapsed().as_millis();
+
+            // ===== PASS 2: Negative particles tree (no screening) =====
+            let t0 = Instant::now();
+            unsafe {
+                reset_i32_k.launch(LaunchConfig {
+                    block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0,
+                }, (&mut self.extract_count, 1))?;
+                extract_k.launch(cfg, (
+                    &self.pos, &self.signs,
+                    &mut self.pos_sign, &mut self.idx_map,
+                    n as i32, -1i32, &mut self.extract_count,
+                ))?;
+            }
+            self.device.synchronize()?;
+            tree_neg = self.build_single_sign_tree(-1, self.n_negative)?;
+
+            // Force - (no screening)
+            unsafe {
+                forces_wc_k.launch(warp_cfg, (
+                    &self.pos, &self.signs,
+                    &self.bvh_node_pos, &self.bvh_node_mass,
+                    &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                    &mut self.acc,
+                    n as i32, -1i32, self.theta as f32, self.softening as f32,
+                ))?;
+            }
+            self.device.synchronize()?;
+            t_force_neg_ms = t0.elapsed().as_millis();
         }
-        self.device.synchronize()?;
-        let t_force_neg_ms = t0.elapsed().as_millis();
 
         // ===== KICK (dt) =====
         let t0 = Instant::now();
@@ -3680,8 +3788,9 @@ impl GpuNBodyTwoPass {
         // The reordering was corrupting the simulation by applying wrong velocities
         // to wrong particles after the kick step.
 
-        // Use screening kernel if lambda_base > 0, standard kernel otherwise
-        let use_screening = self.lambda_base > 0.01;
+        // Use screening kernel if lambda_0 > 0, standard kernel otherwise
+        let use_screening = self.lambda_0 > 0.01;
+        eprintln!("  [DEBUG] lambda_0={}, use_screening={}", self.lambda_0, use_screening);
 
         let reset_i32_k = self.device.get_func("twopass", "reset_i32")
             .ok_or("reset_i32 not found")?;
@@ -3695,7 +3804,11 @@ impl GpuNBodyTwoPass {
             let soft_u16 = ((self.softening * 1000.0).round() as u32).min(0xFFFF);
             let packed_int = ((theta_u16 << 16) | soft_u16) as i32;
             let theta_soft_packed: f32 = f32::from_bits(packed_int as u32);
-            let lambda_base_f32 = self.lambda_base as f32;
+            // λ(z) = λ₀/√(1+z) — redshift scaling per Janus model
+            // λ(z) = λ₀ × √(1+z) — large range at high z (early repulsion), small at z=0
+            let lambda_z = self.lambda_0 * (1.0 + self.current_z).sqrt();
+            let lambda_base_f32 = lambda_z as f32;
+            eprintln!("  [SCREENING] λ₀={:.2}, z={:.2}, λ(z)={:.2}", self.lambda_0, self.current_z, lambda_z);
 
             let forces_scr_k = self.device.get_func("twopass", "forces_twopass_warpcoherent_screening")
                 .ok_or("forces_twopass_warpcoherent_screening not found")?;
@@ -5055,6 +5168,61 @@ impl GpuNBodyTwoPass {
         Ok((dx*dx + dy*dy + dz*dz).sqrt() / self.box_size)
     }
 
+    /// Local purity metric: P = weighted average of |N+ - N-| / (N+ + N-) per cell
+    /// P=0 means perfect mixing (50/50 in each cell)
+    /// P=1 means perfect segregation (each cell is pure m+ or pure m-)
+    pub fn local_purity(&self, n_cells: usize) -> Result<f64, Box<dyn std::error::Error>> {
+        let pos_cpu = self.device.dtoh_sync_copy(&self.pos)?;
+        let signs_cpu = self.device.dtoh_sync_copy(&self.signs)?;
+
+        let cell_size = self.box_size / n_cells as f64;
+        let half_box = self.box_size / 2.0;
+        let n_cells_cubed = n_cells * n_cells * n_cells;
+
+        let mut n_plus = vec![0i32; n_cells_cubed];
+        let mut n_minus = vec![0i32; n_cells_cubed];
+
+        // Assign each particle to its cell
+        for i in 0..self.n_particles {
+            // Positions are in [-box/2, box/2], shift to [0, box]
+            let x = (pos_cpu[i * 3] as f64 + half_box).clamp(0.0, self.box_size - 1e-10);
+            let y = (pos_cpu[i * 3 + 1] as f64 + half_box).clamp(0.0, self.box_size - 1e-10);
+            let z = (pos_cpu[i * 3 + 2] as f64 + half_box).clamp(0.0, self.box_size - 1e-10);
+
+            let ix = (x / cell_size) as usize;
+            let iy = (y / cell_size) as usize;
+            let iz = (z / cell_size) as usize;
+            let idx = ix * n_cells * n_cells + iy * n_cells + iz;
+
+            if signs_cpu[i] > 0 {
+                n_plus[idx] += 1;
+            } else {
+                n_minus[idx] += 1;
+            }
+        }
+
+        // Weighted average of |N+ - N-| / (N+ + N-)
+        let mut total_weight = 0.0f64;
+        let mut weighted_purity = 0.0f64;
+
+        for idx in 0..n_cells_cubed {
+            let np = n_plus[idx] as f64;
+            let nm = n_minus[idx] as f64;
+            let weight = np + nm;
+            if weight > 0.0 {
+                let purity = (np - nm).abs() / weight;
+                weighted_purity += purity * weight;
+                total_weight += weight;
+            }
+        }
+
+        if total_weight > 0.0 {
+            Ok(weighted_purity / total_weight)
+        } else {
+            Ok(0.0)
+        }
+    }
+
     pub fn n_particles(&self) -> usize { self.n_particles }
     pub fn box_size(&self) -> f64 { self.box_size }
     pub fn time(&self) -> f64 { self.time }
@@ -5080,6 +5248,39 @@ impl GpuNBodyTwoPass {
         let vel = self.device.dtoh_sync_copy(&self.vel)?;
         let signs = self.device.dtoh_sync_copy(&self.signs)?;
         Ok((pos, vel, signs))
+    }
+
+    /// Get the mass stored in the tree root node (for debugging)
+    /// Should equal N_sign × mass_factor = G × M_total × (N_sign / N_total)
+    pub fn get_tree_root_mass(&self) -> Result<f64, Box<dyn std::error::Error>> {
+        let node_masses = self.device.dtoh_sync_copy(&self.bvh_node_mass)?;
+        // Root is at index 0
+        Ok(node_masses[0] as f64)
+    }
+
+    /// Get all node masses from tree (for debugging)
+    pub fn get_node_masses(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        Ok(self.device.dtoh_sync_copy(&self.bvh_node_mass)?)
+    }
+
+    /// Get tree left child pointers (for debugging)
+    pub fn get_tree_left(&self) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+        Ok(self.device.dtoh_sync_copy(&self.bvh_left)?)
+    }
+
+    /// Get tree right child pointers (for debugging)
+    pub fn get_tree_right(&self) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+        Ok(self.device.dtoh_sync_copy(&self.bvh_right)?)
+    }
+
+    /// Get tree node types (for debugging): 0=unused, 1=leaf, 2=internal
+    pub fn get_tree_types(&self) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+        Ok(self.device.dtoh_sync_copy(&self.bvh_node_types)?)
+    }
+
+    /// Get tree parent pointers (for debugging)
+    pub fn get_tree_parent(&self) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+        Ok(self.device.dtoh_sync_copy(&self.bvh_parent)?)
     }
 }
 

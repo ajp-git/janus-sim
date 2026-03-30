@@ -573,10 +573,16 @@ extern "C" __global__ void forces_twopass_overwrite(
     const int* __restrict__ right,
     const int* __restrict__ node_types,
     float* __restrict__ acc,                // Changed to float
-    int n_all, int tree_sign, float theta, float softening
+    int n_all, int tree_sign, float theta, float soft_boxhalf_packed
+    // soft_boxhalf_packed: upper 16 bits = softening×1000, lower 16 bits = box_half
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_all) return;
+
+    // Unpack softening and box_half from packed value
+    int packed = __float_as_int(soft_boxhalf_packed);
+    float softening = (float)((packed >> 16) & 0xFFFF) / 1000.0f;
+    float box_half = (float)(packed & 0xFFFF);
 
     float px = pos_all[tid * 3];
     float py = pos_all[tid * 3 + 1];
@@ -609,6 +615,13 @@ extern "C" __global__ void forces_twopass_overwrite(
         float dx = cx - px;
         float dy = cy - py;
         float dz = cz - pz;
+        // Minimum image convention
+        if (dx > box_half) dx -= 2.0f * box_half;
+        if (dx < -box_half) dx += 2.0f * box_half;
+        if (dy > box_half) dy -= 2.0f * box_half;
+        if (dy < -box_half) dy += 2.0f * box_half;
+        if (dz > box_half) dz -= 2.0f * box_half;
+        if (dz < -box_half) dz += 2.0f * box_half;
         float r2 = dx*dx + dy*dy + dz*dz + 1e-20f;
 
         // MAC without sqrt: (2*hs/r < theta) ↔ (4*hs² < theta²*r²)
@@ -624,6 +637,13 @@ extern "C" __global__ void forces_twopass_overwrite(
             float dpx = comx - px;
             float dpy = comy - py;
             float dpz = comz - pz;
+            // Minimum image convention
+            if (dpx > box_half) dpx -= 2.0f * box_half;
+            if (dpx < -box_half) dpx += 2.0f * box_half;
+            if (dpy > box_half) dpy -= 2.0f * box_half;
+            if (dpy < -box_half) dpy += 2.0f * box_half;
+            if (dpz > box_half) dpz -= 2.0f * box_half;
+            if (dpz < -box_half) dpz += 2.0f * box_half;
             float rp2 = dpx*dpx + dpy*dpy + dpz*dpz + eps2;
             float inv_rp3 = rsqrtf(rp2) / rp2;
             float f = interaction * mass * inv_rp3;
@@ -654,10 +674,16 @@ extern "C" __global__ void forces_twopass_accumulate(
     const int* __restrict__ right,
     const int* __restrict__ node_types,
     float* __restrict__ acc,                    // Changed to float
-    int n_all, int tree_sign, float theta, float softening
+    int n_all, int tree_sign, float theta, float soft_boxhalf_packed
+    // soft_boxhalf_packed: upper 16 bits = softening×1000, lower 16 bits = box_half
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_all) return;
+
+    // Unpack softening and box_half from packed value
+    int packed = __float_as_int(soft_boxhalf_packed);
+    float softening = (float)((packed >> 16) & 0xFFFF) / 1000.0f;
+    float box_half = (float)(packed & 0xFFFF);
 
     float px = pos_all[tid * 3];
     float py = pos_all[tid * 3 + 1];
@@ -689,6 +715,13 @@ extern "C" __global__ void forces_twopass_accumulate(
         float dx = cx - px;
         float dy = cy - py;
         float dz = cz - pz;
+        // Minimum image convention
+        if (dx > box_half) dx -= 2.0f * box_half;
+        if (dx < -box_half) dx += 2.0f * box_half;
+        if (dy > box_half) dy -= 2.0f * box_half;
+        if (dy < -box_half) dy += 2.0f * box_half;
+        if (dz > box_half) dz -= 2.0f * box_half;
+        if (dz < -box_half) dz += 2.0f * box_half;
         float r2 = dx*dx + dy*dy + dz*dz + 1e-20f;
 
         // MAC without sqrt: (2*hs/r < theta) ↔ (4*hs² < theta²*r²)
@@ -704,6 +737,13 @@ extern "C" __global__ void forces_twopass_accumulate(
             float dpx = comx - px;
             float dpy = comy - py;
             float dpz = comz - pz;
+            // Minimum image convention
+            if (dpx > box_half) dpx -= 2.0f * box_half;
+            if (dpx < -box_half) dpx += 2.0f * box_half;
+            if (dpy > box_half) dpy -= 2.0f * box_half;
+            if (dpy < -box_half) dpy += 2.0f * box_half;
+            if (dpz > box_half) dpz -= 2.0f * box_half;
+            if (dpz < -box_half) dpz += 2.0f * box_half;
             float rp2 = dpx*dpx + dpy*dpy + dpz*dpz + eps2;
             float inv_rp3 = rsqrtf(rp2) / rp2;
             float f = interaction * mass * inv_rp3;
@@ -741,10 +781,16 @@ extern "C" __global__ void forces_twopass_warpcoherent(
     const int* __restrict__ right,
     const int* __restrict__ node_types,
     float* __restrict__ acc,
-    int n_all, int tree_sign, float theta, float softening
+    int n_all, int tree_sign, float theta, float soft_boxhalf_packed
+    // soft_boxhalf_packed: upper 16 bits = softening×1000, lower 16 bits = box_half
     // accumulate derived from tree_sign: +1=overwrite, -1=accumulate
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Unpack softening and box_half from packed value
+    int packed = __float_as_int(soft_boxhalf_packed);
+    float softening = (float)((packed >> 16) & 0xFFFF) / 1000.0f;
+    float box_half = (float)(packed & 0xFFFF);
 
     // CRITICAL: All threads in warp must participate in sync operations
     // Invalid threads will compute but not write results
@@ -793,6 +839,13 @@ extern "C" __global__ void forces_twopass_warpcoherent(
         float m = node_mass[node];
 
         float dx = cx-px, dy = cy-py, dz = cz-pz;
+        // Minimum image convention
+        if (dx > box_half) dx -= 2.0f * box_half;
+        if (dx < -box_half) dx += 2.0f * box_half;
+        if (dy > box_half) dy -= 2.0f * box_half;
+        if (dy < -box_half) dy += 2.0f * box_half;
+        if (dz > box_half) dz -= 2.0f * box_half;
+        if (dz < -box_half) dz += 2.0f * box_half;
         float r2 = dx*dx + dy*dy + dz*dz + 1e-20f;
 
         // Opening criterion: leaf OR node far enough to approximate
@@ -806,6 +859,13 @@ extern "C" __global__ void forces_twopass_warpcoherent(
             // ALL threads agree to approximate - compute force
             if (valid) {
                 float ddx = comx-px, ddy = comy-py, ddz = comz-pz;
+                // Minimum image convention
+                if (ddx > box_half) ddx -= 2.0f * box_half;
+                if (ddx < -box_half) ddx += 2.0f * box_half;
+                if (ddy > box_half) ddy -= 2.0f * box_half;
+                if (ddy < -box_half) ddy += 2.0f * box_half;
+                if (ddz > box_half) ddz -= 2.0f * box_half;
+                if (ddz < -box_half) ddz += 2.0f * box_half;
                 float rp2 = ddx*ddx + ddy*ddy + ddz*ddz + eps2;
                 float irp3 = rsqrtf(rp2) / rp2;
                 float f = sign_factor * m * irp3;
@@ -857,8 +917,9 @@ extern "C" __global__ void forces_twopass_warpcoherent_screening(
     const int* __restrict__ right,
     const int* __restrict__ node_types,
     float* __restrict__ acc,
-    int n_all, int tree_sign, float theta_soft_packed, float lambda_base
+    int n_all, int tree_sign, float theta_soft_packed, float lambda_boxhalf_packed
     // theta_soft_packed: upper 16 bits = theta×1000, lower 16 bits = softening×1000
+    // lambda_boxhalf_packed: upper 16 bits = lambda×10, lower 16 bits = box_half
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     bool valid = (tid < n_all);
@@ -868,6 +929,11 @@ extern "C" __global__ void forces_twopass_warpcoherent_screening(
     int packed = __float_as_int(theta_soft_packed);
     float theta = (float)((packed >> 16) & 0xFFFF) / 1000.0f;
     float softening = (float)(packed & 0xFFFF) / 1000.0f;
+
+    // Unpack lambda and box_half from packed value
+    int packed2 = __float_as_int(lambda_boxhalf_packed);
+    float lambda_base = (float)((packed2 >> 16) & 0xFFFF) / 10.0f;
+    float box_half = (float)(packed2 & 0xFFFF);
 
     extern __shared__ int shared_stack[];
     int warp_id_in_block = threadIdx.x >> 5;
@@ -909,6 +975,13 @@ extern "C" __global__ void forces_twopass_warpcoherent_screening(
         float m = node_mass[node];
 
         float dx = cx-px, dy = cy-py, dz = cz-pz;
+        // Minimum image convention for periodic BC
+        if (dx > box_half) dx -= 2.0f * box_half;
+        if (dx < -box_half) dx += 2.0f * box_half;
+        if (dy > box_half) dy -= 2.0f * box_half;
+        if (dy < -box_half) dy += 2.0f * box_half;
+        if (dz > box_half) dz -= 2.0f * box_half;
+        if (dz < -box_half) dz += 2.0f * box_half;
         float r2 = dx*dx + dy*dy + dz*dz + 1e-20f;
 
         bool should_approx = (nt == 1) || ((4.0f*hs*hs) < (theta2*r2));
@@ -918,6 +991,13 @@ extern "C" __global__ void forces_twopass_warpcoherent_screening(
         if (all_approx) {
             if (valid) {
                 float ddx = comx-px, ddy = comy-py, ddz = comz-pz;
+                // Minimum image convention for periodic BC (COM)
+                if (ddx > box_half) ddx -= 2.0f * box_half;
+                if (ddx < -box_half) ddx += 2.0f * box_half;
+                if (ddy > box_half) ddy -= 2.0f * box_half;
+                if (ddy < -box_half) ddy += 2.0f * box_half;
+                if (ddz > box_half) ddz -= 2.0f * box_half;
+                if (ddz < -box_half) ddz += 2.0f * box_half;
                 float rp2 = ddx*ddx + ddy*ddy + ddz*ddz + eps2;
                 float rp = sqrtf(rp2);
                 float irp3 = 1.0f / (rp2 * rp);
@@ -975,8 +1055,14 @@ extern "C" __global__ void forces_twopass_shmem_overwrite(
     const int* __restrict__ right,
     const int* __restrict__ node_types,
     float* __restrict__ acc,
-    int n_all, int tree_sign, float theta, float softening
+    int n_all, int tree_sign, float theta, float soft_boxhalf_packed
+    // soft_boxhalf_packed: upper 16 bits = softening×1000, lower 16 bits = box_half
 ) {
+    // Unpack softening and box_half from packed value
+    int packed = __float_as_int(soft_boxhalf_packed);
+    float softening = (float)((packed >> 16) & 0xFFFF) / 1000.0f;
+    float box_half = (float)(packed & 0xFFFF);
+
     // Shared memory for top 1024 nodes
     __shared__ float sh_node_pos[TOP_NODES_SHMEM * 7];   // 28KB
     __shared__ float sh_node_mass[TOP_NODES_SHMEM];       // 4KB
@@ -1064,6 +1150,13 @@ extern "C" __global__ void forces_twopass_shmem_overwrite(
         float dx = cx - px;
         float dy = cy - py;
         float dz = cz - pz;
+        // Minimum image convention for periodic BC
+        if (dx > box_half) dx -= 2.0f * box_half;
+        if (dx < -box_half) dx += 2.0f * box_half;
+        if (dy > box_half) dy -= 2.0f * box_half;
+        if (dy < -box_half) dy += 2.0f * box_half;
+        if (dz > box_half) dz -= 2.0f * box_half;
+        if (dz < -box_half) dz += 2.0f * box_half;
         float r2 = dx*dx + dy*dy + dz*dz + 1e-20f;
 
         float hs4 = 4.0f * hs * hs;
@@ -1073,6 +1166,13 @@ extern "C" __global__ void forces_twopass_shmem_overwrite(
             float dpx = comx - px;
             float dpy = comy - py;
             float dpz = comz - pz;
+            // Minimum image convention for periodic BC (COM)
+            if (dpx > box_half) dpx -= 2.0f * box_half;
+            if (dpx < -box_half) dpx += 2.0f * box_half;
+            if (dpy > box_half) dpy -= 2.0f * box_half;
+            if (dpy < -box_half) dpy += 2.0f * box_half;
+            if (dpz > box_half) dpz -= 2.0f * box_half;
+            if (dpz < -box_half) dpz += 2.0f * box_half;
             float rp2 = dpx*dpx + dpy*dpy + dpz*dpz + eps2;
             float inv_rp3 = rsqrtf(rp2) / rp2;
             float f = interaction * mass * inv_rp3;
@@ -1100,8 +1200,14 @@ extern "C" __global__ void forces_twopass_shmem_accumulate(
     const int* __restrict__ right,
     const int* __restrict__ node_types,
     float* __restrict__ acc,
-    int n_all, int tree_sign, float theta, float softening
+    int n_all, int tree_sign, float theta, float soft_boxhalf_packed
+    // soft_boxhalf_packed: upper 16 bits = softening×1000, lower 16 bits = box_half
 ) {
+    // Unpack softening and box_half from packed value
+    int packed = __float_as_int(soft_boxhalf_packed);
+    float softening = (float)((packed >> 16) & 0xFFFF) / 1000.0f;
+    float box_half = (float)(packed & 0xFFFF);
+
     __shared__ float sh_node_pos[TOP_NODES_SHMEM * 7];
     __shared__ float sh_node_mass[TOP_NODES_SHMEM];
     __shared__ int sh_left[TOP_NODES_SHMEM];
@@ -1183,6 +1289,13 @@ extern "C" __global__ void forces_twopass_shmem_accumulate(
         float dx = cx - px;
         float dy = cy - py;
         float dz = cz - pz;
+        // Minimum image convention for periodic BC
+        if (dx > box_half) dx -= 2.0f * box_half;
+        if (dx < -box_half) dx += 2.0f * box_half;
+        if (dy > box_half) dy -= 2.0f * box_half;
+        if (dy < -box_half) dy += 2.0f * box_half;
+        if (dz > box_half) dz -= 2.0f * box_half;
+        if (dz < -box_half) dz += 2.0f * box_half;
         float r2 = dx*dx + dy*dy + dz*dz + 1e-20f;
 
         float hs4 = 4.0f * hs * hs;
@@ -1192,6 +1305,13 @@ extern "C" __global__ void forces_twopass_shmem_accumulate(
             float dpx = comx - px;
             float dpy = comy - py;
             float dpz = comz - pz;
+            // Minimum image convention for periodic BC (COM)
+            if (dpx > box_half) dpx -= 2.0f * box_half;
+            if (dpx < -box_half) dpx += 2.0f * box_half;
+            if (dpy > box_half) dpy -= 2.0f * box_half;
+            if (dpy < -box_half) dpy += 2.0f * box_half;
+            if (dpz > box_half) dpz -= 2.0f * box_half;
+            if (dpz < -box_half) dpz += 2.0f * box_half;
             float rp2 = dpx*dpx + dpy*dpy + dpz*dpz + eps2;
             float inv_rp3 = rsqrtf(rp2) / rp2;
             float f = interaction * mass * inv_rp3;
@@ -1220,7 +1340,7 @@ extern "C" __global__ void forces_direct_n2(
     const float* __restrict__ pos,      // [n×3] SoA
     const signed char* __restrict__ signs,
     float* __restrict__ acc,            // [n×3] output
-    int n, float eta, float eps2
+    int n, float eta, float eps2, float box_half
 ) {
     extern __shared__ float sh_data[];  // 256 × 4 floats = 4KB
     float* sh_x = sh_data;              // [256]
@@ -1268,6 +1388,13 @@ extern "C" __global__ void forces_direct_n2(
                 float dx = sh_x[j] - px;
                 float dy = sh_y[j] - py;
                 float dz = sh_z[j] - pz;
+                // Minimum image convention for periodic BC
+                if (dx > box_half) dx -= 2.0f * box_half;
+                if (dx < -box_half) dx += 2.0f * box_half;
+                if (dy > box_half) dy -= 2.0f * box_half;
+                if (dy < -box_half) dy += 2.0f * box_half;
+                if (dz > box_half) dz -= 2.0f * box_half;
+                if (dz < -box_half) dz += 2.0f * box_half;
                 float r2 = dx*dx + dy*dy + dz*dz + eps2;
                 float inv_r3 = rsqrtf(r2) / r2;
 
@@ -1549,8 +1676,22 @@ extern "C" __global__ void forces_treepm_short_range(
     const int* __restrict__ right,
     const int* __restrict__ node_types,
     float* __restrict__ acc,
-    int n_all_signed, float theta, float softening, float r_cut
+    int n_all_signed, float theta_soft_packed, float rcut_boxhalf_packed
 ) {
+    // Unpack theta and softening (same packing as forces_twopass_warpcoherent)
+    int packed_ts = __float_as_int(theta_soft_packed);
+    float theta = (float)((packed_ts >> 16) & 0xFFFF) / 1000.0f;
+    float softening = (float)(packed_ts & 0xFFFF) / 1000.0f;
+
+    // Unpack r_cut and box_half (r_cut in upper 16 bits, box_half in lower 16)
+    int packed_rb = __float_as_int(rcut_boxhalf_packed);
+    float r_cut = (float)((packed_rb >> 16) & 0xFFFF);
+    float box_half = (float)(packed_rb & 0xFFFF);
+
+    // r_s = splitting scale for TreePM = r_cut/3 (standard relation)
+    // F_short = F_total × erfc(r/(2×r_s))
+    // At r = r_cut: erfc(r_cut/(2×r_cut/3)) = erfc(1.5) ≈ 0.034 (smooth cutoff)
+    float r_s = r_cut / 3.0f;
     int n_all = (n_all_signed > 0) ? n_all_signed : -n_all_signed;
     int tree_sign = (n_all_signed > 0) ? 1 : -1;
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1596,6 +1737,13 @@ extern "C" __global__ void forces_treepm_short_range(
         float m = node_mass[node];
 
         float dx = cx-px, dy = cy-py, dz = cz-pz;
+        // Minimum image convention for periodic BC
+        if (dx > box_half) dx -= 2.0f * box_half;
+        if (dx < -box_half) dx += 2.0f * box_half;
+        if (dy > box_half) dy -= 2.0f * box_half;
+        if (dy < -box_half) dy += 2.0f * box_half;
+        if (dz > box_half) dz -= 2.0f * box_half;
+        if (dz < -box_half) dz += 2.0f * box_half;
         float r2 = dx*dx + dy*dy + dz*dz + 1e-20f;
         float r = sqrtf(r2);
 
@@ -1612,13 +1760,28 @@ extern "C" __global__ void forces_treepm_short_range(
         if (all_approx) {
             if (valid) {
                 float ddx = comx-px, ddy = comy-py, ddz = comz-pz;
+                // Minimum image convention for periodic BC (COM)
+                if (ddx > box_half) ddx -= 2.0f * box_half;
+                if (ddx < -box_half) ddx += 2.0f * box_half;
+                if (ddy > box_half) ddy -= 2.0f * box_half;
+                if (ddy < -box_half) ddy += 2.0f * box_half;
+                if (ddz > box_half) ddz -= 2.0f * box_half;
+                if (ddz < -box_half) ddz += 2.0f * box_half;
                 float rp2 = ddx*ddx + ddy*ddy + ddz*ddz + eps2;
 
-                // BH computes full force (no erfc splitting for now)
-                // PM handles residual long-range with k-space damping
-                if (rp2 < r_cut_sq) {
-                    float irp3 = rsqrtf(rp2) / rp2;  // 1/r³
-                    float f = sign_factor * m * irp3;
+                // TreePM short-range force with erfc splitting
+                // F_short = F_total × erfc(r/(2×r_s))
+                // This complements PM: F_long = F_total × erf(r/(2×r_s))
+                // So F_short + F_long = F_total exactly
+                float rp = sqrtf(rp2);
+                float erfc_arg = rp / (2.0f * r_s);
+                float erfc_factor = erfcf(erfc_arg);
+
+                // Only compute if erfc_factor is significant (> 1e-6)
+                // This provides natural smooth cutoff without discontinuity
+                if (erfc_factor > 1e-6f) {
+                    float irp3 = 1.0f / (rp * rp2);  // 1/r³
+                    float f = sign_factor * m * irp3 * erfc_factor;
                     ax += f*ddx; ay += f*ddy; az += f*ddz;
                 }
             }
@@ -1741,6 +1904,36 @@ pub struct TreeBuildTiming {
     pub bvh_karras_ms: u128,
     pub init_leaves_ms: u128,
     pub reduce_ms: u128,
+}
+
+/// Pack softening and box_half into a single f32 for kernel calls
+/// Upper 16 bits = softening × 1000, lower 16 bits = box_half
+#[cfg(feature = "cuda")]
+fn pack_soft_boxhalf(softening: f64, box_half: f64) -> f32 {
+    let soft_int = ((softening * 1000.0) as u32).min(0xFFFF);
+    let boxhalf_int = (box_half as u32).min(0xFFFF);
+    let packed = (soft_int << 16) | boxhalf_int;
+    f32::from_bits(packed)
+}
+
+/// Pack lambda and box_half into a single f32 for screening kernel calls
+/// Upper 16 bits = lambda × 10, lower 16 bits = box_half
+#[cfg(feature = "cuda")]
+fn pack_lambda_boxhalf(lambda: f64, box_half: f64) -> f32 {
+    let lambda_int = ((lambda * 10.0) as u32).min(0xFFFF);
+    let boxhalf_int = (box_half as u32).min(0xFFFF);
+    let packed = (lambda_int << 16) | boxhalf_int;
+    f32::from_bits(packed)
+}
+
+/// Pack r_cut and box_half into a single f32 for TreePM kernel
+/// Upper 16 bits = r_cut (integer Mpc), lower 16 bits = box_half (integer Mpc)
+#[cfg(feature = "cuda")]
+fn pack_rcut_boxhalf(r_cut: f64, box_half: f64) -> f32 {
+    let rcut_int = (r_cut as u32).min(0xFFFF);
+    let boxhalf_int = (box_half as u32).min(0xFFFF);
+    let packed = (rcut_int << 16) | boxhalf_int;
+    f32::from_bits(packed)
 }
 
 #[cfg(feature = "cuda")]
@@ -1901,8 +2094,8 @@ impl GpuNBodyTwoPass {
         // TreePM hybrid buffers
         let pm_forces = device.alloc_zeros::<f32>(n_total * 3)?;  // PM long-range forces
 
-        // PM grid buffers (128³ = 2M cells × f64 = 16MB per grid × 4 = 64MB)
-        let pm_grid_size = 128usize;
+        // PM grid buffers (256³ = 16.7M cells × f64 = 134MB per grid × 4 = 536MB)
+        let pm_grid_size = 256usize;
         let grid_cells = pm_grid_size * pm_grid_size * pm_grid_size;
         let rho_plus = device.alloc_zeros::<f64>(grid_cells)?;
         let rho_minus = device.alloc_zeros::<f64>(grid_cells)?;
@@ -2061,14 +2254,14 @@ impl GpuNBodyTwoPass {
 
         let pm_forces = device.alloc_zeros::<f32>(n_total * 3)?;
 
-        let pm_grid_size = 128usize;
+        let pm_grid_size = 256usize;
         let grid_cells = pm_grid_size * pm_grid_size * pm_grid_size;
         let rho_plus = device.alloc_zeros::<f64>(grid_cells)?;
         let rho_minus = device.alloc_zeros::<f64>(grid_cells)?;
         let phi_plus = device.alloc_zeros::<f64>(grid_cells)?;
         let phi_minus = device.alloc_zeros::<f64>(grid_cells)?;
 
-        println!("  GPU buffers allocated");
+        println!("  GPU buffers allocated (PM grid 256³)");
 
         Ok(Self {
             device,
@@ -2397,7 +2590,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                 &mut self.acc,
-                n as i32, 1i32, self.theta as f32, self.softening as f32,
+                n as i32, 1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
             ))?;
         }
         self.device.synchronize()?;
@@ -2429,7 +2622,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                 &mut self.acc,
-                n as i32, -1i32, self.theta as f32, self.softening as f32,
+                n as i32, -1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
             ))?;
         }
         self.device.synchronize()?;
@@ -2532,7 +2725,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                 &mut self.acc,
-                n as i32, 1i32, self.theta as f32, self.softening as f32,
+                n as i32, 1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
             ))?;
         }
         self.device.synchronize()?;
@@ -2571,7 +2764,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                 &mut self.acc,
-                n as i32, -1i32, self.theta as f32, self.softening as f32,
+                n as i32, -1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
             ))?;
         }
         self.device.synchronize()?;
@@ -2691,7 +2884,7 @@ impl GpuNBodyTwoPass {
         unsafe {
             force_k.launch(cfg_n2, (
                 &self.pos, &self.signs, &mut self.acc,
-                n as i32, eta, eps2,
+                n as i32, eta, eps2, (self.box_size / 2.0) as f32,
             ))?;
         }
         self.device.synchronize()?;
@@ -2897,7 +3090,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                 &mut self.acc,
-                n as i32, 1i32, self.theta as f32, self.softening as f32,
+                n as i32, 1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
             ))?;
         }
         self.device.synchronize()?;
@@ -2927,7 +3120,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                 &mut self.acc,
-                n as i32, -1i32, self.theta as f32, self.softening as f32,
+                n as i32, -1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
             ))?;
         }
         self.device.synchronize()?;
@@ -3136,7 +3329,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                 &mut self.acc,
-                n as i32, 1i32, self.theta as f32, self.softening as f32,
+                n as i32, 1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
             ))?;
         }
         self.device.synchronize()?;
@@ -3166,7 +3359,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                 &mut self.acc,
-                n as i32, -1i32, self.theta as f32, self.softening as f32,
+                n as i32, -1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
             ))?;
         }
         self.device.synchronize()?;
@@ -3298,7 +3491,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                 &mut self.acc,
-                n as i32, 1i32, self.theta as f32, self.softening as f32,
+                n as i32, 1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
             ))?;
         }
         self.device.synchronize()?;
@@ -3326,7 +3519,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                 &mut self.acc,
-                n as i32, -1i32, self.theta as f32, self.softening as f32,
+                n as i32, -1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
             ))?;
         }
         self.device.synchronize()?;
@@ -3559,7 +3752,7 @@ impl GpuNBodyTwoPass {
                     &self.bvh_node_pos, &self.bvh_node_mass,
                     &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                     &mut self.acc,
-                    n as i32, 1i32, theta_soft_packed, lambda_f32,
+                    n as i32, 1i32, theta_soft_packed, pack_lambda_boxhalf(lambda_z, self.box_size / 2.0),
                 ))?;
             }
             self.device.synchronize()?;
@@ -3587,7 +3780,7 @@ impl GpuNBodyTwoPass {
                     &self.bvh_node_pos, &self.bvh_node_mass,
                     &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                     &mut self.acc,
-                    n as i32, -1i32, theta_soft_packed, lambda_f32,
+                    n as i32, -1i32, theta_soft_packed, pack_lambda_boxhalf(lambda_z, self.box_size / 2.0),
                 ))?;
             }
             self.device.synchronize()?;
@@ -3602,7 +3795,7 @@ impl GpuNBodyTwoPass {
                     &self.bvh_node_pos, &self.bvh_node_mass,
                     &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                     &mut self.acc,
-                    n as i32, 1i32, self.theta as f32, self.softening as f32,
+                    n as i32, 1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
                 ))?;
             }
             self.device.synchronize()?;
@@ -3630,7 +3823,7 @@ impl GpuNBodyTwoPass {
                     &self.bvh_node_pos, &self.bvh_node_mass,
                     &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                     &mut self.acc,
-                    n as i32, -1i32, self.theta as f32, self.softening as f32,
+                    n as i32, -1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
                 ))?;
             }
             self.device.synchronize()?;
@@ -3746,12 +3939,16 @@ impl GpuNBodyTwoPass {
         Ok(())
     }
 
-    /// TreePM step: GPU BH for short-range only (r < r_cut)
+    /// TreePM step: GPU BH for short-range only with erfc splitting
     /// Long-range forces from PM must be added separately
     ///
     /// This eliminates grid artifacts by construction:
-    /// - Long-range (r > r_cut): handled by PM cuFFT (accurate)
-    /// - Short-range (r < r_cut): GPU BH (accurate at short range)
+    /// - Long-range: PM with exp(-k²r_s²) damping in k-space
+    /// - Short-range: BH with erfc(r/(2r_s)) in real-space
+    /// F_short + F_long = F_total exactly (complementary error functions)
+    ///
+    /// r_cut: cutoff distance for short-range forces
+    /// r_s = r_cut/3 computed inside kernel (standard TreePM relation)
     pub fn compute_short_range_forces(&mut self, r_cut: f64) -> Result<(), Box<dyn std::error::Error>> {
         let box_half = (self.box_size / 2.0) as f32;
         let inv_cell_size = (2097152.0 / self.box_size) as f32;
@@ -3834,7 +4031,7 @@ impl GpuNBodyTwoPass {
                     &self.bvh_node_pos, &self.bvh_node_mass,
                     &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                     &mut self.acc,
-                    n as i32, 1i32, theta_soft_packed, lambda_base_f32,
+                    n as i32, 1i32, theta_soft_packed, pack_lambda_boxhalf(lambda_z, self.box_size / 2.0),
                 ))?;
             }
             self.device.synchronize()?;
@@ -3860,14 +4057,20 @@ impl GpuNBodyTwoPass {
                     &self.bvh_node_pos, &self.bvh_node_mass,
                     &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                     &mut self.acc,
-                    n as i32, -1i32, theta_soft_packed, lambda_base_f32,
+                    n as i32, -1i32, theta_soft_packed, pack_lambda_boxhalf(lambda_z, self.box_size / 2.0),
                 ))?;
             }
             self.device.synchronize()?;
         } else {
-            // Standard kernel (no screening, lambda_base = 0)
-            let forces_wc_k = self.device.get_func("twopass", "forces_twopass_warpcoherent")
-                .ok_or("forces_twopass_warpcoherent not found")?;
+            // TreePM short-range kernel with erfc splitting
+            let forces_treepm_k = self.device.get_func("twopass", "forces_treepm_short_range")
+                .ok_or("forces_treepm_short_range not found")?;
+
+            // Pack theta+softening and r_cut+box_half for 12-param limit
+            let theta_int = ((self.theta * 1000.0) as u32).min(0xFFFF);
+            let soft_int = ((self.softening * 1000.0) as u32).min(0xFFFF);
+            let theta_soft_packed: f32 = f32::from_bits((theta_int << 16) | soft_int);
+            let rcut_boxhalf_packed: f32 = pack_rcut_boxhalf(r_cut, self.box_size / 2.0);
 
             // PASS 1: Positive particles tree
             unsafe {
@@ -3883,14 +4086,14 @@ impl GpuNBodyTwoPass {
             self.device.synchronize()?;
             let _ = self.build_single_sign_tree(1, self.n_positive)?;
 
-            // Force + (overwrite: tree_sign=+1) with warp-coherent
+            // Force + (overwrite: n_all_signed > 0) with TreePM erfc splitting
             unsafe {
-                forces_wc_k.clone().launch(warp_cfg, (
+                forces_treepm_k.clone().launch(warp_cfg, (
                     &self.pos, &self.signs,
                     &self.bvh_node_pos, &self.bvh_node_mass,
                     &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                     &mut self.acc,
-                    n as i32, 1i32, self.theta as f32, self.softening as f32,
+                    n as i32, theta_soft_packed, rcut_boxhalf_packed,
                 ))?;
             }
             self.device.synchronize()?;
@@ -3909,14 +4112,14 @@ impl GpuNBodyTwoPass {
             self.device.synchronize()?;
             let _ = self.build_single_sign_tree(-1, self.n_negative)?;
 
-            // Force - (accumulate: tree_sign=-1) with warp-coherent
+            // Force - (accumulate: n_all_signed < 0) with TreePM erfc splitting
             unsafe {
-                forces_wc_k.launch(warp_cfg, (
+                forces_treepm_k.launch(warp_cfg, (
                     &self.pos, &self.signs,
                     &self.bvh_node_pos, &self.bvh_node_mass,
                     &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                     &mut self.acc,
-                    n as i32, -1i32, self.theta as f32, self.softening as f32,
+                    -(n as i32), theta_soft_packed, rcut_boxhalf_packed,
                 ))?;
             }
             self.device.synchronize()?;
@@ -3965,7 +4168,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_pos_node_pos, &self.bvh_pos_node_mass,
                 &self.bvh_pos_left, &self.bvh_pos_right, &self.bvh_pos_node_types,
                 &mut self.acc,
-                n as i32, 1i32, self.theta as f32, self.softening as f32,
+                n as i32, 1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
             ))?;
         }
         self.device.synchronize()?;
@@ -3977,7 +4180,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_neg_node_pos, &self.bvh_neg_node_mass,
                 &self.bvh_neg_left, &self.bvh_neg_right, &self.bvh_neg_node_types,
                 &mut self.acc,
-                n as i32, -1i32, self.theta as f32, self.softening as f32,
+                n as i32, -1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
             ))?;
         }
         self.device.synchronize()?;
@@ -4048,7 +4251,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_pos_node_pos, &self.bvh_pos_node_mass,
                 &self.bvh_pos_left, &self.bvh_pos_right, &self.bvh_pos_node_types,
                 &mut self.acc,
-                n as i32, 1i32, self.theta as f32, self.softening as f32,
+                n as i32, 1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
             ))?;
         }
         self.device.synchronize()?;
@@ -4077,7 +4280,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_neg_node_pos, &self.bvh_neg_node_mass,
                 &self.bvh_neg_left, &self.bvh_neg_right, &self.bvh_neg_node_types,
                 &mut self.acc,
-                n as i32, -1i32, self.theta as f32, self.softening as f32,
+                n as i32, -1i32, self.theta as f32, pack_soft_boxhalf(self.softening, self.box_size / 2.0),
             ))?;
         }
         self.device.synchronize()?;
@@ -4185,10 +4388,11 @@ impl GpuNBodyTwoPass {
             pm_grid.assign_mass(x, y, z, 1.0, signs_cpu[i]);
         }
 
-        // FFT Poisson solve with STRONG k-space damping
-        // r_s = r_cut → PM only affects r >> r_cut (very long range)
-        // BH handles r < r_cut with full force (no erfc)
-        let r_s = r_cut;  // Strong damping
+        // TreePM Gaussian splitting: r_s = r_cut/3
+        // PM: exp(-k²r_s²) damps short-range in k-space
+        // BH: erfc(r/(2r_s)) damps long-range in real-space
+        // r_cut/r_s = 3 → erfc(r_cut/(2r_s)) = erfc(1.5) ≈ 0.03 at boundary
+        let r_s = r_cut / 3.0;
         let g_constant = 1.0;
         pm_grid.solve_poisson_with_splitting(g_constant, Some(r_s));
 
@@ -4209,7 +4413,7 @@ impl GpuNBodyTwoPass {
 
         let pm_ms = t_pm.elapsed().as_millis();
 
-        // ===== GPU BH SHORT-RANGE (r < r_cut) =====
+        // ===== GPU BH SHORT-RANGE with erfc splitting =====
         let t_bh = Instant::now();
         self.compute_short_range_forces(r_cut)?;
         let bh_ms = t_bh.elapsed().as_millis();
@@ -4384,7 +4588,7 @@ impl GpuNBodyTwoPass {
         self.device.synchronize()?;
         let pm_ms = t_pm.elapsed().as_millis();
 
-        // ===== GPU BH SHORT-RANGE (r < r_cut) =====
+        // ===== GPU BH SHORT-RANGE with erfc splitting =====
         let t_bh = Instant::now();
         self.compute_short_range_forces(r_cut)?;
         let bh_ms = t_bh.elapsed().as_millis();
@@ -4797,7 +5001,7 @@ impl GpuNBodyTwoPass {
         self.device.synchronize()?;
         let pm_ms = t_pm.elapsed().as_millis();
 
-        // ===== GPU BH SHORT-RANGE (Morton-ordered for cache coherence) =====
+        // ===== GPU BH SHORT-RANGE with erfc splitting =====
         let t_bh = Instant::now();
         self.compute_short_range_forces(r_cut)?;
         let bh_ms = t_bh.elapsed().as_millis();

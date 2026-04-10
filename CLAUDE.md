@@ -8,6 +8,7 @@ Claude operates in **fully autonomous** mode on this server.
 - Download necessary observational data
 - Debug and fix errors autonomously
 - Never ask "would you like me to..." — just do it
+- **JAMAIS de timeout sur les simulations** — les runs peuvent durer des heures
 
 ---
 
@@ -117,6 +118,33 @@ ne change pas de forme, seuls les COMs se séparent.
 | Seg₀ ≈ 0.49 | Different COM references | Common origin for both populations |
 | IC Zel'dovich biais | m+/m- dans moitiés opposées grille | Signes aléatoires obligatoires ✅ |
 | FFT "displacement=0" | Format {:.4} tronque 2.4e-8 | Utiliser {:.6e} ✅ |
+| k=8 anisotropy spike | Octree/box resonance L/8=62.5 Mpc @ 500 Mpc | Use 1000 Mpc box to avoid ✅ |
+
+---
+
+## Octree/Box Resonance Bug (March 2026)
+
+**Symptom:** k=8 mode spike (20,884× above neighbors) in power spectrum with 500 Mpc box.
+Grid-like checkerboard pattern visible in purity maps at z≈3.5.
+
+**Root cause:** Barnes-Hut octree recursively divides the box into 8 octants.
+With a 500 Mpc box, this creates a resonance at L/8 = 62.5 Mpc (k=8 mode).
+The tree structure imprints a preferred scale on the force calculation.
+
+**Evidence:**
+- 500 Mpc box: k=8 spike (λ=62.5 Mpc), power 20,884× above k=7,9
+- 1000 Mpc box: NO k=8 spike (same BH code), gentle k=4 peak (11× above neighbors)
+- Both simulations use pure Barnes-Hut (`step_dkd`), NOT TreePM
+- PM grid ruled out (petit_pure_20m uses `step_dkd`, not `step_treepm`)
+
+**Solution:** Use 1000 Mpc box size. Density is 8× lower but spectrum is clean.
+The octree resonance shifts to L/8 = 125 Mpc which doesn't interfere with Janus physics.
+
+**Test files:**
+- `/tmp/compare_box_sizes_v2.py` — Power spectrum comparison
+- `petit_pure_20m.rs` — 500 Mpc (shows spike)
+- `champion_10m_v3.rs` — 1000 Mpc (no spike)
+- `petit_pure_20m_1000mpc.rs` — Fixed 1000 Mpc simulation
 
 ---
 
@@ -176,7 +204,7 @@ tail -f output/*/evolution.csv
 | η | 1.045 |
 | dt | 0.005 |
 | θ (Barnes-Hut) | 0.7 (précis) / 1.2 (rapide) |
-| box | 400 Mpc |
+| box | 1000 Mpc (avoid octree resonance at L/8) |
 | z_init | 10 |
 | Snapshot interval | 100 steps |
 | CSV interval | 10 steps |

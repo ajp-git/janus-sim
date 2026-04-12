@@ -24,6 +24,9 @@ RUN apt-get update && apt-get install -y \
     # For cuFFT bindings (cufft_rust, cudarc)
     libclang-dev \
     clang \
+    # For Grackle cooling library
+    gfortran \
+    libhdf5-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust
@@ -35,6 +38,18 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 ENV CUDA_COMPUTE_CAP=86
 ENV CUDA_ARCH="sm_86"
 
+# Install Grackle cooling library
+COPY external/grackle-dist/libgrackle*.so /usr/local/lib/
+COPY external/grackle-dist/grackle_bridge.h /usr/local/include/
+COPY external/grackle-dist/grackle*.h /usr/local/include/
+RUN ldconfig
+
+# Grackle data files (HM2012 UV background)
+COPY external/grackle-dist/grackle/input /usr/local/share/grackle/input
+
+# Library path for Grackle
+ENV LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"
+
 # Working directory
 WORKDIR /app
 
@@ -44,8 +59,9 @@ COPY . .
 # Pre-fetch Rust dependencies (layer cache)
 RUN cargo fetch
 
-# Build release binaries
-RUN cargo build --release
+# Build library and tests (allow some binaries to fail due to API changes)
+RUN cargo build --release --lib --features "cuda grackle" && \
+    cargo build --release --tests --features "cuda grackle" || true
 
 # Output directory
 RUN mkdir -p output

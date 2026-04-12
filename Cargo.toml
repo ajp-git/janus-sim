@@ -121,6 +121,7 @@ path = "src/lib.rs"
 default = []
 cuda = ["cudarc"]
 cufft = []  # Requires libcufft_wrapper.so (see cuda/build_cufft.sh)
+grackle = []  # Requires libgrackle_bridge.so (see external/Dockerfile.grackle)
 
 [dependencies]
 # Algèbre linéaire SIMD
@@ -583,11 +584,6 @@ path = "src/bin/test_kfilter_512k.rs"
 
 
 [[bin]]
-name = "test_nodipole_512k"
-path = "src/bin/test_nodipole_512k.rs"
-required-features = ["cuda"]
-
-[[bin]]
 name = "test_nodipole_gpu_512k"
 path = "src/bin/test_nodipole_gpu_512k.rs"
 required-features = ["cuda", "cufft"]
@@ -688,3 +684,196 @@ path = "src/bin/lcdm_control_3M_kmin20.rs"
 name = "janus_optim"
 path = "src/bin/janus_optim.rs"
 required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "n_convergence_check"
+path = "src/bin/n_convergence_check.rs"
+
+[[bin]]
+name = "mass_factor_unit_test"
+path = "src/bin/mass_factor_unit_test.rs"
+
+[[bin]]
+name = "mass_factor_grid_test"
+path = "src/bin/mass_factor_grid_test.rs"
+
+[[bin]]
+name = "verify_tree_mass"
+path = "src/bin/verify_tree_mass.rs"
+
+[[bin]]
+name = "debug_tree_mass"
+path = "src/bin/debug_tree_mass.rs"
+
+[[bin]]
+name = "single_tree_test"
+path = "src/bin/single_tree_test.rs"
+
+[[bin]]
+name = "verify_tree_structure"
+path = "src/bin/verify_tree_structure.rs"
+
+[[bin]]
+name = "petit_pure_20m_treepm"
+path = "src/bin/petit_pure_20m_treepm.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "rotated_ic_test"
+path = "src/bin/rotated_ic_test.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "test_pm256"
+path = "src/bin/test_pm256.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "petit_pure_20m_1000mpc"
+path = "src/bin/petit_pure_20m_1000mpc.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_treepm_rcut20"
+path = "src/bin/test_treepm_rcut20.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "petit_pure_v3_treepm"
+path = "src/bin/petit_pure_v3_treepm.rs"
+
+[[bin]]
+name = "petit_pure_20m_treepm_v3"
+path = "src/bin/petit_pure_20m_treepm_v3.rs"
+
+[[bin]]
+name = "scan_mu_janus"
+path = "src/bin/scan_mu_janus.rs"
+
+[[bin]]
+name = "janus_30m_production"
+path = "src/bin/janus_30m_production.rs"
+
+[[bin]]
+name = "janus_mu8_production"
+path = "src/bin/janus_mu8_production.rs"
+
+[[bin]]
+name = "janus_mu16_production"
+path = "src/bin/janus_mu16_production.rs"
+
+[[bin]]
+name = "janus_mu32_production"
+path = "src/bin/janus_mu32_production.rs"
+
+[[bin]]
+name = "janus_mu19_production"
+path = "src/bin/janus_mu19_production.rs"
+
+[[bin]]
+name = "janus_hires_100mpc"
+path = "src/bin/janus_hires_100mpc.rs"
+[[bin]]
+name = "scan_ci_amplitude"
+path = "src/bin/scan_ci_amplitude.rs"
+[[bin]]
+name = "phase2_zoom"
+path = "src/bin/phase2_zoom.rs"
+[[bin]]
+name = "janus_baryonic"
+path = "src/bin/janus_baryonic.rs"
+[[bin]]
+name = "test_sph_pressure"
+path = "src/bin/test_sph_pressure.rs"
+[[bin]]
+name = "pre_bounce_milne"
+path = "src/bin/pre_bounce_milne.rs"
+[[bin]]
+name = "vsl_test"
+path = "src/bin/vsl_test.rs"
+[[bin]]
+name = "vsl_production"
+path = "src/bin/vsl_production.rs"
+[[bin]]
+name = "vsl_gpu_test"
+path = "src/bin/vsl_gpu_test.rs"
+
+[[bin]]
+name = "vsl_production_10M"
+path = "src/bin/vsl_production_10M.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "vsl_12M_vcap"
+path = "src/bin/vsl_12M_vcap.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "vsl_test_thermal"
+path = "src/bin/vsl_test_thermal.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "vsl_test_bigbox"
+path = "src/bin/vsl_test_bigbox.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "vsl_1000mpc_10M"
+path = "src/bin/vsl_1000mpc_10M.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "vsl_1000mpc_10M_stars"
+path = "src/bin/vsl_1000mpc_10M_stars.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "vsl_2714mpc_10M"
+path = "src/bin/vsl_2714mpc_10M.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "vsl_test_100k"
+path = "src/bin/vsl_test_100k.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "vsl_mu_validation"
+path = "src/bin/vsl_mu_validation.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "vsl_mu11_production"
+path = "src/bin/vsl_mu11_production.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "vsl_dynamic_test"
+path = "src/bin/vsl_dynamic_test.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "vsl_petit_production"
+path = "src/bin/vsl_petit_production.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "vsl_bimetric_phase0"
+path = "src/bin/vsl_bimetric_phase0.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "vsl_bimetric_phase1"
+path = "src/bin/vsl_bimetric_phase1.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "vsl_bimetric_phase2"
+path = "src/bin/vsl_bimetric_phase2.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_grackle"
+path = "src/bin/test_grackle.rs"
+required-features = ["grackle"]

@@ -8,9 +8,11 @@
 pub mod config;
 pub mod early_stop;
 pub mod friedmann;
+pub mod janus_expansion;
 pub mod metrics;
 pub mod nbody;
 pub mod analysis;
+pub mod baryonic;
 
 #[cfg(feature = "cuda")]
 pub mod nbody_gpu;
@@ -21,9 +23,19 @@ pub mod nbody_gpu_mixed;
 #[cfg(feature = "cuda")]
 pub mod nbody_gpu_twopass;
 
+#[cfg(feature = "cuda")]
+pub mod sph_pressure_gpu;
+
 // TreePM module uses rustfft (CPU) for initial implementation
 // GPU cuFFT optimization planned after architecture validation
 pub mod treepm;
+
+// VSL dynamic c_ratio module (Petit MPLA 2014)
+pub mod vsl_dynamic;
+
+// Grackle cooling library wrapper (HM2012 UV background)
+#[cfg(feature = "grackle")]
+pub mod grackle_wrapper;
 
 /// Physical constants (SI units)
 pub mod constants {

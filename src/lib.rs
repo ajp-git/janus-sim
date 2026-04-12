@@ -14,6 +14,7 @@ pub mod nbody;
 pub mod analysis;
 pub mod baryonic;
 pub mod power_spectrum;
+pub mod lensing;
 
 #[cfg(feature = "cuda")]
 pub mod nbody_gpu;

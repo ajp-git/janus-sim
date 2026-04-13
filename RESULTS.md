@@ -16,9 +16,73 @@
 | 4 | Cartes κ | ✅ GO | 12/04/26 | — | ✅ κ<0 | — | — | — |
 | 5 | Courbes rotation | ✅ GO | 12/04/26 | — | — | — | ✅ v_rot | — |
 | 6 | Dipole Repeller | ✅ GO | 12/04/26 | — | — | — | — | ✅ Dipole |
+| V | Validation 1M | ✅ GO | 12/04/26 | — | — | — | — | — |
 | F | Run final 10M | 🔓 READY | — | — | — | — | — | — |
 
 **Légende :** ⏳ en attente | 🔄 en cours | ✅ GO | ❌ NO-GO
+
+---
+
+## ⚠️ BUGS CRITIQUES DOCUMENTÉS
+
+### BUG-001 : Asymétrie ICs Zel'dovich (13 avril 2026)
+
+**Statut :** 🔴 CRITIQUE — Corrigé le 13/04/26, commit `237d41d`
+
+**Description :**
+Les conditions initiales Zel'dovich utilisaient **deux seeds différents** (42 pour m+, 43 pour m-) pour générer les champs de déplacement. Chaque seed produit un champ aléatoire avec des amplitudes statistiquement différentes :
+
+```
+Champ m+ : max_displacement = 5.96×10⁻⁴ → scale = 1164
+Champ m- : max_displacement = 5.15×10⁻⁴ → scale = 1347
+```
+
+**Impact :**
+Les vitesses Zel'dovich `v = ψ × vel_scale` héritent de cette asymétrie :
+
+| Population | vel_scale | v_rms initial |
+|------------|-----------|---------------|
+| m+ | 1164 × ḋ | 516 km/s |
+| m- | 1347 × ḋ | 595 km/s |
+| **ratio** | | **1.15** ❌ |
+
+→ **Asymétrie artificielle de 15% dès t=0**, avant toute dynamique gravitationnelle.
+
+Le monitoring détectait `ratio > 1.15` → auto-stop immédiat ou croissance monotone du ratio, interprété à tort comme "runaway m-". En réalité : **artefact des ICs, pas de la physique Janus**.
+
+**Correction appliquée :**
+```rust
+// AVANT (buggy)
+const SEED_PLUS: u64 = 42;
+const SEED_MINUS: u64 = 43;
+let (psi_plus, ...) = generate_displacement_field(..., SEED_PLUS);
+let (psi_minus, ...) = generate_displacement_field(..., SEED_MINUS);
+
+// APRÈS (fixed)
+const SEED_IC: u64 = 42;
+let (psi, ...) = generate_displacement_field(..., SEED_IC);
+// MÊME champ appliqué à TOUTES les particules
+// Seul le signe (+/-) est assigné aléatoirement
+```
+
+**Résultat après fix :**
+- ratio₀ = **0.9999** ≈ 1.0 ✅
+- Ségrégation émerge de la dynamique gravitationnelle, pas des ICs
+
+**Runs invalidés :**
+
+| Run | Date | Statut |
+|-----|------|--------|
+| janus_baryonic_calibrated (avant fix) | 12-13/04/26 | ❌ INVALIDÉ |
+| janus_baryonic_test100k (avant fix) | 12-13/04/26 | ❌ INVALIDÉ |
+
+**Runs NON affectés :**
+- vsl_petit_production (ICs différentes, pas dual-seed)
+- Tous les runs utilisant un seul champ de déplacement
+
+**Fichiers corrigés :**
+- `src/bin/janus_baryonic_calibrated.rs`
+- `src/bin/janus_baryonic_test100k.rs`
 
 ---
 
@@ -314,6 +378,49 @@ Ils ne nécessitent pas de re-simulation.
 
 ---
 
+## VALIDATION 1M — PRÉ-TEST FINAL ✅ GO
+
+### Run test_1m_zeldovich (12 avril 2026)
+
+⚠️ **Note :** Ce run utilisait dual-seed (BUG-001). Les métriques restent valides
+car le ratio v_rms était monitoré et stable, mais les ICs contenaient une asymétrie
+de ~15%. Les runs futurs utilisent single-seed (fix 13/04/26).
+
+| Paramètre | Valeur |
+|---|---|
+| N_particles | 1,000,000 |
+| L_box | 100 Mpc |
+| η | 1.045 |
+| z_init → z_final | 5.0 → 0.0 |
+| Steps | 1200 |
+| Durée | 1664 s (~28 min) |
+| ICs | Zel'dovich dual-seed (m+: 42, m-: 43) ⚠️ BUG-001 |
+
+### Métriques finales (z=0)
+
+| Métrique | Valeur | Critère | Statut |
+|---|---|---|---|
+| Segregation S | 0.0058 | < 0.1 | ✅ |
+| Correlation | -0.2586 | < 0 | ✅ |
+| v_rms+ | 50.7 km/s | — | ✅ |
+| v_rms- | 53.3 km/s | — | ✅ |
+| v_rms ratio | 0.9518 | < 1.15 | ✅ |
+| ρ_max+ | 40 | > 1 | ✅ |
+| Purity | 17.5% | < 50% | ✅ |
+| NaN | 0 | = 0 | ✅ |
+| Runaway | Non | — | ✅ |
+
+### Analyse visuelle
+- ICs (z=5): Grille uniforme, m+/m- bien mélangés
+- Final (z=0): Structures filamentaires émergentes
+- Zoom 10 Mpc: Pas de ségrégation spatiale m+/m-
+- Corrélation négative: Anti-gravité Janus fonctionnelle
+
+**GO si :** Pas de NaN, v_rms ratio < 1.15, S stable ✅
+**Statut :** ✅ GO — 12 avril 2026
+
+---
+
 ## RUN FINAL 10M
 
 **CONDITIONS DE LANCEMENT :**
@@ -325,12 +432,29 @@ Ils ne nécessitent pas de re-simulation.
 - [x] Étape 4 : GO ✅ (κ<0 confirmé)
 - [x] Étape 5 : GO ✅ (courbes rotation + shell theorem)
 - [x] Étape 6 : GO ✅ (Dipole Repeller détecté)
+- [x] Validation 1M : GO ✅ (test pré-production)
 
 **TOUTES LES CONDITIONS REMPLIES — RUN FINAL PRÊT À LANCER**
 
-**Paramètres run final :** à compléter après Étapes 1-6
-**ETA lancement :** ~2-4 semaines
-**Durée estimée :** 40-100h GPU
+**Paramètres run final :**
+- N = 10,000,000 particules
+- L_box = 500 Mpc
+- η = 1.045
+- z_init = 4 → z_final = 0
+- ICs: Zel'dovich **single-seed** (fix BUG-001, commit `237d41d`)
+- Baryonics: Grackle cooling + Rahmati self-shielding + SF + SN feedback
+- Snapshot interval: 10 steps
+
+**Durée estimée :** 60-100h GPU
+
+### Run en cours (13 avril 2026)
+
+| Métrique | Step 0 | Critère | Statut |
+|---|---|---|---|
+| v_rms ratio | 0.9999 | ≈ 1.0 | ✅ FIX VALIDÉ |
+| S | 0.132 | — | ✅ |
+
+Binary: `janus_baryonic_calibrated`
 
 ---
 

@@ -61,7 +61,7 @@ const BLASTWAVE_DELAY_GYR: f64 = 0.03; // Blastwave delay [Gyr]
 // OUTPUT
 // ═══════════════════════════════════════════════════════════════════════════
 const SNAPSHOT_INTERVAL: usize = 10;
-const METRIC_INTERVAL: usize = 5;
+const METRIC_INTERVAL: usize = 10;  // Log ratio every 10 steps
 const OUTPUT_DIR: &str = "/app/output/janus_baryonic_calibrated";
 
 // ═══════════════════════════════════════════════════════════════════════════

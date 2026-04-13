@@ -80,6 +80,42 @@ let (psi, ...) = generate_displacement_field(..., SEED_IC);
 - vsl_petit_production (ICs différentes, pas dual-seed)
 - Tous les runs utilisant un seul champ de déplacement
 
+---
+
+### TEST-001 : Thermodynamique miroir m- (13 avril 2026)
+
+**Statut :** ❌ ÉCHEC — Hypothèse invalidée
+
+**Hypothèse testée :**
+m- possède sa propre thermodynamique dans sa métrique, qui se traduit par une
+**pression répulsive** dans notre métrique. Cela devrait stabiliser le ratio v_rms.
+
+**Paramètres :**
+- T_init_minus = 10^6 K (très chaud → diffus)
+- Pression SPH répulsive : P_minus < 0
+- Pas de cooling pour m-
+- Pas de formation stellaire pour m-
+
+**Résultats (100K test) :**
+
+| Step | z | ratio | T_mean+ | T_mean- | ρ+_max | ρ-_max |
+|------|-----|-------|---------|---------|--------|--------|
+| 0 | 4.00 | 0.99 | 10000 | 10^6 | 1 | 1 |
+| 100 | 3.64 | 1.10 | 9439 | 10^6 | 2 | 1 |
+| 200 | 3.34 | 1.24 | 9435 | 10^6 | 2 | 1 |
+| 270 | 3.16 | **1.30** | 9433 | 10^6 | 2 | 2 |
+
+**AUTO-STOP** à step 270 : ratio > 1.30
+
+**Conclusion :**
+La pression répulsive (T=10^6 K) n'est pas assez forte pour contrebalancer
+l'accélération gravitationnelle de m-. Le ratio diverge de la même manière
+que sans thermodynamique miroir.
+
+**Fichiers :**
+- `src/bin/janus_mirror_thermo_test100k.rs`
+- `output/janus_mirror_thermo/time_series.csv`
+
 **Fichiers corrigés :**
 - `src/bin/janus_baryonic_calibrated.rs`
 - `src/bin/janus_baryonic_test100k.rs`

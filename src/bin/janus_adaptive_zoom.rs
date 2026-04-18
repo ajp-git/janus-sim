@@ -16,6 +16,8 @@ use clap::Parser;
 
 #[cfg(feature = "cuda")]
 use janus::nbody_gpu::GpuNBodySimulation;
+#[cfg(feature = "cuda")]
+use janus::cooling_gpu::GpuCooling;
 use janus::vsl_dynamic::CoupledFriedmann;
 use janus::snapshot_v3::{SnapshotHeaderV3, ParticleV3, write_snapshot_v3, snapshot_info};
 use std::fs::{self, File};
@@ -130,6 +132,10 @@ const DELTA_RMS: f64 = 0.10;
 const PI: f64 = std::f64::consts::PI;
 const MPC_GYR_TO_KMS: f64 = 977.8;
 const G_COSMO: f64 = 4.499e-15;  // Mpc³ M☉⁻¹ Gyr⁻²
+
+// Physique baryonique
+const T_INIT_PLUS: f64 = 10000.0;   // Température initiale m+ [K]
+const T_FLOOR: f64 = 100.0;         // Température plancher [K]
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PARTICLE MASSES (M_sun) — computed from cosmology
@@ -268,9 +274,15 @@ impl AdaptiveState {
             velocities.push(p.vel[2] as f64);
             signs.push(if p.sign == 1 { 1 } else { -1 });
 
-            // Mass in force units: G × m_physical (M☉)
-            // This gives acceleration directly: a = mass × r⁻³ × r_vec
-            let mass_force = G_COSMO * p.mass as f64;
+            // Système d'unités implicite : masse normalisée = 1.0
+            // pour une particule non-splittée, comme janus_baryonic_calibrated
+            let mass_force = if p.split_level == 0 {
+                1.0
+            } else {
+                1.0 / 8.0_f64.powi(p.split_level as i32)
+                // split_level=1 → 0.125 (8 filles × 0.125 = 1.0 conservé)
+                // split_level=2 → 0.015625
+            };
             masses.push(mass_force);
         }
 
@@ -545,6 +557,56 @@ fn ifft_3d(field: &mut [Complex<f64>], ifft: &std::sync::Arc<dyn rustfft::Fft<f6
     field.iter().map(|c| c.re * norm).collect()
 }
 
+/// Compute local overdensities for m+ particles (for cooling physics)
+fn compute_local_overdensities(pos: &[f64], signs: &[i32], grid_size: usize, box_size: f64) -> Vec<f64> {
+    let half_box = box_size / 2.0;
+    let cell_size = box_size / grid_size as f64;
+    let n3 = grid_size * grid_size * grid_size;
+
+    // Count particles per cell (m+ only)
+    let mut cell_counts = vec![0u32; n3];
+    let mut particle_cells: Vec<usize> = Vec::new();
+
+    let n = pos.len() / 3;
+    for i in 0..n {
+        if signs[i] <= 0 {
+            continue;  // Skip m-
+        }
+
+        let x = pos[i*3];
+        let y = pos[i*3 + 1];
+        let z = pos[i*3 + 2];
+
+        let ix = ((x + half_box) / cell_size).floor() as usize;
+        let iy = ((y + half_box) / cell_size).floor() as usize;
+        let iz = ((z + half_box) / cell_size).floor() as usize;
+
+        let ix = ix.min(grid_size - 1);
+        let iy = iy.min(grid_size - 1);
+        let iz = iz.min(grid_size - 1);
+
+        let idx = ix + iy * grid_size + iz * grid_size * grid_size;
+        cell_counts[idx] += 1;
+        particle_cells.push(idx);
+    }
+
+    // Compute mean count per cell
+    let n_plus = particle_cells.len() as f64;
+    let mean_per_cell = n_plus / n3 as f64;
+
+    // Return overdensity for each m+ particle
+    particle_cells.iter()
+        .map(|&cell_idx| {
+            let count = cell_counts[cell_idx] as f64;
+            if mean_per_cell > 0.0 {
+                count / mean_per_cell
+            } else {
+                1.0
+            }
+        })
+        .collect()
+}
+
 fn generate_zeldovich_ics(n_grid: usize, l_box: f64, z_init: f64, h0: f64) -> (Vec<f64>, Vec<f64>, Vec<i32>) {
     println!("\n[1/5] Generating Zel'dovich ICs (correct 3D displacement)...");
 
@@ -560,12 +622,13 @@ fn generate_zeldovich_ics(n_grid: usize, l_box: f64, z_init: f64, h0: f64) -> (V
 
     let mut rng = StdRng::seed_from_u64(SEED_IC);
 
-    // Step 1: Generate Gaussian random field δ(k) with correct displacement spectrum
-    // P_disp(k) ∝ k^(n_s - 4) × δ_rms² — this gives ~30% cell displacement
+    // Step 1: Generate Gaussian random field δ(k) with P_δ(k) ∝ k^n_s
+    // Same method as champion_10m_v2.rs - WORKING formula
     println!("  Generating density field δ(k)...");
     let mut delta_k: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); n_total];
 
-    // Cosmological parameters for IC amplitude
+    // IC amplitude from champion_10m_v2.rs (empirically validated)
+    const IC_AMPLITUDE: f64 = 0.01;
     let a_init = 1.0 / (1.0 + z_init);
     let d_growth = a_init;  // Linear growth factor D(a) ≈ a in matter-dominated era
 
@@ -584,23 +647,46 @@ fn generate_zeldovich_ics(n_grid: usize, l_box: f64, z_init: f64, h0: f64) -> (V
                 if k2 > 0.0 {
                     let k = k2.sqrt();
 
-                    // Power spectrum P(k) ∝ k^(n_s - 4) for displacement field
-                    // This is the correct Zel'dovich spectrum (Harrison-Zeldovich × 1/k²)
-                    let pk = k.powf(N_S - 4.0) * DELTA_RMS.powi(2);
-                    let amp = (pk / 2.0).sqrt();
+                    // Power spectrum with transfer function and window
+                    const K_MIN_IC: f64 = 2.0 * PI / 500.0;  // mode fondamental boîte
+                    const K_MAX_IC: f64 = 2.0 * PI / 5.0;    // Nyquist N_grid=215
+                    const K0_IC: f64 = 0.02;
 
-                    let phase = rng.random::<f64>() * 2.0 * PI;
-                    let re = rng.sample(&normal) * amp * d_growth;
-                    let im = rng.sample(&normal) * amp * d_growth;
+                    let window = if k < K_MIN_IC || k > K_MAX_IC { 0.0 } else { 1.0 };
+                    let pk = k.powf(N_S) / (1.0 + (k / K0_IC).powi(4)) * window;
+                    let sigma_k = pk.sqrt() * IC_AMPLITUDE * d_growth;
 
-                    delta_k[idx] = Complex::new(
-                        re * phase.cos() - im * phase.sin(),
-                        re * phase.sin() + im * phase.cos()
-                    );
+                    let re = rng.sample(&normal) * sigma_k;
+                    let im = rng.sample(&normal) * sigma_k;
+
+                    delta_k[idx] = Complex::new(re, im);
                 }
             }
         }
     }
+
+    // Enforce Hermitian symmetry for real IFFT
+    for iz in 0..n_grid {
+        for iy in 0..n_grid {
+            for ix in 0..=half_n {
+                let idx = iz * n_grid * n_grid + iy * n_grid + ix;
+                let iz_conj = if iz == 0 { 0 } else { n_grid - iz };
+                let iy_conj = if iy == 0 { 0 } else { n_grid - iy };
+                let ix_conj = if ix == 0 { 0 } else { n_grid - ix };
+                let idx_conj = iz_conj * n_grid * n_grid + iy_conj * n_grid + ix_conj;
+
+                if idx < idx_conj {
+                    delta_k[idx_conj] = delta_k[idx].conj();
+                }
+            }
+        }
+    }
+
+    // DIAGNOSTIC: delta_k amplitude
+    let delta_max = delta_k.iter()
+        .map(|c| c.norm())
+        .fold(0.0f64, f64::max);
+    println!("  delta_k max amplitude = {:.6e}", delta_max);
 
     // Step 2: Compute displacement fields ψ(k) = -i k δ(k) / k²
     println!("  Computing displacement fields ψ_x, ψ_y, ψ_z...");
@@ -642,6 +728,11 @@ fn generate_zeldovich_ics(n_grid: usize, l_box: f64, z_init: f64, h0: f64) -> (V
     let psi_y = ifft_3d(&mut psi_y_k, &ifft, n_grid);
     let psi_z = ifft_3d(&mut psi_z_k, &ifft, n_grid);
 
+    // DIAGNOSTIC: psi_x range after IFFT
+    let psi_real_max = psi_x.iter().cloned().fold(0.0f64, f64::max);
+    let psi_real_min = psi_x.iter().cloned().fold(0.0f64, f64::min);
+    println!("  psi_x range = [{:.3e}, {:.3e}]", psi_real_min, psi_real_max);
+
     // Step 4: Compute max displacement for scaling
     let mut max_disp = 0.0f64;
     for i in 0..n_total {
@@ -650,18 +741,22 @@ fn generate_zeldovich_ics(n_grid: usize, l_box: f64, z_init: f64, h0: f64) -> (V
     }
     println!("  Max displacement (raw): {:.6e} Mpc", max_disp);
 
-    // Scale to target: ~30% of cell size for proper structure
-    let target_disp = spacing * 0.3;
+    // Scale to target: 70% of cell size for better structure visibility
+    // Pas de croisement car les déplacements Zel'dovich sont cohérents
+    // (modes longues corrélés) pas aléatoires par particule
+    let target_disp = spacing * 0.7;  // = 1.628 Mpc pour N_grid=215
     let scale = if max_disp > 1e-10 { target_disp / max_disp } else { 1.0 };
-    println!("  Scaling: max_disp → {:.4} Mpc ({:.1}% of cell)",
-             target_disp, 100.0 * target_disp / spacing);
+    println!("  Target displacement: {:.4} Mpc ({:.1}% of cell = {:.3} Mpc)",
+             target_disp, 70.0, spacing);
+    println!("  Scale factor: {:.6e} (max_disp_raw={:.6e} → {:.4} Mpc)",
+             scale, max_disp, target_disp);
 
-    // Velocity scaling: v = a * H(a) * D'(a)/D(a) * ψ ≈ a * H * f * ψ
-    // At high z, f ≈ 1 and D'(a)/D(a) ≈ sqrt(1+z)
-    let a_init = 1.0 / (1.0 + z_init);
-    let h_init = h0 / MPC_GYR_TO_KMS;  // H in Gyr^-1 units
-    let d_dot_factor = (1.0 + z_init).sqrt();
-    let vel_scale = a_init * h_init * d_dot_factor * scale;
+    // Velocity scaling: v_pec = a × H(z) × ψ_phys
+    // = a × (H₀/a^1.5) × ψ = H₀ × sqrt(1+z) × ψ
+    let h0_gyr = h0 / MPC_GYR_TO_KMS;  // H₀ in Gyr⁻¹ units
+    let vel_scale = h0_gyr * (1.0 + z_init).sqrt();  // = a × H(z_init)
+    println!("  Velocity scale: {:.4} Mpc/Gyr ({:.1} km/s per Mpc displacement)",
+             vel_scale, vel_scale * MPC_GYR_TO_KMS);
 
     // Step 5: Build particle arrays
     println!("  Building particle arrays...");
@@ -679,7 +774,7 @@ fn generate_zeldovich_ics(n_grid: usize, l_box: f64, z_init: f64, h0: f64) -> (V
                 let y0 = (iy as f64 + 0.5) * spacing - half_box;
                 let z0 = (iz as f64 + 0.5) * spacing - half_box;
 
-                // Apply 3D displacement with periodic wrapping
+                // Apply Zel'dovich 3D displacement (30% of cell) with periodic wrapping
                 let dx = psi_x[idx] * scale;
                 let dy = psi_y[idx] * scale;
                 let dz = psi_z[idx] * scale;
@@ -688,10 +783,10 @@ fn generate_zeldovich_ics(n_grid: usize, l_box: f64, z_init: f64, h0: f64) -> (V
                 positions[idx * 3 + 1] = ((y0 + dy + half_box) % l_box + l_box) % l_box - half_box;
                 positions[idx * 3 + 2] = ((z0 + dz + half_box) % l_box + l_box) % l_box - half_box;
 
-                // Zel'dovich velocity: v = a * H * D'/D * ψ
-                velocities[idx * 3]     = psi_x[idx] * vel_scale;
-                velocities[idx * 3 + 1] = psi_y[idx] * vel_scale;
-                velocities[idx * 3 + 2] = psi_z[idx] * vel_scale;
+                // Zel'dovich velocity: v = H0 × sqrt(1+z) × ψ_scaled
+                velocities[idx * 3]     = psi_x[idx] * scale * vel_scale;
+                velocities[idx * 3 + 1] = psi_y[idx] * scale * vel_scale;
+                velocities[idx * 3 + 2] = psi_z[idx] * scale * vel_scale;
 
                 // Random sign assignment (η=1.045 → ~52% m+)
                 signs[idx] = if rng.random::<f64>() < 0.52 { 1 } else { -1 };
@@ -781,11 +876,12 @@ fn main() {
     state.header.z_start_run = args.z_init;
 
     println!("\n[2/5] Initializing GPU simulation...");
-    // CRITICAL: Use to_gpu_arrays() to get masses with G_COSMO factor
-    let (gpu_pos, gpu_vel, gpu_signs, gpu_masses) = state.to_gpu_arrays();
-    let mut gpu_sim = GpuNBodySimulation::new_with_state_and_masses(
+    // Use new_with_state() like janus_baryonic_calibrated (masses = 1.0)
+    // new_with_state_and_masses() only needed after splits (masses < 1.0)
+    let (gpu_pos, gpu_vel, gpu_signs, _gpu_masses) = state.to_gpu_arrays();
+    let mut gpu_sim = GpuNBodySimulation::new_with_state(
         n_plus, n_minus, args.l_box,
-        gpu_pos, gpu_vel, gpu_signs, gpu_masses
+        gpu_pos, gpu_vel, gpu_signs
     ).expect("Failed to create GPU simulation");
     gpu_sim.set_theta(args.theta);
     gpu_sim.set_softening(args.eps_plus);
@@ -794,6 +890,25 @@ fn main() {
     let c_ratio_sq_init = CoupledFriedmann::c_ratio_sq_at_z(args.z_init, ETA);
     gpu_sim.set_c_ratio(c_ratio_sq_init.sqrt());
     println!("  GPU ready: {} particles, θ={}", state.particles.len(), args.theta);
+
+    // Initialiser la physique baryonique (cooling + SF)
+    let cuda_device = cudarc::driver::CudaDevice::new(0)
+        .expect("Failed to get CUDA device");
+    let n_plus_init = state.particles.iter().filter(|p| p.sign == 1).count();
+    let mut gpu_cooling = GpuCooling::new(
+        cuda_device,
+        n_plus_init,
+        args.l_box,
+        state.m_plus_base,
+    ).expect("Failed to create GpuCooling");
+
+    let signs_plus: Vec<i32> = vec![1i32; n_plus_init];
+    gpu_cooling.init_from_temperature(T_INIT_PLUS, T_INIT_PLUS, &signs_plus)
+        .expect("Failed to init cooling temperatures");
+    println!("  ✓ Physique baryonique initialisée (T_init = {} K)", T_INIT_PLUS);
+
+    let mut n_stars: usize = 0;
+    let mut sfr: f64 = 0.0;
 
     // RNG for splits
     let mut rng_split = StdRng::seed_from_u64(SEED_IC + 1000);
@@ -819,7 +934,8 @@ fn main() {
             break;
         }
 
-        let h = args.h0 / MPC_GYR_TO_KMS * (1.0 + z).sqrt();  // Simplified H(z)
+        // H(z) = H₀ × (1+z)^(3/2) for matter-dominated Janus (Ω_tot=1)
+        let h = (args.h0 / MPC_GYR_TO_KMS) / a.powf(1.5);  // Same as janus_baryonic_calibrated
 
         // Metrics
         let do_metric = step % METRIC_INTERVAL == 0;
@@ -867,6 +983,17 @@ fn main() {
                     gpu_sim.set_theta(args.theta);
                     gpu_sim.set_softening(args.eps_plus);
                     gpu_sim.set_c_ratio(CoupledFriedmann::c_ratio_sq_at_z(z, ETA).sqrt());
+
+                    // Réinitialiser GpuCooling avec le nouveau n_plus
+                    let n_plus_new = state.particles.iter().filter(|p| p.sign == 1).count();
+                    let cuda_device = cudarc::driver::CudaDevice::new(0)
+                        .expect("Failed to get CUDA device");
+                    gpu_cooling = GpuCooling::new(
+                        cuda_device, n_plus_new, args.l_box, state.m_plus_base
+                    ).expect("Failed to recreate GpuCooling after split");
+                    let signs_plus_new: Vec<i32> = vec![1i32; n_plus_new];
+                    gpu_cooling.init_from_temperature(T_INIT_PLUS, T_INIT_PLUS, &signs_plus_new)
+                        .expect("Failed to reinit cooling");
                 }
             }
 
@@ -909,8 +1036,52 @@ fn main() {
 
         // Time integration
         gpu_sim.step_with_expansion_dkd_gpu(args.dt_max, a, h, 0.0).unwrap();
-        a += a * h * args.dt_max;
+        let da = a * h * args.dt_max;
+        a += da;
         t_gyr += args.dt_max;
+
+        // ═══════════════════════════════════════════════════════
+        // PHYSIQUE BARYONIQUE (m+ uniquement, chaque step)
+        // ═══════════════════════════════════════════════════════
+        {
+            let pos = gpu_sim.get_positions().unwrap();
+            let signs_data = gpu_sim.signs();
+
+            // Densités locales pour le refroidissement
+            let overdensities = compute_local_overdensities(
+                &pos, &signs_data, 32, args.l_box
+            );
+
+            // Conversion correcte : overdensité → nH [cm⁻³]
+            // ρ_mean_baryon(z) = ρ_crit_0 × Ω_b × (1+z)³
+            // ρ_crit_0 = 9.47e-30 g/cm³
+            // Ω_b = 0.05, X_H = 0.76, m_H = 1.673e-24 g
+            // nH = ρ_mean × Ω_b × (1+z)³ × X_H / m_H × overdensity
+            let rho_mean_0_cgs = 9.47e-30_f64;  // g/cm³
+            let omega_b = args.omega_b;
+            let x_h = 0.76_f64;
+            let m_h = 1.673e-24_f64;  // g
+            let nH_mean = rho_mean_0_cgs * omega_b * (1.0 + z).powi(3) * x_h / m_h;
+            let densities: Vec<f64> = overdensities.iter()
+                .map(|&od| od * nH_mean)
+                .collect();
+
+            // Refroidissement GPU
+            gpu_cooling.upload_densities(&densities)
+                .expect("Failed to upload densities");
+            gpu_cooling.apply_cooling(args.dt_max, z)
+                .expect("GPU cooling failed");
+
+            // Formation stellaire
+            let new_stars = gpu_cooling.apply_star_formation(args.dt_max)
+                .unwrap_or(0);
+            n_stars += new_stars as usize;
+            sfr = (new_stars as f64) * state.m_plus_base / args.dt_max;
+
+            if new_stars > 0 {
+                println!("    ★ Step {}: {} nouvelles étoiles, N★={}", step, new_stars, n_stars);
+            }
+        }
 
         // Update c_ratio dynamically
         if step % 100 == 0 {

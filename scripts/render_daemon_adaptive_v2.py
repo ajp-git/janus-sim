@@ -18,15 +18,15 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 
 # === CONFIGURATION ===
-SNAP_DIR = Path("/mnt/T2/janus-sim/output/janus_adaptive_v5/snapshots")
-OUT_10P = Path("/mnt/T2/janus-sim/output/janus_adaptive_v5/frames_10panel")
-OUT_2P5D = Path("/mnt/T2/janus-sim/output/janus_adaptive_v5/frames_2p5d")
+SNAP_DIR = Path("/mnt/T2/janus-sim/output/janus_adaptive_v3/snapshots")
+OUT_10P = Path("/mnt/T2/janus-sim/output/janus_adaptive_v3/frames_10panel")
+OUT_2P5D = Path("/mnt/T2/janus-sim/output/janus_adaptive_v3/frames_2p5d")
 OUT_10P.mkdir(exist_ok=True, parents=True)
 OUT_2P5D.mkdir(exist_ok=True, parents=True)
 
 RESOLUTION_4K = (3840, 2160)
 DPI = 200
-ZOOM_SIZE = 60.0  # For 500 Mpc box
+ZOOM_SIZE = 100.0  # For 500 Mpc box (larger zoom to see structure better)
 GRID_SIZE = 64
 SUBSAMPLE = 200000  # Max particles to plot for performance
 
@@ -260,7 +260,9 @@ def render_10panel(snap_path, step):
 
 
 def render_2p5d(snap_path, step):
-    """Render 3-panel 2.5D layout"""
+    """Render 2.5D layout: left=combined full height, right=m+ top / m- bottom"""
+    from matplotlib.gridspec import GridSpec
+
     data = read_snapshot_v3_fast(str(snap_path))
     pos = data['pos']
     sign = data['sign']
@@ -273,58 +275,85 @@ def render_2p5d(snap_path, step):
     pos_plus = pos[is_plus]
     pos_minus = pos[is_minus]
 
-    # Subsample for 3D
-    pp = subsample(pos_plus, 100000)
-    pm = subsample(pos_minus, 50000)
+    # Subsample for 3D rendering
+    pp = subsample(pos_plus, 150000)
+    pm = subsample(pos_minus, 100000)
 
-    # Create figure with 3 subplots
-    fig = plt.figure(figsize=(19.2, 7.2), facecolor='black')
-    fig.suptitle(f'JANUS ADAPTIVE 2.5D — Step {step} | z = {z:.3f}', color='white', fontsize=14)
+    # 4K figure: 3840x2160 at 200 DPI = 19.2 x 10.8 inches
+    fig = plt.figure(figsize=(19.2, 10.8), facecolor='black')
 
-    # 1. Combined 3D view
-    ax1 = fig.add_subplot(131, projection='3d', facecolor='black')
-    ax1.scatter(pp[:,0], pp[:,1], pp[:,2], s=0.02, c='#4488ff', alpha=0.15, rasterized=True)
-    ax1.scatter(pm[:,0], pm[:,1], pm[:,2], s=0.02, c='#ff4444', alpha=0.15, rasterized=True)
-    ax1.set_xlim(-half, half)
-    ax1.set_ylim(-half, half)
-    ax1.set_zlim(-half, half)
-    ax1.set_title('Combined m+/m-', color='white', fontsize=10)
-    ax1.xaxis.pane.fill = False
-    ax1.yaxis.pane.fill = False
-    ax1.zaxis.pane.fill = False
-    ax1.tick_params(colors='gray', labelsize=6)
-    ax1.view_init(elev=25, azim=45 + step * 0.2)  # Rotating view
+    # GridSpec: 2 rows, 3 columns
+    # Left panel (combined): spans all rows, 2 columns
+    # Right panels: 1 column each, top=m+, bottom=m-
+    gs = GridSpec(2, 3, figure=fig, width_ratios=[2, 2, 1.5],
+                  height_ratios=[1, 1], wspace=0.05, hspace=0.08)
 
-    # 2. m+ only 3D
-    ax2 = fig.add_subplot(132, projection='3d', facecolor='black')
-    ax2.scatter(pp[:,0], pp[:,1], pp[:,2], s=0.03, c='#4488ff', alpha=0.2, rasterized=True)
-    ax2.set_xlim(-half, half)
-    ax2.set_ylim(-half, half)
-    ax2.set_zlim(-half, half)
-    ax2.set_title('m+ structure', color='#4488ff', fontsize=10)
-    ax2.xaxis.pane.fill = False
-    ax2.yaxis.pane.fill = False
-    ax2.zaxis.pane.fill = False
-    ax2.tick_params(colors='gray', labelsize=6)
-    ax2.view_init(elev=25, azim=45 + step * 0.2)
+    azim = 45 + step * 0.15  # Slow rotation
+    elev = 20
 
-    # 3. m- only 3D
-    ax3 = fig.add_subplot(133, projection='3d', facecolor='black')
-    ax3.scatter(pm[:,0], pm[:,1], pm[:,2], s=0.03, c='#ff4444', alpha=0.2, rasterized=True)
-    ax3.set_xlim(-half, half)
-    ax3.set_ylim(-half, half)
-    ax3.set_zlim(-half, half)
-    ax3.set_title('m- (voids)', color='#ff4444', fontsize=10)
-    ax3.xaxis.pane.fill = False
-    ax3.yaxis.pane.fill = False
-    ax3.zaxis.pane.fill = False
-    ax3.tick_params(colors='gray', labelsize=6)
-    ax3.view_init(elev=25, azim=45 + step * 0.2)
+    # === LEFT: Combined m+/m- (full height, 2/3 width) ===
+    ax_main = fig.add_subplot(gs[:, :2], projection='3d', facecolor='black')
+    ax_main.scatter(pm[:,0], pm[:,1], pm[:,2], s=0.15, c='#ff4444', alpha=0.4, rasterized=True)
+    ax_main.scatter(pp[:,0], pp[:,1], pp[:,2], s=0.15, c='#44aaff', alpha=0.4, rasterized=True)
+    ax_main.set_xlim(-half, half)
+    ax_main.set_ylim(-half, half)
+    ax_main.set_zlim(-half, half)
+    ax_main.set_title(f'JANUS BIMETRIC — Step {step} | z = {z:.2f}',
+                      color='white', fontsize=16, pad=10)
+    ax_main.xaxis.pane.fill = False
+    ax_main.yaxis.pane.fill = False
+    ax_main.zaxis.pane.fill = False
+    ax_main.xaxis.pane.set_edgecolor('#333333')
+    ax_main.yaxis.pane.set_edgecolor('#333333')
+    ax_main.zaxis.pane.set_edgecolor('#333333')
+    ax_main.tick_params(colors='#666666', labelsize=8)
+    ax_main.set_xlabel('X [Mpc]', color='#888888', fontsize=9)
+    ax_main.set_ylabel('Y [Mpc]', color='#888888', fontsize=9)
+    ax_main.set_zlabel('Z [Mpc]', color='#888888', fontsize=9)
+    ax_main.view_init(elev=elev, azim=azim)
 
-    plt.tight_layout()
+    # Legend
+    ax_main.text2D(0.02, 0.98, f'N = {len(pos):,}', transform=ax_main.transAxes,
+                   color='white', fontsize=11, va='top')
+    ax_main.text2D(0.02, 0.94, f'm+ (blue): {len(pos_plus):,}', transform=ax_main.transAxes,
+                   color='#44aaff', fontsize=10, va='top')
+    ax_main.text2D(0.02, 0.90, f'm- (red): {len(pos_minus):,}', transform=ax_main.transAxes,
+                   color='#ff4444', fontsize=10, va='top')
+
+    # === TOP RIGHT: m+ only ===
+    ax_plus = fig.add_subplot(gs[0, 2], projection='3d', facecolor='black')
+    ax_plus.scatter(pp[:,0], pp[:,1], pp[:,2], s=0.015, c='#44aaff', alpha=0.25, rasterized=True)
+    ax_plus.set_xlim(-half, half)
+    ax_plus.set_ylim(-half, half)
+    ax_plus.set_zlim(-half, half)
+    ax_plus.set_title('m+ (baryonic matter)', color='#44aaff', fontsize=11)
+    ax_plus.xaxis.pane.fill = False
+    ax_plus.yaxis.pane.fill = False
+    ax_plus.zaxis.pane.fill = False
+    ax_plus.xaxis.pane.set_edgecolor('#222244')
+    ax_plus.yaxis.pane.set_edgecolor('#222244')
+    ax_plus.zaxis.pane.set_edgecolor('#222244')
+    ax_plus.tick_params(colors='#444466', labelsize=6)
+    ax_plus.view_init(elev=elev, azim=azim)
+
+    # === BOTTOM RIGHT: m- only ===
+    ax_minus = fig.add_subplot(gs[1, 2], projection='3d', facecolor='black')
+    ax_minus.scatter(pm[:,0], pm[:,1], pm[:,2], s=0.015, c='#ff4444', alpha=0.25, rasterized=True)
+    ax_minus.set_xlim(-half, half)
+    ax_minus.set_ylim(-half, half)
+    ax_minus.set_zlim(-half, half)
+    ax_minus.set_title('m- (negative mass)', color='#ff4444', fontsize=11)
+    ax_minus.xaxis.pane.fill = False
+    ax_minus.yaxis.pane.fill = False
+    ax_minus.zaxis.pane.fill = False
+    ax_minus.xaxis.pane.set_edgecolor('#442222')
+    ax_minus.yaxis.pane.set_edgecolor('#442222')
+    ax_minus.zaxis.pane.set_edgecolor('#442222')
+    ax_minus.tick_params(colors='#664444', labelsize=6)
+    ax_minus.view_init(elev=elev, azim=azim)
 
     out_path = OUT_2P5D / f'frame_{step:05d}.png'
-    fig.savefig(out_path, dpi=150, facecolor='black')
+    fig.savefig(out_path, dpi=200, facecolor='black', bbox_inches='tight')
     plt.close(fig)
     return out_path
 

@@ -189,22 +189,26 @@ def compute_sph_density_knn(positions: np.ndarray, masses: np.ndarray, k: int = 
 
 def find_top_halos(positions: np.ndarray, densities: np.ndarray,
                    l_box: float, n_halos: int = 4, min_sep: float = 10.0,
-                   border: float = 20.0) -> List[Dict]:
+                   border: float = 50.0) -> List[Dict]:
     """Find top N density peaks with minimum separation
 
     Args:
         border: Exclude halos within this distance from box edges (Mpc)
+                Default 50 Mpc to avoid boundary artifacts at corners
     """
     halos = []
-    mask = np.ones(len(positions), dtype=bool)
     half = l_box / 2.0
+    safe_limit = half - border  # 250 - 50 = 200 Mpc
 
-    # Pre-mask particles near edges
+    # Pre-mask: exclude particles near edges from the start
     edge_mask = (
-        (np.abs(positions[:, 0]) < half - border) &
-        (np.abs(positions[:, 1]) < half - border) &
-        (np.abs(positions[:, 2]) < half - border)
+        (np.abs(positions[:, 0]) < safe_limit) &
+        (np.abs(positions[:, 1]) < safe_limit) &
+        (np.abs(positions[:, 2]) < safe_limit)
     )
+
+    # Start with edge mask applied - never consider edge particles
+    mask = edge_mask.copy()
 
     for _ in range(n_halos * 3):  # Try more candidates to find n_halos valid ones
         if len(halos) >= n_halos:
@@ -212,7 +216,7 @@ def find_top_halos(positions: np.ndarray, densities: np.ndarray,
         if not np.any(mask):
             break
 
-        # Find max density among unmasked
+        # Find max density among unmasked (edge particles already excluded)
         masked_densities = np.where(mask, densities, -np.inf)
         idx_max = np.argmax(masked_densities)
 
@@ -227,10 +231,6 @@ def find_top_halos(positions: np.ndarray, densities: np.ndarray,
 
         # Mask out particles within min_sep for next iteration
         mask &= (distances >= min_sep)
-
-        # Skip if too close to edge
-        if not edge_mask[idx_max]:
-            continue
 
         n_in_halo = np.sum(distances < 2.0)
 
@@ -366,7 +366,7 @@ def analyze_snapshot(header: SnapshotHeaderV3, particles: np.ndarray,
     # HALOS
     # ═══════════════════════════════════════════════════════════════════════
     halos = find_top_halos(pos_plus, densities_plus, l_box=header.l_box,
-                           n_halos=n_halos, min_sep=10.0, border=20.0)
+                           n_halos=n_halos, min_sep=10.0, border=50.0)
 
     # Compute additional halo metrics
     for i, halo in enumerate(halos):

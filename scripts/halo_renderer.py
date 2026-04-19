@@ -19,7 +19,8 @@ from pathlib import Path
 from datetime import datetime
 
 # === CONFIGURATION ===
-MARGIN = 50.0  # Mpc — forbidden zone on each edge (skip halos in this zone)
+MARGIN = 50.0  # Mpc — zone interdite sur chaque bord
+# La boîte fait ±250 Mpc, zone autorisée : [-200, 200] Mpc
 
 # === SNAPSHOT READER (V3 format) ===
 def read_snapshot_v3(path):
@@ -180,8 +181,8 @@ def render_halo(data, halo_center, halo_idx, step, out_dir, r_extract=15.0):
     l_box = data['l_box']
     half = l_box / 2
 
-    # Skip halos too close to edges (within MARGIN)
-    safe_limit = half - MARGIN
+    # Skip halos too close to edges (within MARGIN of box boundary)
+    safe_limit = half - MARGIN  # 250 - 50 = 200 Mpc
     if (abs(halo_center[0]) > safe_limit or
         abs(halo_center[1]) > safe_limit or
         abs(halo_center[2]) > safe_limit):

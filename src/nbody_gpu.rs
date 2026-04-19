@@ -66,6 +66,10 @@ pub struct GpuParticle {
 
 /// CUDA kernels using double precision (f64) for accuracy
 const CUDA_KERNEL_SRC: &str = r#"
+// Asymmetric softening ratio for m- particles (numerical artifact)
+// m- uses SOFTENING_MINUS_RATIO × softening to simulate diffuse gas nature
+#define SOFTENING_MINUS_RATIO 5.0
+
 extern "C" __global__ void compute_forces_simple(
     const double* __restrict__ pos,      // x,y,z interleaved
     const int* __restrict__ signs,
@@ -76,7 +80,9 @@ extern "C" __global__ void compute_forces_simple(
     int n_particles,
     int n_nodes,
     double theta,
-    double softening
+    double softening,
+    double c_ratio_sq,  // (c_minus/c_plus)^2, default=1.0, VSL=100.0
+    double repulsion_scale  // 0.0=no cross-species, 1.0=full Janus (gradual ramp)
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_particles) return;
@@ -87,7 +93,9 @@ extern "C" __global__ void compute_forces_simple(
     int my_sign = signs[tid];
 
     double ax = 0.0, ay = 0.0, az = 0.0;
-    double eps2 = softening * softening;
+    // Asymmetric softening: m- uses larger value to simulate diffuse gas nature
+    double eps = (my_sign > 0) ? softening : (softening * SOFTENING_MINUS_RATIO);
+    double eps2 = eps * eps;
 
     // Stack for tree traversal
     int stack[32];
@@ -132,7 +140,14 @@ extern "C" __global__ void compute_forces_simple(
                 double dpz = com_plus_z - pz;
                 double rp2 = dpx*dpx + dpy*dpy + dpz*dpz + eps2;
                 double inv_rp3 = 1.0 / (rp2 * sqrt(rp2));
-                double interaction = (my_sign > 0) ? 1.0 : -1.0;
+                // VSL Option B: m- feels AMPLIFIED repulsion from m+ (factor c_ratio_sq)
+                // repulsion_scale: 0.0 = no cross-species, 1.0 = full Janus
+                double interaction;
+                if (my_sign > 0) {
+                    interaction = 1.0;  // m+ ← m+ attraction (always)
+                } else {
+                    interaction = -c_ratio_sq * repulsion_scale;  // m- ← m+ repulsion (scaled)
+                }
                 double f = interaction * mass_plus * inv_rp3;
                 ax += f * dpx;
                 ay += f * dpy;
@@ -145,7 +160,14 @@ extern "C" __global__ void compute_forces_simple(
                 double dmz = com_minus_z - pz;
                 double rm2 = dmx*dmx + dmy*dmy + dmz*dmz + eps2;
                 double inv_rm3 = 1.0 / (rm2 * sqrt(rm2));
-                double interaction = (my_sign < 0) ? 1.0 : -1.0;
+                // VSL Option B: m+ feels STANDARD repulsion from m- (factor 1.0)
+                // repulsion_scale: 0.0 = no cross-species, 1.0 = full Janus
+                double interaction;
+                if (my_sign < 0) {
+                    interaction = 1.0;  // m- ← m- attraction (always)
+                } else {
+                    interaction = -1.0 * repulsion_scale;  // m+ ← m- repulsion (scaled)
+                }
                 double f = interaction * mass_minus * inv_rm3;
                 ax += f * dmx;
                 ay += f * dmy;
@@ -341,6 +363,19 @@ extern "C" __global__ void reorder_signs(
     signs_out[tid] = signs_in[sorted_indices[tid]];
 }
 
+// Reorder masses based on sorted indices (for adaptive splitting)
+extern "C" __global__ void reorder_masses(
+    const double* __restrict__ masses_in,
+    double* __restrict__ masses_out,
+    const int* __restrict__ sorted_indices,
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    masses_out[tid] = masses_in[sorted_indices[tid]];
+}
+
 // ============================================================================
 // GPU BVH Construction (Karras 2012)
 // ============================================================================
@@ -478,9 +513,11 @@ extern "C" __global__ void build_bvh_internal(
 }
 
 // Initialize leaf nodes with particle data
+// masses parameter added for adaptive splitting support
 extern "C" __global__ void init_leaves(
     const double* __restrict__ pos,
     const int* __restrict__ signs,
+    const double* __restrict__ masses,  // Per-particle masses (1.0 for uniform)
     double* __restrict__ node_data,  // 12 floats per node: cx,cy,cz,half_size,com+,com-
     int* __restrict__ node_types,
     int* __restrict__ atomic_counter,  // for bottom-up traversal
@@ -497,6 +534,7 @@ extern "C" __global__ void init_leaves(
     double y = pos[i * 3 + 1];
     double z = pos[i * 3 + 2];
     int sign = signs[i];
+    double mass = masses[i];  // Use per-particle mass
 
     // For leaves, center = particle position, half_size = small
     node_data[base + 0] = x;
@@ -504,12 +542,12 @@ extern "C" __global__ void init_leaves(
     node_data[base + 2] = z;
     node_data[base + 3] = box_half / 1024.0;  // Small for leaf
 
-    // COM for this particle
+    // COM for this particle (using actual mass)
     if (sign > 0) {
         node_data[base + 4] = x;  // com_plus
         node_data[base + 5] = y;
         node_data[base + 6] = z;
-        node_data[base + 7] = 1.0;  // mass_plus
+        node_data[base + 7] = mass;  // mass_plus (per-particle)
         node_data[base + 8] = 0.0;  // com_minus
         node_data[base + 9] = 0.0;
         node_data[base + 10] = 0.0;
@@ -522,7 +560,7 @@ extern "C" __global__ void init_leaves(
         node_data[base + 8] = x;
         node_data[base + 9] = y;
         node_data[base + 10] = z;
-        node_data[base + 11] = 1.0;
+        node_data[base + 11] = mass;  // mass_minus (per-particle)
     }
 
     node_types[node_idx] = 1;  // Leaf
@@ -648,7 +686,8 @@ extern "C" __global__ void compute_forces_bvh(
     int n_particles,
     int n_internal,  // n_particles - 1
     double theta,
-    double softening
+    double softening,
+    double c_ratio_sq  // VSL: (c_minus/c_plus)^2, default=1.0, VSL=100.0
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_particles) return;
@@ -659,7 +698,9 @@ extern "C" __global__ void compute_forces_bvh(
     int my_sign = signs[tid];
 
     double ax = 0.0, ay = 0.0, az = 0.0;
-    double eps2 = softening * softening;
+    // Asymmetric softening: m- uses larger value to simulate diffuse gas nature
+    double eps = (my_sign > 0) ? softening : (softening * SOFTENING_MINUS_RATIO);
+    double eps2 = eps * eps;
 
     // Stack-based traversal starting from root
     int stack[64];
@@ -692,6 +733,7 @@ extern "C" __global__ void compute_forces_bvh(
             double mass_plus = node_data[base + 7];
             double mass_minus = node_data[base + 11];
 
+            // Interaction with m+ mass in this node
             if (mass_plus > 0.0) {
                 double com_plus_x = node_data[base + 4];
                 double com_plus_y = node_data[base + 5];
@@ -701,13 +743,15 @@ extern "C" __global__ void compute_forces_bvh(
                 double dpz = com_plus_z - pz;
                 double rp2 = dpx*dpx + dpy*dpy + dpz*dpz + eps2;
                 double inv_rp3 = 1.0 / (rp2 * sqrt(rp2));
-                double interaction = (my_sign > 0) ? 1.0 : -1.0;
+                // VSL Option B: m- feels AMPLIFIED repulsion from m+ (factor c_ratio_sq)
+                double interaction = (my_sign > 0) ? 1.0 : -c_ratio_sq;
                 double f = interaction * mass_plus * inv_rp3;
                 ax += f * dpx;
                 ay += f * dpy;
                 az += f * dpz;
             }
 
+            // Interaction with m- mass in this node
             if (mass_minus > 0.0) {
                 double com_minus_x = node_data[base + 8];
                 double com_minus_y = node_data[base + 9];
@@ -717,6 +761,7 @@ extern "C" __global__ void compute_forces_bvh(
                 double dmz = com_minus_z - pz;
                 double rm2 = dmx*dmx + dmy*dmy + dmz*dmz + eps2;
                 double inv_rm3 = 1.0 / (rm2 * sqrt(rm2));
+                // VSL Option B: m+ feels STANDARD repulsion from m- (factor 1.0)
                 double interaction = (my_sign < 0) ? 1.0 : -1.0;
                 double f = interaction * mass_minus * inv_rm3;
                 ax += f * dmx;
@@ -763,7 +808,9 @@ extern "C" __global__ void compute_forces_bvh_cross(
     int my_sign = signs[tid];
 
     double ax = 0.0, ay = 0.0, az = 0.0;
-    double eps2 = softening * softening;
+    // Asymmetric softening: m- uses larger value
+    double eps = (my_sign > 0) ? softening : (softening * SOFTENING_MINUS_RATIO);
+    double eps2 = eps * eps;
 
     int stack[64];
     int stack_ptr = 0;
@@ -869,7 +916,9 @@ extern "C" __global__ void compute_forces_bvh_yukawa(
     int my_sign = signs[tid];
 
     double ax = 0.0, ay = 0.0, az = 0.0;
-    double eps2 = softening * softening;
+    // Asymmetric softening: m- uses larger value
+    double soft = (my_sign > 0) ? softening : (softening * SOFTENING_MINUS_RATIO);
+    double eps2 = soft * soft;
 
     int stack[64];
     int stack_ptr = 0;
@@ -1404,6 +1453,7 @@ pub struct GpuNBodySimulation {
     pos: CudaSlice<f64>,        // Interleaved x,y,z
     vel: CudaSlice<f64>,        // Interleaved vx,vy,vz
     signs: CudaSlice<i32>,
+    masses: CudaSlice<f64>,     // Per-particle masses (for adaptive splitting)
     acc: CudaSlice<f64>,        // Interleaved ax,ay,az
     node_data: CudaSlice<f64>,
     node_children: CudaSlice<i32>,
@@ -1414,6 +1464,7 @@ pub struct GpuNBodySimulation {
     pos_tmp: CudaSlice<f64>,
     vel_tmp: CudaSlice<f64>,
     signs_tmp: CudaSlice<i32>,
+    masses_tmp: CudaSlice<f64>,
     // GPU BVH buffers (Karras 2012) - primary (backwards compat)
     bvh_left_child: CudaSlice<i32>,
     bvh_right_child: CudaSlice<i32>,
@@ -1430,23 +1481,43 @@ pub struct GpuNBodySimulation {
     n_nodes: usize,
     theta: f64,
     softening: f64,
+    softening_minus: f64,  // Asymmetric softening for m- (default = softening)
     box_size: f64,
     time: f64,
     particles_cpu: Vec<GpuParticle>,
+    /// VSL c_ratio squared: (c_minus/c_plus)^2, default=1.0, VSL=100.0
+    pub c_ratio_sq: f64,
+    /// Relaxation mode: if true, skip inter-species forces (m+ ↔ m- = 0)
+    pub relax_mode: bool,
+    /// Repulsion scale: 0.0 = no cross-species, 1.0 = full Janus physics
+    /// Used for gradual ramp-up during initialization
+    pub repulsion_scale: f64,
 }
+
+/// Kernel names used in PTX
+const KERNEL_NAMES: &[&str] = &[
+    "compute_forces_simple", "leapfrog_kick_drift", "drift_only", "kick_only",
+    "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs", "reorder_masses",
+    "build_bvh_internal", "init_leaves", "reduce_com", "compute_forces_bvh",
+    "compute_forces_bvh_cross", "compute_forces_bvh_yukawa", "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
+];
 
 #[cfg(feature = "cuda")]
 impl GpuNBodySimulation {
+    /// Compile CUDA kernels ONCE and return initialized device
+    /// Call this at startup, then reuse the device for all simulations
+    pub fn compile_kernels() -> Result<Arc<CudaDevice>, Box<dyn std::error::Error>> {
+        let device = CudaDevice::new(0)?;
+        let ptx = cudarc::nvrtc::compile_ptx(CUDA_KERNEL_SRC)?;
+        device.load_ptx(ptx, "nbody", KERNEL_NAMES)?;
+        Ok(device)
+    }
+
     pub fn new(n_positive: usize, n_negative: usize, box_size: f64) -> Result<Self, Box<dyn std::error::Error>> {
         let device = CudaDevice::new(0)?;
 
         let ptx = cudarc::nvrtc::compile_ptx(CUDA_KERNEL_SRC)?;
-        device.load_ptx(ptx, "nbody", &[
-            "compute_forces_simple", "leapfrog_kick_drift", "drift_only", "kick_only",
-            "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs",
-            "build_bvh_internal", "init_leaves", "reduce_com", "compute_forces_bvh",
-            "compute_forces_bvh_cross", "compute_forces_bvh_yukawa", "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
-        ])?;
+        device.load_ptx(ptx, "nbody", KERNEL_NAMES)?;
 
         let n_total = n_positive + n_negative;
 
@@ -1499,9 +1570,13 @@ impl GpuNBodySimulation {
             signs_data.push(p.sign);
         }
 
+        // Uniform masses (1.0) for new() - adaptive splitting uses new_with_masses()
+        let masses_data: Vec<f64> = vec![1.0; n_total];
+
         let pos = device.htod_sync_copy(&pos_data)?;
         let vel = device.htod_sync_copy(&vel_data)?;
         let signs = device.htod_sync_copy(&signs_data)?;
+        let masses = device.htod_sync_copy(&masses_data)?;
         let acc = device.alloc_zeros::<f64>(n_total * 3)?;
 
         let tree = LinearOctree::build(&particles_cpu, box_size);
@@ -1516,6 +1591,7 @@ impl GpuNBodySimulation {
         let pos_tmp = device.alloc_zeros::<f64>(n_total * 3)?;
         let vel_tmp = device.alloc_zeros::<f64>(n_total * 3)?;
         let signs_tmp = device.alloc_zeros::<i32>(n_total)?;
+        let masses_tmp = device.alloc_zeros::<f64>(n_total)?;
 
         // GPU BVH buffers (Karras 2012)
         // Total nodes: 2*n - 1 (n-1 internal + n leaves)
@@ -1534,9 +1610,9 @@ impl GpuNBodySimulation {
 
         Ok(Self {
             device,
-            pos, vel, signs, acc,
+            pos, vel, signs, masses, acc,
             node_data, node_children, node_types,
-            morton_codes, sorted_indices, pos_tmp, vel_tmp, signs_tmp,
+            morton_codes, sorted_indices, pos_tmp, vel_tmp, signs_tmp, masses_tmp,
             bvh_left_child, bvh_right_child, bvh_parent,
             bvh_range_left, bvh_range_right,
             bvh_node_data, bvh_node_types, bvh_atomic_counter,
@@ -1546,9 +1622,13 @@ impl GpuNBodySimulation {
             n_nodes,
             theta: 2.0,  // Optimized for performance (was 0.7)
             softening,
+            softening_minus: softening,  // Default: same as softening
             box_size,
             time: 0.0,
             particles_cpu,
+            c_ratio_sq: 1.0,  // VSL: (c_minus/c_plus)^2, default=1.0
+            relax_mode: false,
+            repulsion_scale: 1.0,
         })
     }
 
@@ -1560,7 +1640,7 @@ impl GpuNBodySimulation {
         let ptx = cudarc::nvrtc::compile_ptx(CUDA_KERNEL_SRC)?;
         device.load_ptx(ptx, "nbody", &[
             "compute_forces_simple", "leapfrog_kick_drift", "drift_only", "kick_only",
-            "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs",
+            "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs", "reorder_masses",
             "build_bvh_internal", "init_leaves", "reduce_com", "compute_forces_bvh",
             "compute_forces_bvh_cross", "compute_forces_bvh_yukawa", "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
         ])?;
@@ -1643,9 +1723,13 @@ impl GpuNBodySimulation {
         println!("  KE_target  = {:.4e}", ke_target);
         println!("  alpha      = {:.6}", alpha);
 
+        // Uniform masses (1.0) for new_bvh_only
+        let masses_data: Vec<f64> = vec![1.0; n_total];
+
         let pos = device.htod_sync_copy(&pos_data)?;
         let vel = device.htod_sync_copy(&vel_data)?;
         let signs = device.htod_sync_copy(&signs_data)?;
+        let masses = device.htod_sync_copy(&masses_data)?;
         let acc = device.alloc_zeros::<f64>(n_total * 3)?;
 
         // SKIP LinearOctree - use minimal placeholder buffers instead
@@ -1661,6 +1745,7 @@ impl GpuNBodySimulation {
         let pos_tmp = device.alloc_zeros::<f64>(n_total * 3)?;
         let vel_tmp = device.alloc_zeros::<f64>(n_total * 3)?;
         let signs_tmp = device.alloc_zeros::<i32>(n_total)?;
+        let masses_tmp = device.alloc_zeros::<f64>(n_total)?;
 
         // GPU BVH buffers (Karras 2012)
         let n_bvh_nodes = 2 * n_total - 1;
@@ -1678,9 +1763,9 @@ impl GpuNBodySimulation {
 
         Ok(Self {
             device,
-            pos, vel, signs, acc,
+            pos, vel, signs, masses, acc,
             node_data, node_children, node_types,
-            morton_codes, sorted_indices, pos_tmp, vel_tmp, signs_tmp,
+            morton_codes, sorted_indices, pos_tmp, vel_tmp, signs_tmp, masses_tmp,
             bvh_left_child, bvh_right_child, bvh_parent,
             bvh_range_left, bvh_range_right,
             bvh_node_data, bvh_node_types, bvh_atomic_counter,
@@ -1690,13 +1775,18 @@ impl GpuNBodySimulation {
             n_nodes,
             theta: 2.0,
             softening,
+            softening_minus: softening,  // Default: same as softening
             box_size,
             time: 0.0,
             particles_cpu,
+            c_ratio_sq: 1.0,  // VSL: (c_minus/c_plus)^2, default=1.0
+            relax_mode: false,
+            repulsion_scale: 1.0,
         })
     }
 
     /// Create simulation with specific initial state (for comparison tests)
+    /// OPTIMIZED: Skips CPU LinearOctree build (saves ~4GB RAM for 10M particles)
     pub fn new_with_state(
         n_positive: usize, n_negative: usize, box_size: f64,
         positions: Vec<f64>, velocities: Vec<f64>, signs_data: Vec<i32>
@@ -1706,38 +1796,31 @@ impl GpuNBodySimulation {
         let ptx = cudarc::nvrtc::compile_ptx(CUDA_KERNEL_SRC)?;
         device.load_ptx(ptx, "nbody", &[
             "compute_forces_simple", "leapfrog_kick_drift", "drift_only", "kick_only",
-            "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs",
+            "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs", "reorder_masses",
             "build_bvh_internal", "init_leaves", "reduce_com", "compute_forces_bvh",
             "compute_forces_bvh_cross", "compute_forces_bvh_yukawa", "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
         ])?;
 
         let n_total = n_positive + n_negative;
 
-        // Build particles_cpu from provided data
-        let mut particles_cpu = Vec::with_capacity(n_total);
-        for i in 0..n_total {
-            particles_cpu.push(GpuParticle {
-                x: positions[i * 3],
-                y: positions[i * 3 + 1],
-                z: positions[i * 3 + 2],
-                vx: velocities[i * 3],
-                vy: velocities[i * 3 + 1],
-                vz: velocities[i * 3 + 2],
-                mass: 1.0,
-                sign: signs_data[i],
-            });
-        }
+        // SKIP particles_cpu - we use GPU BVH only, no need to keep CPU copy
+        let particles_cpu = Vec::new();
+
+        // Uniform masses (1.0) for backwards compatibility
+        let masses_data: Vec<f64> = vec![1.0; n_total];
 
         let pos = device.htod_sync_copy(&positions)?;
         let vel = device.htod_sync_copy(&velocities)?;
         let signs = device.htod_sync_copy(&signs_data)?;
+        let masses = device.htod_sync_copy(&masses_data)?;
         let acc = device.alloc_zeros::<f64>(n_total * 3)?;
 
-        let tree = LinearOctree::build(&particles_cpu, box_size);
-        let n_nodes = tree.nodes.len();
-        let node_data = device.htod_sync_copy(&tree.node_data)?;
-        let node_children = device.htod_sync_copy(&tree.node_children)?;
-        let node_types = device.htod_sync_copy(&tree.node_types)?;
+        // SKIP CPU LinearOctree - we use GPU BVH only (saves ~3-4 GB RAM for 10M particles)
+        // Allocate minimal dummy data for legacy node_data/node_children/node_types fields
+        let n_nodes = 1;  // Minimal placeholder
+        let node_data = device.alloc_zeros::<f64>(12)?;  // 1 node × 12 f64
+        let node_children = device.alloc_zeros::<i32>(8)?;  // 1 node × 8 children
+        let node_types = device.alloc_zeros::<i32>(1)?;  // 1 node
 
         // Morton sorting buffers
         let morton_codes = device.alloc_zeros::<u64>(n_total)?;
@@ -1745,6 +1828,7 @@ impl GpuNBodySimulation {
         let pos_tmp = device.alloc_zeros::<f64>(n_total * 3)?;
         let vel_tmp = device.alloc_zeros::<f64>(n_total * 3)?;
         let signs_tmp = device.alloc_zeros::<i32>(n_total)?;
+        let masses_tmp = device.alloc_zeros::<f64>(n_total)?;
 
         // GPU BVH buffers (Karras 2012)
         let n_bvh_nodes = 2 * n_total - 1;
@@ -1762,9 +1846,9 @@ impl GpuNBodySimulation {
 
         Ok(Self {
             device,
-            pos, vel, signs, acc,
+            pos, vel, signs, masses, acc,
             node_data, node_children, node_types,
-            morton_codes, sorted_indices, pos_tmp, vel_tmp, signs_tmp,
+            morton_codes, sorted_indices, pos_tmp, vel_tmp, signs_tmp, masses_tmp,
             bvh_left_child, bvh_right_child, bvh_parent,
             bvh_range_left, bvh_range_right,
             bvh_node_data, bvh_node_types, bvh_atomic_counter,
@@ -1774,9 +1858,100 @@ impl GpuNBodySimulation {
             n_nodes,
             theta: 2.0,  // Optimized for performance (was 0.7)
             softening,
+            softening_minus: softening,  // Default: same as softening
             box_size,
             time: 0.0,
             particles_cpu,
+            c_ratio_sq: 1.0,  // VSL: (c_minus/c_plus)^2, default=1.0
+            relax_mode: false,
+            repulsion_scale: 1.0,
+        })
+    }
+
+    /// Create simulation with specific initial state AND per-particle masses
+    /// This is the primary constructor for adaptive splitting simulations
+    /// OPTIMIZED: Skips CPU LinearOctree build (saves ~4GB RAM for 10M particles)
+    pub fn new_with_state_and_masses(
+        n_positive: usize, n_negative: usize, box_size: f64,
+        positions: Vec<f64>, velocities: Vec<f64>, signs_data: Vec<i32>,
+        masses_data: Vec<f64>
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let device = Self::compile_kernels()?;
+        Self::new_with_state_and_masses_with_device(
+            device, n_positive, n_negative, box_size,
+            positions, velocities, signs_data, masses_data
+        )
+    }
+
+    /// Create simulation with pre-compiled device (FAST - no PTX recompilation)
+    /// Use compile_kernels() once at startup, then pass the device here for each split
+    pub fn new_with_state_and_masses_with_device(
+        device: Arc<CudaDevice>,
+        n_positive: usize, n_negative: usize, box_size: f64,
+        positions: Vec<f64>, velocities: Vec<f64>, signs_data: Vec<i32>,
+        masses_data: Vec<f64>
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let n_total = n_positive + n_negative;
+
+        // SKIP particles_cpu - we use GPU BVH only, no need to keep CPU copy
+        let particles_cpu = Vec::new();
+
+        let pos = device.htod_sync_copy(&positions)?;
+        let vel = device.htod_sync_copy(&velocities)?;
+        let signs = device.htod_sync_copy(&signs_data)?;
+        let masses = device.htod_sync_copy(&masses_data)?;
+        let acc = device.alloc_zeros::<f64>(n_total * 3)?;
+
+        // SKIP CPU LinearOctree - we use GPU BVH only (saves ~3-4 GB RAM for 10M particles)
+        // Allocate minimal dummy data for legacy node_data/node_children/node_types fields
+        let n_nodes = 1;  // Minimal placeholder
+        let node_data = device.alloc_zeros::<f64>(12)?;  // 1 node × 12 f64
+        let node_children = device.alloc_zeros::<i32>(8)?;  // 1 node × 8 children
+        let node_types = device.alloc_zeros::<i32>(1)?;  // 1 node
+
+        // Morton sorting buffers
+        let morton_codes = device.alloc_zeros::<u64>(n_total)?;
+        let sorted_indices = device.alloc_zeros::<i32>(n_total)?;
+        let pos_tmp = device.alloc_zeros::<f64>(n_total * 3)?;
+        let vel_tmp = device.alloc_zeros::<f64>(n_total * 3)?;
+        let signs_tmp = device.alloc_zeros::<i32>(n_total)?;
+        let masses_tmp = device.alloc_zeros::<f64>(n_total)?;
+
+        // GPU BVH buffers (Karras 2012)
+        let n_bvh_nodes = 2 * n_total - 1;
+        let bvh_left_child = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_right_child = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_parent = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_range_left = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_range_right = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_node_data = device.alloc_zeros::<f64>(n_bvh_nodes * 12)?;
+        let bvh_node_types = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+        let bvh_atomic_counter = device.alloc_zeros::<i32>(n_bvh_nodes)?;
+
+        let mean_sep = box_size / (n_total as f64).powf(1.0/3.0);
+        let softening = 0.5 * mean_sep;
+
+        Ok(Self {
+            device,
+            pos, vel, signs, masses, acc,
+            node_data, node_children, node_types,
+            morton_codes, sorted_indices, pos_tmp, vel_tmp, signs_tmp, masses_tmp,
+            bvh_left_child, bvh_right_child, bvh_parent,
+            bvh_range_left, bvh_range_right,
+            bvh_node_data, bvh_node_types, bvh_atomic_counter,
+            bvh_buffers: None,
+            current_bvh: 0,
+            n_particles: n_total,
+            n_nodes,
+            theta: 2.0,  // Optimized for performance (was 0.7)
+            softening,
+            softening_minus: softening,  // Default: same as softening
+            box_size,
+            time: 0.0,
+            particles_cpu,
+            c_ratio_sq: 1.0,  // VSL: (c_minus/c_plus)^2, default=1.0
+            relax_mode: false,
+            repulsion_scale: 1.0,
         })
     }
 
@@ -1807,9 +1982,57 @@ impl GpuNBodySimulation {
         self.softening = softening;
     }
 
+    /// Get current softening length
+    pub fn get_softening(&self) -> f64 {
+        self.softening
+    }
+
+    /// Set asymmetric softening for m- particles
+    /// Numerical artifact to simulate diffuse gas nature of m- without SPH
+    pub fn set_softening_minus(&mut self, softening_minus: f64) {
+        self.softening_minus = softening_minus;
+    }
+
+    /// Set VSL c_ratio (c_minus/c_plus)
+    /// Default c_ratio=1.0 (standard Janus)
+    /// VSL: c_ratio=10 → (c⁻/c⁺)²=100
+    /// Effect: m+ feels 100× stronger repulsion from m-
+    ///         m- feels 100× weaker repulsion from m+
+    pub fn set_c_ratio(&mut self, c_ratio: f64) {
+        self.c_ratio_sq = c_ratio * c_ratio;
+    }
+
     /// Get current theta value
     pub fn get_theta(&self) -> f64 {
         self.theta
+    }
+
+    /// Get current c_ratio squared
+    pub fn get_c_ratio_sq(&self) -> f64 {
+        self.c_ratio_sq
+    }
+
+    /// Set relaxation mode (intra-species only, no m+ ↔ m- forces)
+    /// Also sets repulsion_scale: 0.0 for relax=true, 1.0 for relax=false
+    pub fn set_relax_mode(&mut self, relax: bool) {
+        self.relax_mode = relax;
+        self.repulsion_scale = if relax { 0.0 } else { 1.0 };
+    }
+
+    /// Get current relaxation mode
+    pub fn get_relax_mode(&self) -> bool {
+        self.relax_mode
+    }
+
+    /// Set repulsion scale for gradual ramp-up (0.0 = no repulsion, 1.0 = full Janus)
+    /// Use this to smoothly transition from relaxation to production
+    pub fn set_repulsion_scale(&mut self, scale: f64) {
+        self.repulsion_scale = scale.clamp(0.0, 1.0);
+    }
+
+    /// Get current repulsion scale
+    pub fn get_repulsion_scale(&self) -> f64 {
+        self.repulsion_scale
     }
 
     /// Step sans expansion cosmologique (a=1, H=0)
@@ -1857,14 +2080,14 @@ impl GpuNBodySimulation {
         let leapfrog = self.device.get_func("nbody", "leapfrog_kick_drift")
             .ok_or("Failed to get leapfrog_kick_drift kernel")?;
 
-        // Compute forces (10 args - within tuple limit)
+        // Compute forces (12 args with VSL c_ratio_sq + repulsion_scale)
         unsafe {
             compute_forces.clone().launch(cfg, (
                 &self.pos, &self.signs,
                 &self.node_data, &self.node_children, &self.node_types,
                 &mut self.acc,
                 self.n_particles as i32, self.n_nodes as i32,
-                self.theta, self.softening,
+                self.theta, self.softening, self.c_ratio_sq, self.repulsion_scale,
             ))?;
         }
 
@@ -1900,7 +2123,7 @@ impl GpuNBodySimulation {
                 &self.node_data, &self.node_children, &self.node_types,
                 &mut self.acc,
                 self.n_particles as i32, self.n_nodes as i32,
-                self.theta, self.softening,
+                self.theta, self.softening, self.c_ratio_sq, self.repulsion_scale,
             ))?;
         }
 
@@ -1975,7 +2198,7 @@ impl GpuNBodySimulation {
                 &self.node_data, &self.node_children, &self.node_types,
                 &mut self.acc,
                 self.n_particles as i32, self.n_nodes as i32,
-                self.theta, self.softening,
+                self.theta, self.softening, self.c_ratio_sq, self.repulsion_scale,
             ))?;
         }
 
@@ -2213,6 +2436,19 @@ impl GpuNBodySimulation {
         }
         std::mem::swap(&mut self.vel, &mut self.vel_tmp);
 
+        // Reorder masses (for adaptive splitting support)
+        let reorder_masses = self.device.get_func("nbody", "reorder_masses")
+            .ok_or("Failed to get reorder_masses kernel")?;
+        unsafe {
+            reorder_masses.launch(cfg, (
+                &self.masses,
+                &mut self.masses_tmp,
+                &self.sorted_indices,
+                n as i32,
+            ))?;
+        }
+        std::mem::swap(&mut self.masses, &mut self.masses_tmp);
+
         self.device.synchronize()?;
 
         // Step 4: Reset ONLY atomic_counter (other buffers are fully overwritten)
@@ -2258,13 +2494,14 @@ impl GpuNBodySimulation {
         }
         self.device.synchronize()?;
 
-        // Step 6: Initialize leaves with particle data
+        // Step 6: Initialize leaves with particle data (including per-particle masses)
         let init_leaves = self.device.get_func("nbody", "init_leaves")
             .ok_or("Failed to get init_leaves kernel")?;
         unsafe {
             init_leaves.launch(cfg, (
                 &self.pos,
                 &self.signs,
+                &self.masses,  // Per-particle masses for adaptive splitting
                 &mut self.bvh_node_data,
                 &mut self.bvh_node_types,
                 &mut self.bvh_atomic_counter,
@@ -2432,7 +2669,7 @@ impl GpuNBodySimulation {
         self.device.synchronize()?;
         let t5_elapsed = t5.elapsed().as_secs_f64() * 1000.0;
 
-        // Step 6: Init leaves
+        // Step 6: Init leaves (with per-particle masses)
         let t6 = Instant::now();
         let init_leaves = self.device.get_func("nbody", "init_leaves")
             .ok_or("Failed to get init_leaves kernel")?;
@@ -2440,6 +2677,7 @@ impl GpuNBodySimulation {
             init_leaves.launch(cfg, (
                 &self.pos,
                 &self.signs,
+                &self.masses,
                 &mut self.bvh_node_data,
                 &mut self.bvh_node_types,
                 &mut self.bvh_atomic_counter,
@@ -2520,13 +2758,14 @@ impl GpuNBodySimulation {
             ))?;
         }
 
-        // Step 2: Re-initialize leaves with current particle positions
+        // Step 2: Re-initialize leaves with current particle positions and masses
         let init_leaves = self.device.get_func("nbody", "init_leaves")
             .ok_or("Failed to get init_leaves kernel")?;
         unsafe {
             init_leaves.launch(cfg, (
                 &self.pos,
                 &self.signs,
+                &self.masses,
                 &mut self.bvh_node_data,
                 &mut self.bvh_node_types,
                 &mut self.bvh_atomic_counter,
@@ -2594,7 +2833,7 @@ impl GpuNBodySimulation {
         // Step 2: Build GPU tree
         self.build_gpu_tree()?;
 
-        // Step 3: Compute forces using GPU-built BVH
+        // Step 3: Compute forces using GPU-built BVH (with VSL c_ratio_sq)
         unsafe {
             force_kernel.launch(cfg, (
                 &self.pos,
@@ -2608,6 +2847,7 @@ impl GpuNBodySimulation {
                 (n - 1) as i32,  // n_internal
                 self.theta,
                 self.softening,
+                self.c_ratio_sq,  // VSL: (c_minus/c_plus)^2
             ))?;
         }
 
@@ -2685,7 +2925,7 @@ impl GpuNBodySimulation {
                 (n - 1) as i32,  // n_internal
                 self.theta,
                 self.softening,
-                cross_factor,  // New parameter
+                cross_factor,  // Cross-sign interaction factor
             ))?;
         }
 
@@ -2842,7 +3082,7 @@ impl GpuNBodySimulation {
             self.update_com_only()?;
         }
 
-        // Step 3: Compute forces using GPU-built BVH
+        // Step 3: Compute forces using GPU-built BVH (with VSL c_ratio_sq)
         unsafe {
             force_kernel.launch(cfg, (
                 &self.pos,
@@ -2856,6 +3096,7 @@ impl GpuNBodySimulation {
                 (n - 1) as i32,  // n_internal
                 self.theta,
                 self.softening,
+                self.c_ratio_sq,  // VSL: (c_minus/c_plus)^2
             ))?;
         }
 
@@ -3032,12 +3273,12 @@ impl GpuNBodySimulation {
         }
         self.device.synchronize()?;
 
-        // Step 6: Init leaves
+        // Step 6: Init leaves (with per-particle masses)
         let init_leaves = self.device.get_func("nbody", "init_leaves")
             .ok_or("Failed to get init_leaves")?;
         unsafe {
             init_leaves.launch(cfg, (
-                &self.pos, &self.signs,
+                &self.pos, &self.signs, &self.masses,
                 &mut buf.node_data, &mut buf.node_types, &mut buf.atomic_counter,
                 n as i32, box_half,
             ))?;
@@ -3119,7 +3360,7 @@ impl GpuNBodySimulation {
         // launching kernels on the tree_stream. For now, we do sequential
         // tree build but prepare for full async later.
 
-        // Compute forces using current tree (on default stream)
+        // Compute forces using current tree (on default stream) with VSL
         {
             let buffers = self.bvh_buffers.as_ref().ok_or("Buffers not initialized")?;
             let buf = &buffers[current_idx];
@@ -3137,6 +3378,7 @@ impl GpuNBodySimulation {
                     (n - 1) as i32,
                     self.theta,
                     self.softening,
+                    self.c_ratio_sq,  // VSL: (c_minus/c_plus)^2
                 ))?;
             }
         }
@@ -3232,7 +3474,7 @@ impl GpuNBodySimulation {
                 &self.node_data, &self.node_children, &self.node_types,
                 &mut self.acc,
                 self.n_particles as i32, self.n_nodes as i32,
-                self.theta, self.softening,
+                self.theta, self.softening, self.c_ratio_sq, self.repulsion_scale,
             ))?;
         }
 
@@ -3575,6 +3817,12 @@ impl GpuNBodySimulation {
         Ok(vel)
     }
 
+    /// Set velocities (for external pressure/force updates)
+    pub fn set_velocities(&mut self, vel: &[f64]) -> Result<(), Box<dyn std::error::Error>> {
+        self.device.htod_sync_copy_into(vel, &mut self.vel)?;
+        Ok(())
+    }
+
     pub fn get_signs(&self) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
         let signs = self.device.dtoh_sync_copy(&self.signs)?;
         Ok(signs)
@@ -3594,7 +3842,7 @@ impl GpuNBodySimulation {
         // Step 1: Build GPU tree (this reorders particles by Morton code)
         self.build_gpu_tree()?;
 
-        // Step 2: Compute forces with GPU BVH tree
+        // Step 2: Compute forces with GPU BVH tree (with VSL c_ratio_sq)
         let gpu_force_kernel = self.device.get_func("nbody", "compute_forces_bvh")
             .ok_or("Failed to get compute_forces_bvh kernel")?;
         unsafe {
@@ -3609,6 +3857,7 @@ impl GpuNBodySimulation {
                 (n - 1) as i32,
                 self.theta,
                 self.softening,
+                self.c_ratio_sq,  // VSL: (c_minus/c_plus)^2
             ))?;
         }
         self.device.synchronize()?;
@@ -3642,7 +3891,7 @@ impl GpuNBodySimulation {
                 &self.node_data, &self.node_children, &self.node_types,
                 &mut self.acc,
                 n as i32, self.n_nodes as i32,
-                self.theta, self.softening,
+                self.theta, self.softening, self.c_ratio_sq, self.repulsion_scale,
             ))?;
         }
         self.device.synchronize()?;

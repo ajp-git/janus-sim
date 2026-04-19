@@ -358,8 +358,10 @@ fn adaptive_split_check_with_thresholds(
         }
     }
 
-    // Limit splits to not exceed N_MAX_TOTAL
-    let max_new = (N_MAX_TOTAL - state.particles.len()) / 7;  // Each split adds 7 (8-1)
+    // Limit splits to not exceed N_MAX_TOTAL AND to avoid GPU reconstruction bottleneck
+    const MAX_SPLITS_PER_STEP: usize = 10_000;  // Gradual splitting to avoid GPU stall
+    let max_capacity = (N_MAX_TOTAL - state.particles.len()) / 7;  // Each split adds 7 (8-1)
+    let max_new = max_capacity.min(MAX_SPLITS_PER_STEP);
     if to_split.len() > max_new {
         to_split.truncate(max_new);
     }
@@ -876,6 +878,11 @@ fn main() {
     state.header.z_start_run = args.z_init;
 
     println!("\n[2/5] Initializing GPU simulation...");
+    // COMPILE KERNELS ONCE at startup — reuse for all splits
+    let cuda_device = GpuNBodySimulation::compile_kernels()
+        .expect("Failed to compile CUDA kernels");
+    println!("  ✓ CUDA kernels compiled (one-time)");
+
     // Use new_with_state() like janus_baryonic_calibrated (masses = 1.0)
     // new_with_state_and_masses() only needed after splits (masses < 1.0)
     let (gpu_pos, gpu_vel, gpu_signs, _gpu_masses) = state.to_gpu_arrays();
@@ -890,13 +897,10 @@ fn main() {
     let c_ratio_sq_init = CoupledFriedmann::c_ratio_sq_at_z(args.z_init, ETA);
     gpu_sim.set_c_ratio(c_ratio_sq_init.sqrt());
     println!("  GPU ready: {} particles, θ={}", state.particles.len(), args.theta);
-
-    // Initialiser la physique baryonique (cooling + SF)
-    let cuda_device = cudarc::driver::CudaDevice::new(0)
-        .expect("Failed to get CUDA device");
+    // Initialiser la physique baryonique (cooling + SF) - réutilise le device compilé
     let n_plus_init = state.particles.iter().filter(|p| p.sign == 1).count();
     let mut gpu_cooling = GpuCooling::new(
-        cuda_device,
+        cuda_device.clone(),  // Clone pour garder le device pour les splits
         n_plus_init,
         args.l_box,
         state.m_plus_base,
@@ -977,19 +981,18 @@ fn main() {
                     // Without this, both sims exist simultaneously during creation = OOM
                     drop(gpu_sim);
 
-                    gpu_sim = GpuNBodySimulation::new_with_state_and_masses(
-                        np, nm, args.l_box, new_pos, new_vel, new_signs, new_masses
+                    // Use pre-compiled device — NO PTX recompilation!
+                    gpu_sim = GpuNBodySimulation::new_with_state_and_masses_with_device(
+                        cuda_device.clone(), np, nm, args.l_box, new_pos, new_vel, new_signs, new_masses
                     ).expect("Failed to recreate GPU simulation after split");
                     gpu_sim.set_theta(args.theta);
                     gpu_sim.set_softening(args.eps_plus);
                     gpu_sim.set_c_ratio(CoupledFriedmann::c_ratio_sq_at_z(z, ETA).sqrt());
 
-                    // Réinitialiser GpuCooling avec le nouveau n_plus
+                    // Réinitialiser GpuCooling avec le nouveau n_plus (reuse device)
                     let n_plus_new = state.particles.iter().filter(|p| p.sign == 1).count();
-                    let cuda_device = cudarc::driver::CudaDevice::new(0)
-                        .expect("Failed to get CUDA device");
                     gpu_cooling = GpuCooling::new(
-                        cuda_device, n_plus_new, args.l_box, state.m_plus_base
+                        cuda_device.clone(), n_plus_new, args.l_box, state.m_plus_base
                     ).expect("Failed to recreate GpuCooling after split");
                     let signs_plus_new: Vec<i32> = vec![1i32; n_plus_new];
                     gpu_cooling.init_from_temperature(T_INIT_PLUS, T_INIT_PLUS, &signs_plus_new)

@@ -29,11 +29,13 @@ def read_snapshot_v3(path):
         l_box = struct.unpack('<d', header[40:48])[0]
         z = 1.0 / a - 1.0
 
-        # Particle dtype: x,y,z (f64), vx,vy,vz (f64), sign (u8), split_level (u8), padding (2 bytes), mass (f32)
+        # Particle dtype: ParticleV3 uses f32 for positions/velocities
         dt = np.dtype([
-            ('x', '<f8'), ('y', '<f8'), ('z', '<f8'),
-            ('vx', '<f8'), ('vy', '<f8'), ('vz', '<f8'),
-            ('sign', 'u1'), ('split_level', 'u1'), ('_pad', 'u1', 2), ('mass', '<f4')
+            ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+            ('vx', '<f4'), ('vy', '<f4'), ('vz', '<f4'),
+            ('mass', '<f4'),
+            ('epsilon', '<f4'),
+            ('sign', 'u1'), ('split_level', 'u1'), ('is_star', 'u1'), ('flags', 'u1'),
         ])
 
         particles = np.fromfile(f, dtype=dt, count=n)
@@ -64,9 +66,9 @@ def read_analysis_csv(path):
             # Find column indices
             step_idx = header.index('step') if 'step' in header else 0
 
-            # Look for halo columns (halo1_x, halo1_y, halo1_z, etc.)
+            # Look for halo columns (halo0_x, halo0_y, halo0_z, etc.)
             halo_cols = {}
-            for i in range(1, 10):  # Up to 9 halos
+            for i in range(0, 10):  # Up to 10 halos (0-indexed)
                 x_col = f'halo{i}_x'
                 y_col = f'halo{i}_y'
                 z_col = f'halo{i}_z'
@@ -102,8 +104,13 @@ def read_analysis_csv(path):
 
     return halos_by_step
 
-def find_density_peaks(pos, signs, l_box, n_halos=4, grid_size=64):
-    """Find density peaks as halo candidates (fallback if no analysis.csv)"""
+def find_density_peaks(pos, signs, l_box, n_halos=4, grid_size=64, border=20.0):
+    """Find density peaks as halo candidates (fallback if no analysis.csv)
+
+    Args:
+        border: Exclude peaks within this distance from box edges (Mpc)
+                Default 20 Mpc to avoid edge artifacts
+    """
     half = l_box / 2
 
     # Only use m+ particles for halo detection
@@ -136,11 +143,26 @@ def find_density_peaks(pos, signs, l_box, n_halos=4, grid_size=64):
     order = np.argsort(peak_values)[::-1]
     peak_coords = peak_coords[order]
 
+    # Border exclusion: skip peaks too close to edges
+    inner_min = border
+    inner_max = l_box - border
+
     halos = []
-    for i in range(min(n_halos, len(peak_coords))):
+    for i in range(len(peak_coords)):
+        if len(halos) >= n_halos:
+            break
+
         cx = (peak_coords[i, 0] + 0.5) * cell - half
         cy = (peak_coords[i, 1] + 0.5) * cell - half
         cz = (peak_coords[i, 2] + 0.5) * cell - half
+
+        # Check if inside inner region (away from borders)
+        # Coordinates are in [-half, half], so check |coord| < half - border
+        if (abs(cx) > half - border or
+            abs(cy) > half - border or
+            abs(cz) > half - border):
+            continue  # Skip edge peaks
+
         halos.append(np.array([cx, cy, cz]))
 
     return halos
@@ -176,7 +198,7 @@ def render_halo(data, halo_center, halo_idx, step, out_dir, r_extract=15.0):
 
     # Require minimum m+ particles for a valid halo
     n_plus_local = np.sum((sign[mask] == 1))
-    if n_plus_local < 1000:
+    if n_plus_local < 100:
         return None  # Not a real halo, skip
 
     # Extract local particles
@@ -328,6 +350,9 @@ def main():
 
     print(f"Already rendered: {len(rendered)} halo frames")
 
+    # Track attempted steps to avoid re-processing
+    attempted_steps = set()
+
     # Main daemon loop
     while True:
         # Read analysis.csv for halo positions
@@ -344,9 +369,14 @@ def main():
             except:
                 continue
 
+            # Skip already attempted steps
+            if step in attempted_steps:
+                continue
+
             # Check if all halos for this step are rendered
             all_rendered = all((h+1, step) in rendered for h in range(args.n_halos))
             if all_rendered:
+                attempted_steps.add(step)
                 continue
 
             # Read snapshot
@@ -383,6 +413,8 @@ def main():
                     print(f"H{i+1}:ERR({e})", end=" ", flush=True)
 
             print()
+            # Mark step as attempted (even if no halos rendered)
+            attempted_steps.add(step)
 
         time.sleep(30)
 

@@ -29,6 +29,7 @@ DPI = 200
 ZOOM_SIZE = 100.0  # For 500 Mpc box (larger zoom to see structure better)
 GRID_SIZE = 64
 SUBSAMPLE = 200000  # Max particles to plot for performance
+GLOBAL_RADIUS = 200.0  # Only show particles within this radius from center (removes edge artifacts)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SNAPSHOT READER (V3 format)
@@ -141,19 +142,23 @@ def render_10panel(snap_path, step):
             spine.set_color('gray')
         ax.tick_params(colors='gray', labelsize=7)
 
-    # 1. XY m+ global
-    p = subsample(pos_plus, SUBSAMPLE)
+    # Apply radial mask for global views (removes edge artifacts)
+    r_plus = np.sqrt(pos_plus[:,0]**2 + pos_plus[:,1]**2 + pos_plus[:,2]**2)
+    pos_plus_inner = pos_plus[r_plus < GLOBAL_RADIUS]
+
+    # 1. XY m+ global (r < 200 Mpc)
+    p = subsample(pos_plus_inner, SUBSAMPLE)
     axes[0,0].scatter(p[:,0], p[:,1], s=0.01, c='#4488ff', alpha=0.3, rasterized=True)
-    axes[0,0].set_xlim(-half, half)
-    axes[0,0].set_ylim(-half, half)
-    axes[0,0].set_title('m+ XY global', color='#4488ff', fontsize=9)
+    axes[0,0].set_xlim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
+    axes[0,0].set_ylim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
+    axes[0,0].set_title('m+ XY (r<200 Mpc)', color='#4488ff', fontsize=9)
     axes[0,0].set_aspect('equal')
 
-    # 2. XZ m+ global
+    # 2. XZ m+ global (r < 200 Mpc)
     axes[0,1].scatter(p[:,0], p[:,2], s=0.01, c='#4488ff', alpha=0.3, rasterized=True)
-    axes[0,1].set_xlim(-half, half)
-    axes[0,1].set_ylim(-half, half)
-    axes[0,1].set_title('m+ XZ global', color='#4488ff', fontsize=9)
+    axes[0,1].set_xlim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
+    axes[0,1].set_ylim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
+    axes[0,1].set_title('m+ XZ (r<200 Mpc)', color='#4488ff', fontsize=9)
     axes[0,1].set_aspect('equal')
 
     # 3. XY m+ zoom with m- contours
@@ -207,19 +212,23 @@ def render_10panel(snap_path, step):
             spine.set_color('gray')
         ax.tick_params(colors='gray', labelsize=7)
 
-    # 6. XY m- global
-    m = subsample(pos_minus, SUBSAMPLE)
+    # Apply radial mask for m- global views
+    r_minus = np.sqrt(pos_minus[:,0]**2 + pos_minus[:,1]**2 + pos_minus[:,2]**2)
+    pos_minus_inner = pos_minus[r_minus < GLOBAL_RADIUS]
+
+    # 6. XY m- global (r < 200 Mpc)
+    m = subsample(pos_minus_inner, SUBSAMPLE)
     axes[1,0].scatter(m[:,0], m[:,1], s=0.01, c='#ff4444', alpha=0.3, rasterized=True)
-    axes[1,0].set_xlim(-half, half)
-    axes[1,0].set_ylim(-half, half)
-    axes[1,0].set_title('m- XY global', color='#ff4444', fontsize=9)
+    axes[1,0].set_xlim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
+    axes[1,0].set_ylim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
+    axes[1,0].set_title('m- XY (r<200 Mpc)', color='#ff4444', fontsize=9)
     axes[1,0].set_aspect('equal')
 
-    # 7. XZ m- global
+    # 7. XZ m- global (r < 200 Mpc)
     axes[1,1].scatter(m[:,0], m[:,2], s=0.01, c='#ff4444', alpha=0.3, rasterized=True)
-    axes[1,1].set_xlim(-half, half)
-    axes[1,1].set_ylim(-half, half)
-    axes[1,1].set_title('m- XZ global', color='#ff4444', fontsize=9)
+    axes[1,1].set_xlim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
+    axes[1,1].set_ylim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
+    axes[1,1].set_title('m- XZ (r<200 Mpc)', color='#ff4444', fontsize=9)
     axes[1,1].set_aspect('equal')
 
     # 8. XY m- zoom
@@ -275,9 +284,15 @@ def render_2p5d(snap_path, step):
     pos_plus = pos[is_plus]
     pos_minus = pos[is_minus]
 
-    # Subsample for 3D rendering
-    pp = subsample(pos_plus, 150000)
-    pm = subsample(pos_minus, 100000)
+    # Apply radial mask (r < 200 Mpc) to remove edge artifacts
+    r_plus = np.sqrt(pos_plus[:,0]**2 + pos_plus[:,1]**2 + pos_plus[:,2]**2)
+    r_minus = np.sqrt(pos_minus[:,0]**2 + pos_minus[:,1]**2 + pos_minus[:,2]**2)
+    pos_plus_inner = pos_plus[r_plus < GLOBAL_RADIUS]
+    pos_minus_inner = pos_minus[r_minus < GLOBAL_RADIUS]
+
+    # Subsample for 3D rendering (from inner region only)
+    pp = subsample(pos_plus_inner, 150000)
+    pm = subsample(pos_minus_inner, 100000)
 
     # 4K figure: 3840x2160 at 200 DPI = 19.2 x 10.8 inches
     fig = plt.figure(figsize=(19.2, 10.8), facecolor='black')
@@ -295,9 +310,9 @@ def render_2p5d(snap_path, step):
     ax_main = fig.add_subplot(gs[:, :2], projection='3d', facecolor='black')
     ax_main.scatter(pm[:,0], pm[:,1], pm[:,2], s=0.15, c='#ff4444', alpha=0.4, rasterized=True)
     ax_main.scatter(pp[:,0], pp[:,1], pp[:,2], s=0.15, c='#44aaff', alpha=0.4, rasterized=True)
-    ax_main.set_xlim(-half, half)
-    ax_main.set_ylim(-half, half)
-    ax_main.set_zlim(-half, half)
+    ax_main.set_xlim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
+    ax_main.set_ylim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
+    ax_main.set_zlim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
     ax_main.set_title(f'JANUS BIMETRIC — Step {step} | z = {z:.2f}',
                       color='white', fontsize=16, pad=10)
     ax_main.xaxis.pane.fill = False
@@ -312,20 +327,20 @@ def render_2p5d(snap_path, step):
     ax_main.set_zlabel('Z [Mpc]', color='#888888', fontsize=9)
     ax_main.view_init(elev=elev, azim=azim)
 
-    # Legend
-    ax_main.text2D(0.02, 0.98, f'N = {len(pos):,}', transform=ax_main.transAxes,
-                   color='white', fontsize=11, va='top')
-    ax_main.text2D(0.02, 0.94, f'm+ (blue): {len(pos_plus):,}', transform=ax_main.transAxes,
+    # Legend (show inner region counts)
+    ax_main.text2D(0.02, 0.98, f'N (r<{GLOBAL_RADIUS:.0f}) = {len(pos_plus_inner) + len(pos_minus_inner):,}',
+                   transform=ax_main.transAxes, color='white', fontsize=11, va='top')
+    ax_main.text2D(0.02, 0.94, f'm+ (blue): {len(pos_plus_inner):,}', transform=ax_main.transAxes,
                    color='#44aaff', fontsize=10, va='top')
-    ax_main.text2D(0.02, 0.90, f'm- (red): {len(pos_minus):,}', transform=ax_main.transAxes,
+    ax_main.text2D(0.02, 0.90, f'm- (red): {len(pos_minus_inner):,}', transform=ax_main.transAxes,
                    color='#ff4444', fontsize=10, va='top')
 
     # === TOP RIGHT: m+ only ===
     ax_plus = fig.add_subplot(gs[0, 2], projection='3d', facecolor='black')
     ax_plus.scatter(pp[:,0], pp[:,1], pp[:,2], s=0.015, c='#44aaff', alpha=0.25, rasterized=True)
-    ax_plus.set_xlim(-half, half)
-    ax_plus.set_ylim(-half, half)
-    ax_plus.set_zlim(-half, half)
+    ax_plus.set_xlim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
+    ax_plus.set_ylim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
+    ax_plus.set_zlim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
     ax_plus.set_title('m+ (baryonic matter)', color='#44aaff', fontsize=11)
     ax_plus.xaxis.pane.fill = False
     ax_plus.yaxis.pane.fill = False
@@ -339,9 +354,9 @@ def render_2p5d(snap_path, step):
     # === BOTTOM RIGHT: m- only ===
     ax_minus = fig.add_subplot(gs[1, 2], projection='3d', facecolor='black')
     ax_minus.scatter(pm[:,0], pm[:,1], pm[:,2], s=0.015, c='#ff4444', alpha=0.25, rasterized=True)
-    ax_minus.set_xlim(-half, half)
-    ax_minus.set_ylim(-half, half)
-    ax_minus.set_zlim(-half, half)
+    ax_minus.set_xlim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
+    ax_minus.set_ylim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
+    ax_minus.set_zlim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
     ax_minus.set_title('m- (negative mass)', color='#ff4444', fontsize=11)
     ax_minus.xaxis.pane.fill = False
     ax_minus.yaxis.pane.fill = False

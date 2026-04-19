@@ -18,6 +18,9 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
+# === CONFIGURATION ===
+MARGIN = 50.0  # Mpc — forbidden zone on each edge (skip halos in this zone)
+
 # === SNAPSHOT READER (V3 format) ===
 def read_snapshot_v3(path):
     """Read v3 snapshot with split_level info"""
@@ -175,9 +178,16 @@ def render_halo(data, halo_center, halo_idx, step, out_dir, r_extract=15.0):
     mass = data['mass']
     z = data['z']
     l_box = data['l_box']
+    half = l_box / 2
+
+    # Skip halos too close to edges (within MARGIN)
+    safe_limit = half - MARGIN
+    if (abs(halo_center[0]) > safe_limit or
+        abs(halo_center[1]) > safe_limit or
+        abs(halo_center[2]) > safe_limit):
+        return None  # Halo too close to edge
 
     # Extract particles within r_extract of halo center (with periodic BC)
-    half = l_box / 2
     dx = pos[:, 0] - halo_center[0]
     dy = pos[:, 1] - halo_center[1]
     dz = pos[:, 2] - halo_center[2]

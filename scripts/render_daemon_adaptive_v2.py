@@ -18,9 +18,9 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 
 # === CONFIGURATION ===
-SNAP_DIR = Path("/mnt/T2/janus-sim/output/janus_adaptive_v3/snapshots")
-OUT_10P = Path("/mnt/T2/janus-sim/output/janus_adaptive_v3/frames_10panel")
-OUT_2P5D = Path("/mnt/T2/janus-sim/output/janus_adaptive_v3/frames_2p5d")
+SNAP_DIR = Path("/mnt/T2/janus-sim/output/janus_adaptive_v4/snapshots")
+OUT_10P = Path("/mnt/T2/janus-sim/output/janus_adaptive_v4/frames_10panel")
+OUT_2P5D = Path("/mnt/T2/janus-sim/output/janus_adaptive_v4/frames_2p5d")
 OUT_10P.mkdir(exist_ok=True, parents=True)
 OUT_2P5D.mkdir(exist_ok=True, parents=True)
 
@@ -30,6 +30,7 @@ ZOOM_SIZE = 100.0  # For 500 Mpc box (larger zoom to see structure better)
 GRID_SIZE = 64
 SUBSAMPLE = 200000  # Max particles to plot for performance
 GLOBAL_RADIUS = 200.0  # Only show particles within this radius from center (removes edge artifacts)
+MARGIN = 50.0  # Mpc — forbidden zone on each edge for zoom center search
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SNAPSHOT READER (V3 format)
@@ -79,12 +80,27 @@ def read_snapshot_v3_fast(path):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def find_density_peak(pos, box_size, n_cells=32):
-    """Find position of maximum density"""
+    """Find position of maximum density in safe zone (away from edges)"""
     half = box_size / 2
-    bins = np.linspace(-half, half, n_cells + 1)
-    H, _ = np.histogramdd(pos, bins=[bins, bins, bins])
+    safe_limit = half - MARGIN  # Stay away from edges
+
+    # Filter to safe zone only
+    mask_safe = (
+        (np.abs(pos[:, 0]) < safe_limit) &
+        (np.abs(pos[:, 1]) < safe_limit) &
+        (np.abs(pos[:, 2]) < safe_limit)
+    )
+    pos_safe = pos[mask_safe]
+
+    if len(pos_safe) < 100:
+        # Fallback to center if no particles in safe zone
+        return np.array([0.0, 0.0, 0.0])
+
+    # Search only in safe region
+    bins = np.linspace(-safe_limit, safe_limit, n_cells + 1)
+    H, _ = np.histogramdd(pos_safe, bins=[bins, bins, bins])
     idx = np.unravel_index(np.argmax(H), H.shape)
-    cell = box_size / n_cells
+    cell = (2 * safe_limit) / n_cells
     return np.array([bins[idx[0]] + cell/2, bins[idx[1]] + cell/2, bins[idx[2]] + cell/2])
 
 

@@ -49,9 +49,9 @@ extern "C" __global__ void drift_f32(
 
 extern "C" __global__ void kick_f32(
     float* __restrict__ vel,
-    const float* __restrict__ acc,  // Changed to float
+    const float* __restrict__ acc,  // Physical acceleration in Mpc/Gyr²
     float dt, int n,
-    float hubble_param, float dtau_per_dt  // Changed to float
+    float hubble_param, float dtau_per_dt
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n) return;
@@ -2146,7 +2146,7 @@ impl GpuNBodyTwoPass {
             lambda_0: 0.0,  // no screening by default
             current_z: 0.0,
             mass_factor: {
-                let g_cosmo = 4.498e-12;  // Mpc³/(M_sun·Gyr²)
+                let g_cosmo = 4.499e-15;  // Mpc³/(M_sun·Gyr²) - CORRECTED from e-12
                 let rho_crit = 2.775e11;  // M_sun/Mpc³
                 let omega_m = 0.3;
                 let m_total = omega_m * rho_crit * box_size.powi(3);
@@ -2291,11 +2291,13 @@ impl GpuNBodyTwoPass {
             lambda_0: 0.0,  // no screening by default
             current_z: 0.0,
             mass_factor: {
-                let g_cosmo = 4.498e-12;  // Mpc³/(M_sun·Gyr²)
+                let g_cosmo = 4.499e-15;  // Mpc³/(M_sun·Gyr²) - CORRECTED from e-12
                 let rho_crit = 2.775e11;  // M_sun/Mpc³
                 let omega_m = 0.3;
                 let m_total = omega_m * rho_crit * box_size.powi(3);
-                g_cosmo * m_total / n_total as f64
+                let mf = g_cosmo * m_total / n_total as f64;
+                println!("  [DEBUG] G={:.3e}, m_total={:.3e} M_sun, mass_factor={:.6e}", g_cosmo, m_total, mf);
+                mf
             },
         })
     }
@@ -2311,6 +2313,13 @@ impl GpuNBodyTwoPass {
 
     /// Get mass_factor = G × M_total / N for debugging
     pub fn get_mass_factor(&self) -> f64 { self.mass_factor }
+
+    /// Set mass_factor directly (for Janus density correction)
+    /// mass_factor = G × M_total / N where M_total = ρ_total × V_box
+    pub fn set_mass_factor(&mut self, mf: f64) {
+        println!("  [JANUS] mass_factor: {:.4e} → {:.4e}", self.mass_factor, mf);
+        self.mass_factor = mf;
+    }
 
     /// Set k-space filter minimum index (k_min=3 suppresses dipole modes k=0,1,2)
     pub fn set_pm_k_min(&mut self, k_min: usize) { self.pm_k_min = k_min; }
@@ -3987,7 +3996,7 @@ impl GpuNBodyTwoPass {
 
         // Use screening kernel if lambda_0 > 0, standard kernel otherwise
         let use_screening = self.lambda_0 > 0.01;
-        eprintln!("  [DEBUG] lambda_0={}, use_screening={}", self.lambda_0, use_screening);
+        // Debug disabled for cleaner output
 
         let reset_i32_k = self.device.get_func("twopass", "reset_i32")
             .ok_or("reset_i32 not found")?;
@@ -4393,7 +4402,9 @@ impl GpuNBodyTwoPass {
         // BH: erfc(r/(2r_s)) damps long-range in real-space
         // r_cut/r_s = 3 → erfc(r_cut/(2r_s)) = erfc(1.5) ≈ 0.03 at boundary
         let r_s = r_cut / 3.0;
-        let g_constant = 1.0;
+        // BUG FIX #2: g_constant must account for cell_volume to convert COUNT to DENSITY
+        let cell_vol = (self.box_size / pm_grid.grid_size as f64).powi(3);
+        let g_constant = self.mass_factor / cell_vol;
         pm_grid.solve_poisson_with_splitting(g_constant, Some(r_s));
 
         // Interpolate PM forces for all particles
@@ -4487,8 +4498,9 @@ impl GpuNBodyTwoPass {
         let half_dt = (dt / 2.0) as f32;
         let cell_size = (self.box_size / grid as f64) as f32;
         let inv_cell_size = (grid as f64 / self.box_size) as f32;
-        // No k-space damping: BH handles r < r_cut, PM handles r > r_cut
-        let g_constant = 1.0;
+        // BUG FIX #2: g_constant must account for cell_volume to convert COUNT to DENSITY
+        let cell_vol = (self.box_size / grid as f64).powi(3);
+        let g_constant = self.mass_factor / cell_vol;
 
         let blocks = (n + 255) / 256;
         let grid_blocks = (grid_cells + 255) / 256;
@@ -4658,7 +4670,9 @@ impl GpuNBodyTwoPass {
         let half_dt = (dt / 2.0) as f32;
         let cell_size = (self.box_size / grid as f64) as f32;
         let inv_cell_size = (grid as f64 / self.box_size) as f32;
-        let g_constant = 1.0;
+        // BUG FIX #2: g_constant must account for cell_volume to convert COUNT to DENSITY
+        let cell_vol = (self.box_size / grid as f64).powi(3);
+        let g_constant = self.mass_factor / cell_vol;
 
         let blocks = (n + 255) / 256;
         let grid_blocks = (grid_cells + 255) / 256;
@@ -4823,7 +4837,12 @@ impl GpuNBodyTwoPass {
         let half_dt = (dt / 2.0) as f32;
         let cell_size = (self.box_size / grid as f64) as f32;
         let inv_cell_size = (grid as f64 / self.box_size) as f32;
-        let g_constant = 1.0;
+        // BUG FIX #2: g_constant must account for cell_volume to convert particle COUNT to DENSITY
+        // CIC scatter assigns particle COUNT, but Poisson expects MASS DENSITY
+        // ρ_mass = (M_total/N) × N_particles_in_cell / cell_vol
+        // So: g_constant = mass_factor / cell_vol = mass_factor × (grid/box)³
+        let cell_vol = (self.box_size / grid as f64).powi(3);
+        let g_constant = self.mass_factor / cell_vol;
 
         let blocks = (n + 255) / 256;
         let n_blocks_all = blocks;
@@ -5255,7 +5274,8 @@ impl GpuNBodyTwoPass {
         let phi_plus_ptr = get_device_ptr(&self.phi_plus) as *mut f64;
         let phi_minus_ptr = get_device_ptr(&self.phi_minus) as *mut f64;
 
-        let g_constant = 1.0;  // Normalized units
+        // BUG FIX #2: g_constant must account for cell_volume to convert COUNT to DENSITY
+        let g_constant = self.mass_factor / cell_vol;
         let r_s = self.box_size / 2.0;  // PM softening scale
 
         unsafe {

@@ -303,16 +303,34 @@ extern "C" __global__ void compute_morton_codes(
     int* __restrict__ indices,
     int n,
     double box_half,
-    double inv_cell_size
+    double inv_cell_size,
+    double offset_x,  // Phase 13: random octree offset
+    double offset_y,
+    double offset_z
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n) return;
 
-    // Read position and normalize to [0, 1024) range (10 bits per axis)
-    double scale = 1024.0 / (2.0 * box_half);
-    double x = (pos[tid * 3]     + box_half) * scale;
-    double y = (pos[tid * 3 + 1] + box_half) * scale;
-    double z = (pos[tid * 3 + 2] + box_half) * scale;
+    // Phase 13: Shift positions by random offset before Morton computation
+    // This breaks the fixed grid alignment that causes cardinal-direction artifacts
+    double box_size = 2.0 * box_half;
+    double px = pos[tid * 3]     + offset_x;
+    double py = pos[tid * 3 + 1] + offset_y;
+    double pz = pos[tid * 3 + 2] + offset_z;
+
+    // Periodic wrap to [-box_half, box_half]
+    if (px >  box_half) px -= box_size;
+    if (px < -box_half) px += box_size;
+    if (py >  box_half) py -= box_size;
+    if (py < -box_half) py += box_size;
+    if (pz >  box_half) pz -= box_size;
+    if (pz < -box_half) pz += box_size;
+
+    // Normalize to [0, 1024) range (10 bits per axis)
+    double scale = 1024.0 / box_size;
+    double x = (px + box_half) * scale;
+    double y = (py + box_half) * scale;
+    double z = (pz + box_half) * scale;
 
     // Clamp to valid range (10 bits = 0..1023)
     unsigned int ix = min(max((unsigned int)x, 0u), 0x3ffu);
@@ -2420,6 +2438,7 @@ impl GpuNBodySimulation {
         let inv_cell_size = 2097152.0 / self.box_size;
 
         // Step 1: Compute Morton codes on GPU
+        // Note: For pure sorting, we use zero offset (no grid randomization needed)
         let morton_kernel = self.device.get_func("nbody", "compute_morton_codes")
             .ok_or("Failed to get compute_morton_codes kernel")?;
 
@@ -2431,6 +2450,9 @@ impl GpuNBodySimulation {
                 self.n_particles as i32,
                 box_half,
                 inv_cell_size,
+                0.0_f64,  // offset_x = 0 (Phase 13: no offset for pure sorting)
+                0.0_f64,  // offset_y = 0
+                0.0_f64,  // offset_z = 0
             ))?;
         }
         self.device.synchronize()?;
@@ -2530,7 +2552,16 @@ impl GpuNBodySimulation {
             shared_mem_bytes: 0,
         };
 
-        // Step 1: Compute Morton codes
+        // Phase 13: Random octree offset to break grid alignment artifacts
+        // Each rebuild uses a different offset, so tree structure varies per step
+        // This prevents cumulative cardinal-direction contamination
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let offset_x = (rng.gen::<f64>() - 0.5) * self.box_size;
+        let offset_y = (rng.gen::<f64>() - 0.5) * self.box_size;
+        let offset_z = (rng.gen::<f64>() - 0.5) * self.box_size;
+
+        // Step 1: Compute Morton codes (with random offset)
         let morton_kernel = self.device.get_func("nbody", "compute_morton_codes")
             .ok_or("Failed to get compute_morton_codes kernel")?;
         unsafe {
@@ -2541,6 +2572,9 @@ impl GpuNBodySimulation {
                 n as i32,
                 box_half,
                 inv_cell_size,
+                offset_x,
+                offset_y,
+                offset_z,
             ))?;
         }
         self.device.synchronize()?;
@@ -2728,6 +2762,13 @@ impl GpuNBodySimulation {
             shared_mem_bytes: 0,
         };
 
+        // Phase 13: Random octree offset
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let offset_x = (rng.gen::<f64>() - 0.5) * self.box_size;
+        let offset_y = (rng.gen::<f64>() - 0.5) * self.box_size;
+        let offset_z = (rng.gen::<f64>() - 0.5) * self.box_size;
+
         // Step 1: Compute Morton codes
         let t1 = Instant::now();
         let morton_kernel = self.device.get_func("nbody", "compute_morton_codes")
@@ -2740,6 +2781,9 @@ impl GpuNBodySimulation {
                 n as i32,
                 box_half,
                 inv_cell_size,
+                offset_x,
+                offset_y,
+                offset_z,
             ))?;
         }
         self.device.synchronize()?;
@@ -3360,6 +3404,13 @@ impl GpuNBodySimulation {
             shared_mem_bytes: 0,
         };
 
+        // Phase 13: Random octree offset
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let offset_x = (rng.gen::<f64>() - 0.5) * self.box_size;
+        let offset_y = (rng.gen::<f64>() - 0.5) * self.box_size;
+        let offset_z = (rng.gen::<f64>() - 0.5) * self.box_size;
+
         // Step 1: Morton codes
         let morton_kernel = self.device.get_func("nbody", "compute_morton_codes")
             .ok_or("Failed to get compute_morton_codes kernel")?;
@@ -3371,6 +3422,9 @@ impl GpuNBodySimulation {
                 n as i32,
                 box_half,
                 inv_cell_size,
+                offset_x,
+                offset_y,
+                offset_z,
             ))?;
         }
         self.device.synchronize()?;

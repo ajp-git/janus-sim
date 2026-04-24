@@ -935,16 +935,30 @@ fn generate_zeldovich_ics(n_grid: usize, l_box: f64, z_init: f64, h0: f64, mu: f
         c0 * (1.0 - dz) + c1 * dz
     };
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // FIX Phase 11: offset aléatoire de la grille ψ
+    // Les positions particules restent inchangées, mais on décale où on
+    // lit ψ dans la grille FFT. Casse la corrélation entre la grille FFT
+    // et le spacing moyen des particules m-.
+    // ═══════════════════════════════════════════════════════════════════════
+    let offset_x = rng_pos.random::<f64>() * spacing_fft;
+    let offset_y = rng_pos.random::<f64>() * spacing_fft;
+    let offset_z = rng_pos.random::<f64>() * spacing_fft;
+    println!("  FIX Phase 11 offset aléatoire grille ψ :");
+    println!("    spacing_fft = {:.4} Mpc", spacing_fft);
+    println!("    offset      = ({:.4}, {:.4}, {:.4}) Mpc", offset_x, offset_y, offset_z);
+
     for i in 0..n_total {
         // Position aléatoire uniforme dans [-L/2, L/2]³
         let x0 = (rng_pos.random::<f64>() - 0.5) * l_box;
         let y0 = (rng_pos.random::<f64>() - 0.5) * l_box;
         let z0 = (rng_pos.random::<f64>() - 0.5) * l_box;
 
-        // Interpoler ψ à cette position aléatoire (CIC)
-        let psi_xi = cic_interp(&psi_x, x0, y0, z0) * scale;
-        let psi_yi = cic_interp(&psi_y, x0, y0, z0) * scale;
-        let psi_zi = cic_interp(&psi_z, x0, y0, z0) * scale;
+        // Interpoler ψ à cette position décalée (CIC) — Phase 11 fix
+        // cic_interp gère les conditions périodiques automatiquement
+        let psi_xi = cic_interp(&psi_x, x0 + offset_x, y0 + offset_y, z0 + offset_z) * scale;
+        let psi_yi = cic_interp(&psi_y, x0 + offset_x, y0 + offset_y, z0 + offset_z) * scale;
+        let psi_zi = cic_interp(&psi_z, x0 + offset_x, y0 + offset_y, z0 + offset_z) * scale;
 
         // Position finale : random + ψ, avec conditions périodiques
         positions[i * 3]     = ((x0 + psi_xi + half_box) % l_box + l_box) % l_box - half_box;

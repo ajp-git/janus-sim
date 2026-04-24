@@ -18,9 +18,9 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 
 # === CONFIGURATION ===
-SNAP_DIR = Path("/mnt/T2/janus-sim/output/janus_adaptive_v4/snapshots")
-OUT_10P = Path("/mnt/T2/janus-sim/output/janus_adaptive_v4/frames_10panel")
-OUT_2P5D = Path("/mnt/T2/janus-sim/output/janus_adaptive_v4/frames_2p5d")
+SNAP_DIR = Path("/mnt/T2/janus-sim/output/test_phase11_translation/snapshots")
+OUT_10P = Path("/mnt/T2/janus-sim/output/test_phase11_translation/frames_10panel")
+OUT_2P5D = Path("/mnt/T2/janus-sim/output/test_phase11_translation/frames_2p5d")
 OUT_10P.mkdir(exist_ok=True, parents=True)
 OUT_2P5D.mkdir(exist_ok=True, parents=True)
 
@@ -141,7 +141,7 @@ def render_10panel(snap_path, step):
 
     # Create figure
     fig, axes = plt.subplots(2, 5, figsize=(19.2, 10.8), facecolor='black')
-    fig.subplots_adjust(left=0.02, right=0.98, top=0.94, bottom=0.04, wspace=0.15, hspace=0.15)
+    fig.subplots_adjust(left=0.03, right=0.97, top=0.92, bottom=0.06, wspace=0.20, hspace=0.20)
 
     # Title
     n_hr = np.sum(split_level > 0)
@@ -157,6 +157,7 @@ def render_10panel(snap_path, step):
         for spine in ax.spines.values():
             spine.set_color('gray')
         ax.tick_params(colors='gray', labelsize=7)
+        ax.set_clip_on(True)
 
     # Apply radial mask for global views (removes edge artifacts)
     r_plus = np.sqrt(pos_plus[:,0]**2 + pos_plus[:,1]**2 + pos_plus[:,2]**2)
@@ -164,18 +165,20 @@ def render_10panel(snap_path, step):
 
     # 1. XY m+ global (r < 200 Mpc)
     p = subsample(pos_plus_inner, SUBSAMPLE)
-    axes[0,0].scatter(p[:,0], p[:,1], s=0.01, c='#4488ff', alpha=0.3, rasterized=True)
+    axes[0,0].scatter(p[:,0], p[:,1], s=0.01, c='#4488ff', alpha=0.3, rasterized=True, zorder=1)
     axes[0,0].set_xlim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
     axes[0,0].set_ylim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
     axes[0,0].set_title('m+ XY (r<200 Mpc)', color='#4488ff', fontsize=9)
     axes[0,0].set_aspect('equal')
+    axes[0,0].set_zorder(10)
 
     # 2. XZ m+ global (r < 200 Mpc)
-    axes[0,1].scatter(p[:,0], p[:,2], s=0.01, c='#4488ff', alpha=0.3, rasterized=True)
+    axes[0,1].scatter(p[:,0], p[:,2], s=0.01, c='#4488ff', alpha=0.3, rasterized=True, zorder=1)
     axes[0,1].set_xlim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
     axes[0,1].set_ylim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
     axes[0,1].set_title('m+ XZ (r<200 Mpc)', color='#4488ff', fontsize=9)
     axes[0,1].set_aspect('equal')
+    axes[0,1].set_zorder(10)
 
     # 3. XY m+ zoom with m- contours
     zoom_mask_p = (np.abs(pos_plus[:,0] - center[0]) < zoom_half) & \
@@ -234,18 +237,20 @@ def render_10panel(snap_path, step):
 
     # 6. XY m- global (r < 200 Mpc)
     m = subsample(pos_minus_inner, SUBSAMPLE)
-    axes[1,0].scatter(m[:,0], m[:,1], s=0.01, c='#ff4444', alpha=0.3, rasterized=True)
+    axes[1,0].scatter(m[:,0], m[:,1], s=0.01, c='#ff4444', alpha=0.3, rasterized=True, zorder=1)
     axes[1,0].set_xlim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
     axes[1,0].set_ylim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
     axes[1,0].set_title('m- XY (r<200 Mpc)', color='#ff4444', fontsize=9)
     axes[1,0].set_aspect('equal')
+    axes[1,0].set_zorder(10)
 
     # 7. XZ m- global (r < 200 Mpc)
-    axes[1,1].scatter(m[:,0], m[:,2], s=0.01, c='#ff4444', alpha=0.3, rasterized=True)
+    axes[1,1].scatter(m[:,0], m[:,2], s=0.01, c='#ff4444', alpha=0.3, rasterized=True, zorder=1)
     axes[1,1].set_xlim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
     axes[1,1].set_ylim(-GLOBAL_RADIUS, GLOBAL_RADIUS)
     axes[1,1].set_title('m- XZ (r<200 Mpc)', color='#ff4444', fontsize=9)
     axes[1,1].set_aspect('equal')
+    axes[1,1].set_zorder(10)
 
     # 8. XY m- zoom
     mz = subsample(pos_minus[zoom_mask_m] - center, min(50000, zoom_mask_m.sum())) if zoom_mask_m.sum() > 0 else np.empty((0,3))

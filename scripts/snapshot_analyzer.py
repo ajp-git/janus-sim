@@ -247,18 +247,36 @@ def find_top_halos(positions: np.ndarray, densities: np.ndarray,
 
 
 def compute_segregation(pos_plus: np.ndarray, pos_minus: np.ndarray,
-                        l_box: float, grid_size: int = 64) -> Tuple[float, float]:
+                        l_box: float, grid_size: int = 64,
+                        mass_plus: np.ndarray = None,
+                        mass_minus: np.ndarray = None) -> Tuple[float, float]:
     """
     Compute segregation metrics:
     - corr_delta: Correlation between δ+ and δ- fields
     - r_k_mean: Mean cross-correlation coefficient
+
+    IMPORTANT: When adaptive particle splitting is active, a single parent m+
+    can have 8^N daughter particles at split level N. Counting particles per cell
+    (unweighted histogram) would then correlate with the local density of SPLIT
+    ACTIVITY rather than with true mass overdensity, producing spurious
+    POSITIVE corr(δ+,δ−). This function therefore builds MASS-WEIGHTED
+    density fields when masses are provided.
     """
     half = l_box / 2.0
     bins = np.linspace(-half, half, grid_size + 1)
 
-    # 3D histograms
-    hist_plus, _ = np.histogramdd(pos_plus, bins=[bins, bins, bins])
-    hist_minus, _ = np.histogramdd(pos_minus, bins=[bins, bins, bins])
+    # Mass-weighted 3D histograms (falls back to unweighted if masses are None)
+    if mass_plus is not None:
+        hist_plus, _ = np.histogramdd(pos_plus, bins=[bins, bins, bins],
+                                       weights=mass_plus)
+    else:
+        hist_plus, _ = np.histogramdd(pos_plus, bins=[bins, bins, bins])
+
+    if mass_minus is not None:
+        hist_minus, _ = np.histogramdd(pos_minus, bins=[bins, bins, bins],
+                                        weights=mass_minus)
+    else:
+        hist_minus, _ = np.histogramdd(pos_minus, bins=[bins, bins, bins])
 
     # Overdensity fields
     mean_plus = np.mean(hist_plus)
@@ -333,6 +351,7 @@ def analyze_snapshot(header: SnapshotHeaderV3, particles: np.ndarray,
     pos_minus = pos[mask_minus]
     vel_plus = vel[mask_plus]
     masses_plus = masses[mask_plus]
+    masses_minus = masses[mask_minus]
 
     # ═══════════════════════════════════════════════════════════════════════
     # BASIC COUNTS
@@ -402,7 +421,7 @@ def analyze_snapshot(header: SnapshotHeaderV3, particles: np.ndarray,
         v_rms_hr = 0.0
 
     # Velocity dispersion in halo0
-    if halos[0]['n_particles'] > 10:
+    if len(halos) > 0 and halos[0]['n_particles'] > 10:
         halo0_pos = np.array([halos[0]['x'], halos[0]['y'], halos[0]['z']])
         distances = np.linalg.norm(pos - halo0_pos, axis=1)
         in_halo0 = distances < 2.0
@@ -420,7 +439,10 @@ def analyze_snapshot(header: SnapshotHeaderV3, particles: np.ndarray,
     # SEGREGATION
     # ═══════════════════════════════════════════════════════════════════════
     if len(pos_plus) > 100 and len(pos_minus) > 100:
-        corr_delta, r_k_mean = compute_segregation(pos_plus, pos_minus, header.l_box, grid_size)
+        corr_delta, r_k_mean = compute_segregation(
+            pos_plus, pos_minus, header.l_box, grid_size,
+            mass_plus=masses_plus, mass_minus=masses_minus,
+        )
     else:
         corr_delta, r_k_mean = 0.0, 0.0
 
@@ -482,34 +504,34 @@ def analyze_snapshot(header: SnapshotHeaderV3, particles: np.ndarray,
         'rho_p99': rho_p99,
         'rho_p999': rho_p999,
 
-        # Halos
-        'halo0_x': halos[0]['x'],
-        'halo0_y': halos[0]['y'],
-        'halo0_z': halos[0]['z'],
-        'halo0_rho': halos[0]['rho'],
-        'halo0_n_particles': halos[0]['n_particles'],
-        'halo0_split_max': halos[0]['split_max'],
+        # Halos (safe access with defaults)
+        'halo0_x': halos[0]['x'] if len(halos) > 0 else 0.0,
+        'halo0_y': halos[0]['y'] if len(halos) > 0 else 0.0,
+        'halo0_z': halos[0]['z'] if len(halos) > 0 else 0.0,
+        'halo0_rho': halos[0]['rho'] if len(halos) > 0 else 0.0,
+        'halo0_n_particles': halos[0]['n_particles'] if len(halos) > 0 else 0,
+        'halo0_split_max': halos[0]['split_max'] if len(halos) > 0 else 0,
 
-        'halo1_x': halos[1]['x'],
-        'halo1_y': halos[1]['y'],
-        'halo1_z': halos[1]['z'],
-        'halo1_rho': halos[1]['rho'],
-        'halo1_n_particles': halos[1]['n_particles'],
-        'halo1_split_max': halos[1]['split_max'],
+        'halo1_x': halos[1]['x'] if len(halos) > 1 else 0.0,
+        'halo1_y': halos[1]['y'] if len(halos) > 1 else 0.0,
+        'halo1_z': halos[1]['z'] if len(halos) > 1 else 0.0,
+        'halo1_rho': halos[1]['rho'] if len(halos) > 1 else 0.0,
+        'halo1_n_particles': halos[1]['n_particles'] if len(halos) > 1 else 0,
+        'halo1_split_max': halos[1]['split_max'] if len(halos) > 1 else 0,
 
-        'halo2_x': halos[2]['x'],
-        'halo2_y': halos[2]['y'],
-        'halo2_z': halos[2]['z'],
-        'halo2_rho': halos[2]['rho'],
-        'halo2_n_particles': halos[2]['n_particles'],
-        'halo2_split_max': halos[2]['split_max'],
+        'halo2_x': halos[2]['x'] if len(halos) > 2 else 0.0,
+        'halo2_y': halos[2]['y'] if len(halos) > 2 else 0.0,
+        'halo2_z': halos[2]['z'] if len(halos) > 2 else 0.0,
+        'halo2_rho': halos[2]['rho'] if len(halos) > 2 else 0.0,
+        'halo2_n_particles': halos[2]['n_particles'] if len(halos) > 2 else 0,
+        'halo2_split_max': halos[2]['split_max'] if len(halos) > 2 else 0,
 
-        'halo3_x': halos[3]['x'],
-        'halo3_y': halos[3]['y'],
-        'halo3_z': halos[3]['z'],
-        'halo3_rho': halos[3]['rho'],
-        'halo3_n_particles': halos[3]['n_particles'],
-        'halo3_split_max': halos[3]['split_max'],
+        'halo3_x': halos[3]['x'] if len(halos) > 3 else 0.0,
+        'halo3_y': halos[3]['y'] if len(halos) > 3 else 0.0,
+        'halo3_z': halos[3]['z'] if len(halos) > 3 else 0.0,
+        'halo3_rho': halos[3]['rho'] if len(halos) > 3 else 0.0,
+        'halo3_n_particles': halos[3]['n_particles'] if len(halos) > 3 else 0,
+        'halo3_split_max': halos[3]['split_max'] if len(halos) > 3 else 0,
 
         # Kinematics
         'v_rms_global': v_rms_global,

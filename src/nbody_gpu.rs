@@ -70,6 +70,13 @@ const CUDA_KERNEL_SRC: &str = r#"
 // m- uses SOFTENING_MINUS_RATIO × softening to simulate diffuse gas nature
 #define SOFTENING_MINUS_RATIO 5.0
 
+// Minimum image convention for periodic boundaries
+__device__ inline double minimum_image(double d, double box_size, double box_half) {
+    if (d >  box_half) d -= box_size;
+    if (d < -box_half) d += box_size;
+    return d;
+}
+
 extern "C" __global__ void compute_forces_simple(
     const double* __restrict__ pos,      // x,y,z interleaved
     const int* __restrict__ signs,
@@ -78,15 +85,16 @@ extern "C" __global__ void compute_forces_simple(
     const int* __restrict__ node_types,
     double* __restrict__ acc,            // ax,ay,az interleaved
     int n_particles,
-    int n_nodes,
     double theta,
     double softening,
     double c_ratio_sq,  // (c_minus/c_plus)^2, default=1.0, VSL=100.0
-    double repulsion_scale  // 0.0=no cross-species, 1.0=full Janus (gradual ramp)
+    double repulsion_scale,  // 0.0=no cross-species, 1.0=full Janus (gradual ramp)
+    double box_size  // Box size for periodic boundary conditions
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_particles) return;
 
+    double box_half = 0.5 * box_size;
     double px = pos[tid * 3];
     double py = pos[tid * 3 + 1];
     double pz = pos[tid * 3 + 2];
@@ -104,7 +112,7 @@ extern "C" __global__ void compute_forces_simple(
 
     while (stack_ptr > 0) {
         int node_idx = stack[--stack_ptr];
-        if (node_idx < 0 || node_idx >= n_nodes) continue;
+        if (node_idx < 0) continue;  // node_type == 0 check below handles invalid nodes
 
         int node_type = node_types[node_idx];
         if (node_type == 0) continue;
@@ -115,9 +123,9 @@ extern "C" __global__ void compute_forces_simple(
         double cz = node_data[base + 2];
         double half_size = node_data[base + 3];
 
-        double dx = cx - px;
-        double dy = cy - py;
-        double dz = cz - pz;
+        double dx = minimum_image(cx - px, box_size, box_half);
+        double dy = minimum_image(cy - py, box_size, box_half);
+        double dz = minimum_image(cz - pz, box_size, box_half);
         double r2 = dx*dx + dy*dy + dz*dz;
         double r = sqrt(r2 + 1e-20);
 
@@ -135,9 +143,9 @@ extern "C" __global__ void compute_forces_simple(
             double mass_minus = node_data[base + 11];
 
             if (mass_plus > 0.0) {
-                double dpx = com_plus_x - px;
-                double dpy = com_plus_y - py;
-                double dpz = com_plus_z - pz;
+                double dpx = minimum_image(com_plus_x - px, box_size, box_half);
+                double dpy = minimum_image(com_plus_y - py, box_size, box_half);
+                double dpz = minimum_image(com_plus_z - pz, box_size, box_half);
                 double rp2 = dpx*dpx + dpy*dpy + dpz*dpz + eps2;
                 double inv_rp3 = 1.0 / (rp2 * sqrt(rp2));
                 // VSL Option B: m- feels AMPLIFIED repulsion from m+ (factor c_ratio_sq)
@@ -155,9 +163,9 @@ extern "C" __global__ void compute_forces_simple(
             }
 
             if (mass_minus > 0.0) {
-                double dmx = com_minus_x - px;
-                double dmy = com_minus_y - py;
-                double dmz = com_minus_z - pz;
+                double dmx = minimum_image(com_minus_x - px, box_size, box_half);
+                double dmy = minimum_image(com_minus_y - py, box_size, box_half);
+                double dmz = minimum_image(com_minus_z - pz, box_size, box_half);
                 double rm2 = dmx*dmx + dmy*dmy + dmz*dmz + eps2;
                 double inv_rm3 = 1.0 / (rm2 * sqrt(rm2));
                 // VSL Option B: m+ feels STANDARD repulsion from m- (factor 1.0)
@@ -578,7 +586,8 @@ extern "C" __global__ void reduce_com(
     int* __restrict__ node_types,
     int* __restrict__ atomic_counter,
     int n,  // number of leaves
-    double box_half
+    double box_half,
+    int* __restrict__ diag_counters  // [0]=nodes_processed, [1]=both_mplus, [2]=boundary_cross_mplus, [3]=both_mminus, [4]=boundary_cross_mminus
 ) {
     int leaf_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (leaf_idx >= n) return;
@@ -606,28 +615,120 @@ extern "C" __global__ void reduce_com(
         int left_base = left * 12;
         int right_base = right * 12;
 
+        // Diagnostic: count nodes processed
+        if (diag_counters != NULL) atomicAdd(&diag_counters[0], 1);
+
         // Read children data
         double l_mp = node_data[left_base + 7];
         double l_mm = node_data[left_base + 11];
         double r_mp = node_data[right_base + 7];
         double r_mm = node_data[right_base + 11];
 
-        // Compute combined COM for positive masses
+        // Box size for periodic unfolding
+        double box_size = 2.0 * box_half;
+
+        // Compute combined COM for positive masses with periodic unfolding
         double total_mp = l_mp + r_mp;
         double com_plus_x = 0.0, com_plus_y = 0.0, com_plus_z = 0.0;
         if (total_mp > 0.0) {
-            com_plus_x = (l_mp * node_data[left_base + 4] + r_mp * node_data[right_base + 4]) / total_mp;
-            com_plus_y = (l_mp * node_data[left_base + 5] + r_mp * node_data[right_base + 5]) / total_mp;
-            com_plus_z = (l_mp * node_data[left_base + 6] + r_mp * node_data[right_base + 6]) / total_mp;
+            if (l_mp > 0.0 && r_mp > 0.0) {
+                // Both children have m+ : unfold right relative to left
+                if (diag_counters != NULL) atomicAdd(&diag_counters[1], 1);  // both_mplus
+
+                double left_x = node_data[left_base + 4];
+                double left_y = node_data[left_base + 5];
+                double left_z = node_data[left_base + 6];
+                double right_x = node_data[right_base + 4];
+                double right_y = node_data[right_base + 5];
+                double right_z = node_data[right_base + 6];
+
+                // Check if boundary crossing occurs (before minimum_image)
+                double raw_dx = right_x - left_x;
+                double raw_dy = right_y - left_y;
+                double raw_dz = right_z - left_z;
+                if (diag_counters != NULL && (fabs(raw_dx) > box_half || fabs(raw_dy) > box_half || fabs(raw_dz) > box_half)) {
+                    atomicAdd(&diag_counters[2], 1);  // boundary_cross_mplus
+                }
+
+                double dx = minimum_image(right_x - left_x, box_size, box_half);
+                double dy = minimum_image(right_y - left_y, box_size, box_half);
+                double dz = minimum_image(right_z - left_z, box_size, box_half);
+
+                double w_right = r_mp / total_mp;
+                com_plus_x = left_x + w_right * dx;
+                com_plus_y = left_y + w_right * dy;
+                com_plus_z = left_z + w_right * dz;
+
+                // Wrap back into [-box_half, +box_half]
+                if (com_plus_x >  box_half) com_plus_x -= box_size;
+                if (com_plus_x < -box_half) com_plus_x += box_size;
+                if (com_plus_y >  box_half) com_plus_y -= box_size;
+                if (com_plus_y < -box_half) com_plus_y += box_size;
+                if (com_plus_z >  box_half) com_plus_z -= box_size;
+                if (com_plus_z < -box_half) com_plus_z += box_size;
+            } else if (l_mp > 0.0) {
+                // Only left child has m+
+                com_plus_x = node_data[left_base + 4];
+                com_plus_y = node_data[left_base + 5];
+                com_plus_z = node_data[left_base + 6];
+            } else {
+                // Only right child has m+
+                com_plus_x = node_data[right_base + 4];
+                com_plus_y = node_data[right_base + 5];
+                com_plus_z = node_data[right_base + 6];
+            }
         }
 
-        // Compute combined COM for negative masses
+        // Compute combined COM for negative masses with periodic unfolding
         double total_mm = l_mm + r_mm;
         double com_minus_x = 0.0, com_minus_y = 0.0, com_minus_z = 0.0;
         if (total_mm > 0.0) {
-            com_minus_x = (l_mm * node_data[left_base + 8] + r_mm * node_data[right_base + 8]) / total_mm;
-            com_minus_y = (l_mm * node_data[left_base + 9] + r_mm * node_data[right_base + 9]) / total_mm;
-            com_minus_z = (l_mm * node_data[left_base + 10] + r_mm * node_data[right_base + 10]) / total_mm;
+            if (l_mm > 0.0 && r_mm > 0.0) {
+                // Both children have m- : unfold right relative to left
+                if (diag_counters != NULL) atomicAdd(&diag_counters[3], 1);  // both_mminus
+
+                double left_x = node_data[left_base + 8];
+                double left_y = node_data[left_base + 9];
+                double left_z = node_data[left_base + 10];
+                double right_x = node_data[right_base + 8];
+                double right_y = node_data[right_base + 9];
+                double right_z = node_data[right_base + 10];
+
+                // Check if boundary crossing occurs (before minimum_image)
+                double raw_dx = right_x - left_x;
+                double raw_dy = right_y - left_y;
+                double raw_dz = right_z - left_z;
+                if (diag_counters != NULL && (fabs(raw_dx) > box_half || fabs(raw_dy) > box_half || fabs(raw_dz) > box_half)) {
+                    atomicAdd(&diag_counters[4], 1);  // boundary_cross_mminus
+                }
+
+                double dx = minimum_image(right_x - left_x, box_size, box_half);
+                double dy = minimum_image(right_y - left_y, box_size, box_half);
+                double dz = minimum_image(right_z - left_z, box_size, box_half);
+
+                double w_right = r_mm / total_mm;
+                com_minus_x = left_x + w_right * dx;
+                com_minus_y = left_y + w_right * dy;
+                com_minus_z = left_z + w_right * dz;
+
+                // Wrap back into [-box_half, +box_half]
+                if (com_minus_x >  box_half) com_minus_x -= box_size;
+                if (com_minus_x < -box_half) com_minus_x += box_size;
+                if (com_minus_y >  box_half) com_minus_y -= box_size;
+                if (com_minus_y < -box_half) com_minus_y += box_size;
+                if (com_minus_z >  box_half) com_minus_z -= box_size;
+                if (com_minus_z < -box_half) com_minus_z += box_size;
+            } else if (l_mm > 0.0) {
+                // Only left child has m-
+                com_minus_x = node_data[left_base + 8];
+                com_minus_y = node_data[left_base + 9];
+                com_minus_z = node_data[left_base + 10];
+            } else {
+                // Only right child has m-
+                com_minus_x = node_data[right_base + 8];
+                com_minus_y = node_data[right_base + 9];
+                com_minus_z = node_data[right_base + 10];
+            }
         }
 
         // Compute bounding box half-size from range
@@ -642,14 +743,34 @@ extern "C" __global__ void reduce_com(
         double half_size = box_half * cbrt(frac);
         if (half_size < box_half / 1024.0) half_size = box_half / 1024.0;
 
-        // Geometric center (average of COMs)
-        double cx = (com_plus_x + com_minus_x) / 2.0;
-        double cy = (com_plus_y + com_minus_y) / 2.0;
-        double cz = (com_plus_z + com_minus_z) / 2.0;
-        if (total_mp + total_mm > 0.0) {
-            cx = (total_mp * com_plus_x + total_mm * com_minus_x) / (total_mp + total_mm);
-            cy = (total_mp * com_plus_y + total_mm * com_minus_y) / (total_mp + total_mm);
-            cz = (total_mp * com_plus_z + total_mm * com_minus_z) / (total_mp + total_mm);
+        // Geometric center (mass-weighted average of COMs with periodic unfolding)
+        double cx = 0.0, cy = 0.0, cz = 0.0;
+        if (total_mp > 0.0 && total_mm > 0.0) {
+            // Both populations exist: unfold com_minus relative to com_plus
+            double dx = minimum_image(com_minus_x - com_plus_x, box_size, box_half);
+            double dy = minimum_image(com_minus_y - com_plus_y, box_size, box_half);
+            double dz = minimum_image(com_minus_z - com_plus_z, box_size, box_half);
+
+            double w_minus = total_mm / (total_mp + total_mm);
+            cx = com_plus_x + w_minus * dx;
+            cy = com_plus_y + w_minus * dy;
+            cz = com_plus_z + w_minus * dz;
+
+            // Wrap back
+            if (cx >  box_half) cx -= box_size;
+            if (cx < -box_half) cx += box_size;
+            if (cy >  box_half) cy -= box_size;
+            if (cy < -box_half) cy += box_size;
+            if (cz >  box_half) cz -= box_size;
+            if (cz < -box_half) cz += box_size;
+        } else if (total_mp > 0.0) {
+            cx = com_plus_x;
+            cy = com_plus_y;
+            cz = com_plus_z;
+        } else if (total_mm > 0.0) {
+            cx = com_minus_x;
+            cy = com_minus_y;
+            cz = com_minus_z;
         }
 
         // Store node data
@@ -684,14 +805,15 @@ extern "C" __global__ void compute_forces_bvh(
     const int* __restrict__ node_types,
     double* __restrict__ acc,
     int n_particles,
-    int n_internal,  // n_particles - 1
     double theta,
     double softening,
-    double c_ratio_sq  // VSL: (c_minus/c_plus)^2, default=1.0, VSL=100.0
+    double c_ratio_sq,  // VSL: (c_minus/c_plus)^2, default=1.0, VSL=100.0
+    double box_size  // Box size for periodic boundary conditions
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_particles) return;
 
+    double box_half = 0.5 * box_size;
     double px = pos[tid * 3];
     double py = pos[tid * 3 + 1];
     double pz = pos[tid * 3 + 2];
@@ -720,9 +842,9 @@ extern "C" __global__ void compute_forces_bvh(
         double cz = node_data[base + 2];
         double half_size = node_data[base + 3];
 
-        double dx = cx - px;
-        double dy = cy - py;
-        double dz = cz - pz;
+        double dx = minimum_image(cx - px, box_size, box_half);
+        double dy = minimum_image(cy - py, box_size, box_half);
+        double dz = minimum_image(cz - pz, box_size, box_half);
         double r2 = dx*dx + dy*dy + dz*dz;
         double r = sqrt(r2 + 1e-20);
 
@@ -738,9 +860,9 @@ extern "C" __global__ void compute_forces_bvh(
                 double com_plus_x = node_data[base + 4];
                 double com_plus_y = node_data[base + 5];
                 double com_plus_z = node_data[base + 6];
-                double dpx = com_plus_x - px;
-                double dpy = com_plus_y - py;
-                double dpz = com_plus_z - pz;
+                double dpx = minimum_image(com_plus_x - px, box_size, box_half);
+                double dpy = minimum_image(com_plus_y - py, box_size, box_half);
+                double dpz = minimum_image(com_plus_z - pz, box_size, box_half);
                 double rp2 = dpx*dpx + dpy*dpy + dpz*dpz + eps2;
                 double inv_rp3 = 1.0 / (rp2 * sqrt(rp2));
                 // VSL Option B: m- feels AMPLIFIED repulsion from m+ (factor c_ratio_sq)
@@ -756,9 +878,9 @@ extern "C" __global__ void compute_forces_bvh(
                 double com_minus_x = node_data[base + 8];
                 double com_minus_y = node_data[base + 9];
                 double com_minus_z = node_data[base + 10];
-                double dmx = com_minus_x - px;
-                double dmy = com_minus_y - py;
-                double dmz = com_minus_z - pz;
+                double dmx = minimum_image(com_minus_x - px, box_size, box_half);
+                double dmy = minimum_image(com_minus_y - py, box_size, box_half);
+                double dmz = minimum_image(com_minus_z - pz, box_size, box_half);
                 double rm2 = dmx*dmx + dmy*dmy + dmz*dmz + eps2;
                 double inv_rm3 = 1.0 / (rm2 * sqrt(rm2));
                 // VSL Option B: m+ feels STANDARD repulsion from m- (factor 1.0)
@@ -794,14 +916,15 @@ extern "C" __global__ void compute_forces_bvh_cross(
     const int* __restrict__ node_types,
     double* __restrict__ acc,
     int n_particles,
-    int n_internal,
     double theta,
     double softening,
-    double cross_factor
+    double cross_factor,
+    double box_size  // Box size for periodic boundary conditions
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_particles) return;
 
+    double box_half = 0.5 * box_size;
     double px = pos[tid * 3];
     double py = pos[tid * 3 + 1];
     double pz = pos[tid * 3 + 2];
@@ -829,9 +952,9 @@ extern "C" __global__ void compute_forces_bvh_cross(
         double cz = node_data[base + 2];
         double half_size = node_data[base + 3];
 
-        double dx = cx - px;
-        double dy = cy - py;
-        double dz = cz - pz;
+        double dx = minimum_image(cx - px, box_size, box_half);
+        double dy = minimum_image(cy - py, box_size, box_half);
+        double dz = minimum_image(cz - pz, box_size, box_half);
         double r2 = dx*dx + dy*dy + dz*dz;
         double r = sqrt(r2 + 1e-20);
 
@@ -845,9 +968,9 @@ extern "C" __global__ void compute_forces_bvh_cross(
                 double com_plus_x = node_data[base + 4];
                 double com_plus_y = node_data[base + 5];
                 double com_plus_z = node_data[base + 6];
-                double dpx = com_plus_x - px;
-                double dpy = com_plus_y - py;
-                double dpz = com_plus_z - pz;
+                double dpx = minimum_image(com_plus_x - px, box_size, box_half);
+                double dpy = minimum_image(com_plus_y - py, box_size, box_half);
+                double dpz = minimum_image(com_plus_z - pz, box_size, box_half);
                 double rp2 = dpx*dpx + dpy*dpy + dpz*dpz + eps2;
                 double inv_rp3 = 1.0 / (rp2 * sqrt(rp2));
                 // Same sign: attraction (1.0), Opposite sign: cross_factor
@@ -862,9 +985,9 @@ extern "C" __global__ void compute_forces_bvh_cross(
                 double com_minus_x = node_data[base + 8];
                 double com_minus_y = node_data[base + 9];
                 double com_minus_z = node_data[base + 10];
-                double dmx = com_minus_x - px;
-                double dmy = com_minus_y - py;
-                double dmz = com_minus_z - pz;
+                double dmx = minimum_image(com_minus_x - px, box_size, box_half);
+                double dmy = minimum_image(com_minus_y - py, box_size, box_half);
+                double dmz = minimum_image(com_minus_z - pz, box_size, box_half);
                 double rm2 = dmx*dmx + dmy*dmy + dmz*dmz + eps2;
                 double inv_rm3 = 1.0 / (rm2 * sqrt(rm2));
                 // Same sign: attraction (1.0), Opposite sign: cross_factor
@@ -891,7 +1014,7 @@ extern "C" __global__ void compute_forces_bvh_cross(
 // α(r) = 1 - ε×exp(-r/r_c) for opposite-sign interactions
 // At r → 0: α → 1-ε (partial attraction)
 // At r → ∞: α → 1 (standard Janus repulsion)
-// Note: n_internal = n_particles - 1 (computed internally to reduce params)
+// Note: yukawa_packed = r_c + epsilon (epsilon in fractional part, r_c in integer part)
 extern "C" __global__ void compute_forces_bvh_yukawa(
     const double* __restrict__ pos,
     const int* __restrict__ signs,
@@ -903,13 +1026,17 @@ extern "C" __global__ void compute_forces_bvh_yukawa(
     int n_particles,
     double theta,
     double softening,
-    double epsilon,   // Breaking strength (e.g., 0.3)
-    double r_c        // Characteristic scale (e.g., 40 Mpc)
+    double yukawa_packed,   // r_c (integer part) + epsilon (fractional part)
+    double box_size   // Box size for periodic boundary conditions
 ) {
-    int n_internal = n_particles - 1;  // BVH has n-1 internal nodes
+    // Unpack Yukawa parameters
+    double r_c = floor(yukawa_packed);
+    double epsilon = yukawa_packed - r_c;
+
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_particles) return;
 
+    double box_half = 0.5 * box_size;
     double px = pos[tid * 3];
     double py = pos[tid * 3 + 1];
     double pz = pos[tid * 3 + 2];
@@ -937,9 +1064,9 @@ extern "C" __global__ void compute_forces_bvh_yukawa(
         double cz = node_data[base + 2];
         double half_size = node_data[base + 3];
 
-        double dx = cx - px;
-        double dy = cy - py;
-        double dz = cz - pz;
+        double dx = minimum_image(cx - px, box_size, box_half);
+        double dy = minimum_image(cy - py, box_size, box_half);
+        double dz = minimum_image(cz - pz, box_size, box_half);
         double r2 = dx*dx + dy*dy + dz*dz;
         double r = sqrt(r2 + 1e-20);
 
@@ -953,9 +1080,9 @@ extern "C" __global__ void compute_forces_bvh_yukawa(
                 double com_plus_x = node_data[base + 4];
                 double com_plus_y = node_data[base + 5];
                 double com_plus_z = node_data[base + 6];
-                double dpx = com_plus_x - px;
-                double dpy = com_plus_y - py;
-                double dpz = com_plus_z - pz;
+                double dpx = minimum_image(com_plus_x - px, box_size, box_half);
+                double dpy = minimum_image(com_plus_y - py, box_size, box_half);
+                double dpz = minimum_image(com_plus_z - pz, box_size, box_half);
                 double rp2 = dpx*dpx + dpy*dpy + dpz*dpz + eps2;
                 double rp = sqrt(rp2);
                 double inv_rp3 = 1.0 / (rp2 * rp);
@@ -981,9 +1108,9 @@ extern "C" __global__ void compute_forces_bvh_yukawa(
                 double com_minus_x = node_data[base + 8];
                 double com_minus_y = node_data[base + 9];
                 double com_minus_z = node_data[base + 10];
-                double dmx = com_minus_x - px;
-                double dmy = com_minus_y - py;
-                double dmz = com_minus_z - pz;
+                double dmx = minimum_image(com_minus_x - px, box_size, box_half);
+                double dmy = minimum_image(com_minus_y - py, box_size, box_half);
+                double dmz = minimum_image(com_minus_z - pz, box_size, box_half);
                 double rm2 = dmx*dmx + dmy*dmy + dmz*dmz + eps2;
                 double rm = sqrt(rm2);
                 double inv_rm3 = 1.0 / (rm2 * rm);
@@ -1570,8 +1697,14 @@ impl GpuNBodySimulation {
             signs_data.push(p.sign);
         }
 
-        // Uniform masses (1.0) for new() - adaptive splitting uses new_with_masses()
-        let masses_data: Vec<f64> = vec![1.0; n_total];
+        // Cosmological mass calculation: mass_per_particle = G × M_total / N
+        // This makes forces N-independent (correct for cosmological simulations)
+        let g_cosmo = 4.499e-15;  // Mpc³/(M_sun·Gyr²) — gravitational constant
+        let rho_crit = 2.775e11;  // M_sun/Mpc³ — critical density
+        let omega_m = 0.3;        // matter fraction
+        let m_total = omega_m * rho_crit * box_size.powi(3);
+        let mass_per_particle = g_cosmo * m_total / n_total as f64;
+        let masses_data: Vec<f64> = vec![mass_per_particle; n_total];
 
         let pos = device.htod_sync_copy(&pos_data)?;
         let vel = device.htod_sync_copy(&vel_data)?;
@@ -1723,8 +1856,14 @@ impl GpuNBodySimulation {
         println!("  KE_target  = {:.4e}", ke_target);
         println!("  alpha      = {:.6}", alpha);
 
-        // Uniform masses (1.0) for new_bvh_only
-        let masses_data: Vec<f64> = vec![1.0; n_total];
+        // Cosmological mass calculation: mass_per_particle = G × M_total / N
+        // This makes forces N-independent (correct for cosmological simulations)
+        let g_cosmo = 4.499e-15;  // Mpc³/(M_sun·Gyr²) — gravitational constant
+        let rho_crit = 2.775e11;  // M_sun/Mpc³ — critical density
+        let omega_m = 0.3;        // matter fraction
+        let m_total = omega_m * rho_crit * box_size.powi(3);
+        let mass_per_particle = g_cosmo * m_total / n_total as f64;
+        let masses_data: Vec<f64> = vec![mass_per_particle; n_total];
 
         let pos = device.htod_sync_copy(&pos_data)?;
         let vel = device.htod_sync_copy(&vel_data)?;
@@ -1806,8 +1945,14 @@ impl GpuNBodySimulation {
         // SKIP particles_cpu - we use GPU BVH only, no need to keep CPU copy
         let particles_cpu = Vec::new();
 
-        // Uniform masses (1.0) for backwards compatibility
-        let masses_data: Vec<f64> = vec![1.0; n_total];
+        // Cosmological mass calculation: mass_per_particle = G × M_total / N
+        // This makes forces N-independent (correct for cosmological simulations)
+        let g_cosmo = 4.499e-15;  // Mpc³/(M_sun·Gyr²) — gravitational constant
+        let rho_crit = 2.775e11;  // M_sun/Mpc³ — critical density
+        let omega_m = 0.3;        // matter fraction
+        let m_total = omega_m * rho_crit * box_size.powi(3);
+        let mass_per_particle = g_cosmo * m_total / n_total as f64;
+        let masses_data: Vec<f64> = vec![mass_per_particle; n_total];
 
         let pos = device.htod_sync_copy(&positions)?;
         let vel = device.htod_sync_copy(&velocities)?;
@@ -1982,6 +2127,23 @@ impl GpuNBodySimulation {
         self.softening = softening;
     }
 
+    /// Scale all particle masses by a factor (for Janus physics correction)
+    /// Call after construction: sim.set_mass_factor(omega_b * (1.0 + mu) / 0.3)
+    pub fn set_mass_factor(&mut self, factor: f64) {
+        // Download masses from GPU
+        let mut masses_host = self.device.dtoh_sync_copy(&self.masses).unwrap();
+
+        // Scale all masses
+        for m in masses_host.iter_mut() {
+            *m *= factor;
+        }
+
+        // Upload back to GPU
+        self.masses = self.device.htod_sync_copy(&masses_host).unwrap();
+
+        println!("  [MASS] Scaled all masses by factor {:.4}", factor);
+    }
+
     /// Get current softening length
     pub fn get_softening(&self) -> f64 {
         self.softening
@@ -2080,14 +2242,15 @@ impl GpuNBodySimulation {
         let leapfrog = self.device.get_func("nbody", "leapfrog_kick_drift")
             .ok_or("Failed to get leapfrog_kick_drift kernel")?;
 
-        // Compute forces (12 args with VSL c_ratio_sq + repulsion_scale)
+        // Compute forces (12 args with VSL c_ratio_sq + repulsion_scale + box_size)
         unsafe {
             compute_forces.clone().launch(cfg, (
                 &self.pos, &self.signs,
                 &self.node_data, &self.node_children, &self.node_types,
                 &mut self.acc,
-                self.n_particles as i32, self.n_nodes as i32,
+                self.n_particles as i32,
                 self.theta, self.softening, self.c_ratio_sq, self.repulsion_scale,
+                self.box_size,  // Periodic boundary conditions
             ))?;
         }
 
@@ -2197,8 +2360,9 @@ impl GpuNBodySimulation {
                 &self.pos, &self.signs,
                 &self.node_data, &self.node_children, &self.node_types,
                 &mut self.acc,
-                self.n_particles as i32, self.n_nodes as i32,
+                self.n_particles as i32,
                 self.theta, self.softening, self.c_ratio_sq, self.repulsion_scale,
+                self.box_size,  // Periodic boundary conditions
             ))?;
         }
 
@@ -2511,9 +2675,13 @@ impl GpuNBodySimulation {
         }
         self.device.synchronize()?;
 
-        // Step 7: Bottom-up COM reduction
+        // Step 7: Bottom-up COM reduction with diagnostics
         let reduce_kernel = self.device.get_func("nbody", "reduce_com")
             .ok_or("Failed to get reduce_com kernel")?;
+
+        // Allocate diagnostic counters: [nodes_processed, both_mplus, boundary_cross_mplus, both_mminus, boundary_cross_mminus]
+        let mut diag_counters = self.device.alloc_zeros::<i32>(5)?;
+
         unsafe {
             reduce_kernel.launch(cfg, (
                 &self.bvh_left_child,
@@ -2526,9 +2694,19 @@ impl GpuNBodySimulation {
                 &mut self.bvh_atomic_counter,
                 n as i32,
                 box_half,
+                &mut diag_counters,
             ))?;
         }
         self.device.synchronize()?;
+
+        // Read back and print diagnostics (only on first few calls)
+        static DIAG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let count = DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if count < 3 {
+            let diag = self.device.dtoh_sync_copy(&diag_counters)?;
+            println!("[DIAG reduce_com #{}] nodes={}, both_m+={}, boundary_m+={}, both_m-={}, boundary_m-={}",
+                count, diag[0], diag[1], diag[2], diag[3], diag[4]);
+        }
 
         Ok(())
     }
@@ -2693,6 +2871,7 @@ impl GpuNBodySimulation {
         let reduce_kernel = self.device.get_func("nbody", "reduce_com")
             .ok_or("Failed to get reduce_com kernel")?;
         unsafe {
+            let mut diag_counters = self.device.alloc_zeros::<i32>(5)?;
             reduce_kernel.launch(cfg, (
                 &self.bvh_left_child,
                 &self.bvh_right_child,
@@ -2704,6 +2883,7 @@ impl GpuNBodySimulation {
                 &mut self.bvh_atomic_counter,
                 n as i32,
                 box_half,
+                &mut diag_counters,
             ))?;
         }
         self.device.synchronize()?;
@@ -2778,6 +2958,7 @@ impl GpuNBodySimulation {
         // Step 3: Bottom-up COM reduction
         let reduce_kernel = self.device.get_func("nbody", "reduce_com")
             .ok_or("Failed to get reduce_com kernel")?;
+        let mut diag_counters = self.device.alloc_zeros::<i32>(5)?;
         unsafe {
             reduce_kernel.launch(cfg, (
                 &self.bvh_left_child,
@@ -2790,6 +2971,7 @@ impl GpuNBodySimulation {
                 &mut self.bvh_atomic_counter,
                 n as i32,
                 box_half,
+                &mut diag_counters,
             ))?;
         }
         self.device.synchronize()?;
@@ -2844,10 +3026,10 @@ impl GpuNBodySimulation {
                 &self.bvh_node_types,
                 &mut self.acc,
                 n as i32,
-                (n - 1) as i32,  // n_internal
                 self.theta,
                 self.softening,
                 self.c_ratio_sq,  // VSL: (c_minus/c_plus)^2
+                self.box_size,    // Periodic boundary conditions
             ))?;
         }
 
@@ -2922,10 +3104,10 @@ impl GpuNBodySimulation {
                 &self.bvh_node_types,
                 &mut self.acc,
                 n as i32,
-                (n - 1) as i32,  // n_internal
                 self.theta,
                 self.softening,
                 cross_factor,  // Cross-sign interaction factor
+                self.box_size, // Periodic boundary conditions
             ))?;
         }
 
@@ -2992,6 +3174,8 @@ impl GpuNBodySimulation {
         self.build_gpu_tree()?;
 
         // Step 3: Compute forces with Yukawa-screened interaction
+        // Pack epsilon and r_c: yukawa_packed = r_c (integer) + epsilon (fractional)
+        let yukawa_packed = r_c.floor() + epsilon;
         unsafe {
             force_kernel.launch(cfg, (
                 &self.pos,
@@ -3004,8 +3188,8 @@ impl GpuNBodySimulation {
                 n as i32,
                 self.theta,
                 self.softening,
-                epsilon,
-                r_c,
+                yukawa_packed,
+                self.box_size, // Periodic boundary conditions
             ))?;
         }
 
@@ -3093,10 +3277,10 @@ impl GpuNBodySimulation {
                 &self.bvh_node_types,
                 &mut self.acc,
                 n as i32,
-                (n - 1) as i32,  // n_internal
                 self.theta,
                 self.softening,
                 self.c_ratio_sq,  // VSL: (c_minus/c_plus)^2
+                self.box_size,    // Periodic boundary conditions
             ))?;
         }
 
@@ -3288,12 +3472,14 @@ impl GpuNBodySimulation {
         // Step 7: COM reduction
         let reduce_kernel = self.device.get_func("nbody", "reduce_com")
             .ok_or("Failed to get reduce_com")?;
+        let mut diag_counters = self.device.alloc_zeros::<i32>(5)?;
         unsafe {
             reduce_kernel.launch(cfg, (
                 &buf.left_child, &buf.right_child, &buf.parent,
                 &buf.range_left, &buf.range_right,
                 &mut buf.node_data, &mut buf.node_types, &mut buf.atomic_counter,
                 n as i32, box_half,
+                &mut diag_counters,
             ))?;
         }
         self.device.synchronize()?;
@@ -3375,10 +3561,10 @@ impl GpuNBodySimulation {
                     &buf.node_types,
                     &mut self.acc,
                     n as i32,
-                    (n - 1) as i32,
                     self.theta,
                     self.softening,
                     self.c_ratio_sq,  // VSL: (c_minus/c_plus)^2
+                    self.box_size,    // Periodic boundary conditions
                 ))?;
             }
         }
@@ -3473,8 +3659,9 @@ impl GpuNBodySimulation {
                 &self.pos, &self.signs,
                 &self.node_data, &self.node_children, &self.node_types,
                 &mut self.acc,
-                self.n_particles as i32, self.n_nodes as i32,
+                self.n_particles as i32,
                 self.theta, self.softening, self.c_ratio_sq, self.repulsion_scale,
+                self.box_size,  // Periodic boundary conditions
             ))?;
         }
 
@@ -3854,10 +4041,10 @@ impl GpuNBodySimulation {
                 &self.bvh_node_types,
                 &mut self.acc,
                 n as i32,
-                (n - 1) as i32,
                 self.theta,
                 self.softening,
                 self.c_ratio_sq,  // VSL: (c_minus/c_plus)^2
+                self.box_size,    // Periodic boundary conditions
             ))?;
         }
         self.device.synchronize()?;
@@ -3890,8 +4077,9 @@ impl GpuNBodySimulation {
                 &self.pos, &self.signs,
                 &self.node_data, &self.node_children, &self.node_types,
                 &mut self.acc,
-                n as i32, self.n_nodes as i32,
+                n as i32,
                 self.theta, self.softening, self.c_ratio_sq, self.repulsion_scale,
+                self.box_size,  // Periodic boundary conditions
             ))?;
         }
         self.device.synchronize()?;

@@ -14,9 +14,11 @@ pub mod nbody;
 pub mod analysis;
 pub mod baryonic;
 pub mod power_spectrum;
+pub mod ic_gen;
 pub mod lensing;
 pub mod rotation_curves;
 pub mod peculiar_velocity;
+pub mod snapshot_v3;
 
 #[cfg(feature = "cuda")]
 pub mod nbody_gpu;
@@ -29,6 +31,10 @@ pub mod nbody_gpu_twopass;
 
 #[cfg(feature = "cuda")]
 pub mod sph_pressure_gpu;
+
+// Native CUDA cooling (replaces Grackle for GPU performance)
+#[cfg(feature = "cuda")]
+pub mod cooling_gpu;
 
 // TreePM module uses rustfft (CPU) for initial implementation
 // GPU cuFFT optimization planned after architecture validation

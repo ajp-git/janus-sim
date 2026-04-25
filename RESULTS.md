@@ -23,6 +23,50 @@
 
 ---
 
+## ANALYSE COOLING KERNEL — 13 avril 2026
+
+### Problème identifié
+Les fits Cen 1992 originaux (Lambda_H, Lambda_He, Lambda_ff) étaient **100-10000× trop élevés** par rapport à Sutherland & Dopita 1993 (référence standard).
+
+### Tests AI corrections (REJETÉS)
+4 versions testées, TOUTES échouent :
+
+| Fit | err_max | Verdict |
+|-----|---------|---------|
+| base (Cen 1992) | 63935% | REJETÉ |
+| ChatGPT (gaussienne additive) | 63935% | REJETÉ |
+| Gemini (multiplicative log) | 63935% | REJETÉ |
+| Mistral (asymétrique) | >10^15% | REJETÉ |
+
+**Cause :** Les corrections supposaient un fit de base proche de S&D93, mais le fit était fondamentalement faux (mauvais coefficients).
+
+### Solution implémentée
+Remplacement du fit analytique par **S&D93 Table 6 tabulée** :
+- 24 points log-linéaires interpolés
+- Gaz primordial CIE (H + He, Z = 0)
+- Erreur max: **1.7%** vs S&D93 ✓
+
+### Validation finale
+
+| T (K) | S&D93 | Kernel | Ratio | Zone |
+|-------|-------|--------|-------|------|
+| 10^4 | 3.47e-25 | 3.47e-25 | 0.999 | Lower bound |
+| 3.16×10^4 | 1.29e-22 | 1.28e-22 | 0.996 | Ly-α peak |
+| 10^5 | 5.75e-23 | 5.75e-23 | 1.001 | He recombinaison |
+| 10^6 | 1.78e-23 | 1.78e-23 | 0.999 | He plateau |
+| 10^8 | 1.10e-22 | 1.10e-22 | 0.997 | Bremsstrahlung |
+
+**Caractéristiques validées :**
+- Pic Lyman-alpha : T = 4×10^4 K, Λ = 1.6×10^-22 erg cm³/s ✓
+- Pente haute-T : 0.51 (attendu ~0.5 pour Bremsstrahlung) ✓
+
+**Fichiers modifiés :**
+- `cuda/cooling_kernel.cu` — S&D93 tabulé implémenté
+- `cuda/cooling_validation.cu` — 4 fits de test (historique)
+- `tests/test_cooling_*.py` — suite de validation
+
+---
+
 ## ⚠️ BUGS CRITIQUES DOCUMENTÉS
 
 ### BUG-001 : Asymétrie ICs Zel'dovich (13 avril 2026)
@@ -507,3 +551,294 @@ Binary: `janus_baryonic_calibrated`
 
 *Fichier créé le 12 avril 2026 — mis à jour automatiquement par CLI*
 *Ne jamais modifier manuellement — CLI gère toutes les mises à jour*
+
+---
+
+## RUN 10M BARYONIC — COOLING-ONLY (13 avril 2026)
+
+### Configuration
+
+| Paramètre | Valeur |
+|---|---|
+| N_particles | 10,077,696 |
+| L_box | 500 Mpc |
+| η | 1.045 |
+| z_init → z_final | 4.0 → 0.0 |
+| Steps | 30,000 |
+| dt | 0.001 Gyr |
+| θ (Barnes-Hut) | 0.7 |
+| ε (softening) | 0.1 Mpc |
+| ICs | Zel'dovich single-seed (42) |
+| Cooling | S&D93 GPU native (validated <2%) |
+| Star Formation | **DISABLED** (seuil n_H=30 cm⁻³ irréaliste) |
+
+### Bug découvert: Seuil SF impossible
+
+```
+n_H = 2e-7 × (1+z)³ × overdensity [cm⁻³]
+
+À z=4 avec overdensity=10.8:
+  n_H_max = 2.7e-4 cm⁻³
+
+Seuil SF requis: n_H > 30 cm⁻³
+  → Overdensity requise: 1.2e6 (impossible)
+  → SF ne déclenche JAMAIS
+
+FIX pour prochain run: OVERDENSITY_THRESHOLD = 5.0
+```
+
+### Évolution observée (z=4 → z=0.65)
+
+| Step | z | v_rms+ | v_rms- | ratio | S | ρ_max+ |
+|------|---|--------|--------|-------|---|--------|
+| 0 | 4.00 | 749 | 749 | 1.00 | 0.13 | 46 |
+| 1000 | 2.65 | 9,230 | 10,610 | 1.15 | 0.38 | 92 |
+| 2000 | 1.46 | 20,320 | 23,870 | 1.17 | 0.49 | 136 |
+| 3000 | 0.84 | 27,650 | 29,350 | 1.06 | 0.66 | 243 |
+| 3660 | 0.65 | 38,870 | 34,070 | **0.88** | 0.76 | 741 |
+
+### Observation majeure: Inversion du ratio
+
+Le ratio v_rms-/v_rms+ a **inversé** autour de z~0.8:
+- z>1: ratio > 1 (m- plus rapide que m+)
+- z<0.8: ratio < 1 (m+ plus rapide que m-)
+
+**Cause probable:** Le cooling S&D93 est actif uniquement sur m+, mais à basse
+densité (n_H < 0.01 cm⁻³) le cooling est désactivé (density floor). Cependant,
+les régions denses (ρ_max+ = 741) commencent à refroidir, ce qui pourrait
+affecter la dynamique.
+
+**Hypothèse alternative:** Sans SF pour dissiper l'énergie, m+ accumule de
+l'énergie cinétique dans les puits de potentiel. L'anti-gravité Janus crée
+des structures où m+ et m- ont des dynamiques différentes.
+
+### Métriques notables
+
+- **S = 0.76** : Ségrégation spatiale très élevée
+- **Corr(δ+,δ-) = -0.20** : Anti-corrélation confirmée
+- **ρ_max+ = 741** : Surdensités x35 par rapport au départ
+- **N_stars = 0** : Aucune formation stellaire (bug seuil)
+- **T_mean = 10,000 K** : Cooling inactif à basse densité
+
+### Fichiers
+
+- `output/janus_baryonic_calibrated/time_series.csv`
+- `output/janus_baryonic_calibrated/snapshots/snap_*.bin`
+- `output/janus_baryonic_calibrated/frame_step02960.png`
+
+### Statut
+
+✅ **TERMINÉ** — 14 avril 2026, 07:15 UTC+2
+
+### Arrêt du run
+
+| Paramètre | Valeur |
+|-----------|--------|
+| z_final | **0.359** |
+| Step final | 5165 |
+| Snapshots | 1034 |
+| Durée totale | ~20 heures |
+| Cause arrêt | **Clustering excessif → tree rebuild exponentiellement lent** |
+
+**Diagnostic performance:**
+```
+Step 5070-5075: 8 min / 5 steps
+Step 5140-5145: 26 min / 5 steps
+Step 5160-5165: 35 min / 5 steps
+Extrapolation: ~120 jours pour atteindre z=0
+```
+
+### Snapshot final
+
+```
+Fichier: snap_05165_FINAL.bin (240 MB)
+SHA-256: ed9d6fa01b40eff287a4a7e61c93c19482ad144ccce689ed99bbe5e4fb550a9f
+```
+
+### Métriques finales (z = 0.36)
+
+| Métrique | Valeur |
+|----------|--------|
+| ρ_max+ | **105,412** |
+| S (ségrégation) | **0.9826** |
+| N_proto_stars (cluster #1) | 65,066 à z=0.42 |
+
+Ce run reste scientifiquement valide pour:
+- Dynamique gravitationnelle Janus
+- Ségrégation m+/m-
+- Évolution du ratio v_rms
+- Test du kernel cooling S&D93 (même si inactif à basse densité)
+
+**TODO prochain run:**
+- Fixer `OVERDENSITY_THRESHOLD_SF = 5.0`
+- Ou `N_THRESHOLD_SF = 1e-4` cm⁻³
+
+---
+
+## STELLAR POST-PROCESSING (13 avril 2026)
+
+### Méthode
+
+Post-traitement des 787 snapshots pour identifier les candidats proto-étoiles.
+
+**Critères SF appliqués rétroactivement:**
+- Overdensité > 5.0 (vs. densité moyenne)
+- Divergence vélocité < 0 (régions en collapse)
+
+**Implémentation:**
+- `src/bin/stellar_postprocessing.rs` — Rust + kiddo (k-NN) + rayon
+- k-NN neighbors: 32
+- Sample: 10% des particules m+ (~515,000 par snapshot)
+- Temps d'exécution: **15 minutes** (vs. estimé >24h en Python)
+
+### Résultats clés
+
+| Redshift | Step | Proto-stars | % Sample | Mean δ | % Collapsing |
+|----------|------|-------------|----------|--------|--------------|
+| z=4.0 | 0 | 0 | 0% | 1.1 | 54% |
+| z=1.55 | 1480 | 1 | 0% | 1.3 | 67% |
+| z=1.07 | 2340 | 59,000 | 11.5% | 2.0 | 64% |
+| z=0.88 | 2835 | 128,000 | 24.9% | 5.0 | 64% |
+| z=0.58 | 3930 | 209,209 | **40.6%** | 28.7 | 64% |
+
+### Interprétation
+
+1. **Première proto-étoile**: z=1.55 (step 1480)
+   - Début de la formation de structures suffisamment denses
+
+2. **Onset formation stellaire massive**: z~1.0 (step 2340)
+   - Overdensité moyenne dépasse 2.0
+   - ~11.5% des particules satisfont les critères SF
+
+3. **Transition rapide**: z=1.0 → z=0.6
+   - Proto-stars: 11% → 40% en 1600 steps
+   - Overdensité: 2.0 → 28.7
+
+4. **Fraction collapsing stable**: ~64%
+   - Indépendant du redshift
+   - Indicateur que la structure est en régime quasi-stationnaire
+
+### Conclusion
+
+**Même sans SF en temps réel, 40% des particules m+ auraient formé des étoiles**
+si le seuil avait été correctement calibré (OVERDENSITY > 5.0).
+
+Le run cooling-only a démontré que:
+- La dynamique gravitationnelle Janus produit des structures
+- Les overdensités atteignent des valeurs suffisantes pour la SF
+- Le ratio v_rms s'inverse autour de z~0.8 (phénomène à investiguer)
+
+### Fichiers
+
+- `output/janus_baryonic_calibrated/stellar_evolution.csv` — 787 lignes
+- `src/bin/stellar_postprocessing.rs` — Rust post-processing tool
+
+---
+
+## CLUSTER ANALYSIS — FOF + Velocity Profiles (13 avril 2026)
+
+### Méthode
+
+Identification des amas de proto-galaxies par Friends-of-Friends (FOF) sur les proto-étoiles.
+
+**IMPORTANT:** Les objets identifiés sont des **AMAS** (échelle Mpc), pas des galaxies individuelles (échelle kpc). À la résolution de cette simulation (500 Mpc / 10M particules), les galaxies individuelles ne sont pas résolues.
+
+**Paramètres FOF:**
+- Linking length: 0.5 Mpc (échelle amas)
+- Minimum particles: 100 proto-étoiles par amas
+- Snapshot analysé: step 4645, z = 0.44
+
+**Corrections d'unités appliquées:**
+
+| Paramètre | Valeur erronée | Valeur corrigée |
+|-----------|----------------|-----------------|
+| G constant | 4.302e-6 × 1000 | **4.302e-9** Mpc·(km/s)²/M☉ |
+| m_particle | 1.7e9 M☉ | **5.1e11** M☉ |
+
+Calcul masse particule:
+```
+M_box = Ω_m × ρ_crit × h² × V
+      = 0.3 × 2.78e11 × 0.49 × (500)³
+      = 5.1e18 M☉
+
+m_particle = M_box / N = 5.1e18 / 10^7 = 5.1e11 M☉
+```
+
+### Résultats (z = 0.44)
+
+| Métrique | Valeur |
+|----------|--------|
+| Proto-étoiles identifiées | 2,520,285 (48.9% de m+) |
+| Groupes FOF | 1,511,691 |
+| Amas (N ≥ 100) | 552 |
+| Masse stellaire totale | 5.94 × 10¹⁶ M☉ |
+
+**Top 5 amas:**
+
+| Amas | N_proto | R_half (Mpc) | M_* (M☉) | v_circ max (km/s) |
+|------|---------|--------------|----------|-------------------|
+| #1 | 4,399 | 3.63 | 2.24e15 | 1864 |
+| #2 | 4,197 | 3.40 | 2.14e15 | ~1800 |
+| #3 | 3,707 | 2.64 | 1.89e15 | ~1600 |
+| #4 | 3,014 | 3.74 | 1.54e15 | ~1500 |
+| #5 | 2,861 | 3.70 | 1.46e15 | ~1400 |
+
+### Validation physique
+
+**v_circ ~ 1000-2000 km/s** → Cohérent avec les dispersions de vitesse des amas de galaxies ✓
+
+Comparaison:
+- Amas Coma: M ~ 7×10¹⁴ M☉, σ ~ 1000 km/s
+- Nos amas Janus: M ~ 2×10¹⁵ M☉, v_circ ~ 1800 km/s ✓
+
+### Observation clé: Expulsion de m-
+
+Les profils de densité montrent **ρ- ≈ 0** dans les cœurs des amas:
+
+```
+r = 0.1 Mpc:  n+ = 2,   n- = 0   → ρ-/ρ+ = 0
+r = 1.0 Mpc:  n+ = 66,  n- = 0   → ρ-/ρ+ = 0
+r = 5.0 Mpc:  n+ = 500, n- = 0   → ρ-/ρ+ = 0
+```
+
+**Interprétation physique:**
+L'anti-gravité Janus **expulse** la matière m- des régions surdenses.
+Les amas sont constitués de m+ quasi-pur, avec m- formant des coques diffuses à grand rayon.
+
+Ceci explique:
+1. **Profils de vitesse croissants** — pas de masse négative pour réduire M_eff
+2. **Concentration de masse** — m+ s'effondre sans opposition
+3. **Formation de vides** — m- s'accumule dans les régions sous-denses
+
+### Courbes de vitesse
+
+La vitesse circulaire est calculée comme:
+```
+v_circ(r) = sqrt(G × M_eff(r) / r)
+
+où M_eff = M_enc_plus - M_enc_minus  (contribution Janus)
+```
+
+Dans les amas observés, M_enc_minus ≈ 0 donc M_eff ≈ M_enc_plus.
+Les courbes sont **monotonement croissantes** (pas de plateau),
+ce qui est attendu pour des amas en formation à z=0.44.
+
+### Fichiers
+
+```
+output/janus_baryonic_calibrated/cluster_analysis/
+├── cluster_catalog.csv              — 100 amas
+├── velocity_profile_cl[1-5].csv     — profils radiaux
+├── proto_stars.csv                  — 2.5M positions
+├── all_particles.csv                — 100k subsampled
+├── janus_clusters_z044.png          — figure 4 panneaux
+└── velocity_profiles_corrected.png  — courbes détaillées
+```
+
+### Code
+
+- `src/bin/galaxy_analysis.rs` — Rust + kiddo + rayon
+  - FOF clustering avec Union-Find
+  - Profils de vitesse avec k-NN density estimation
+  - Temps d'exécution: ~3 minutes pour snapshot complet
+

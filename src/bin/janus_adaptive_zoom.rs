@@ -106,6 +106,23 @@ struct Args {
     /// Barnes-Hut opening angle θ
     #[arg(long, default_value = "0.7")]
     theta: f64,
+
+    /// Zoom cube size in Mpc (0 = disabled, splits anywhere based on density)
+    /// If > 0, only particles inside [-size/2, +size/2]³ centered at origin can split
+    #[arg(long, default_value = "0.0")]
+    zoom_cube_size: f64,
+
+    /// Maximum split level (strict limit to prevent runaway splitting)
+    #[arg(long, default_value = "2")]
+    max_split_level: u8,
+
+    /// Split threshold for level 0→1 (M_sun/Mpc³). Default ~10× ρ_plus_mean
+    #[arg(long, default_value = "6.78e10")]
+    delta_split_l1: f64,
+
+    /// Split threshold for level 1→2 (M_sun/Mpc³). Default ~100× ρ_plus_mean
+    #[arg(long, default_value = "6.78e11")]
+    delta_split_l2: f64,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -340,18 +357,28 @@ fn blue_noise_daughters(center: [f32; 3], radius: f32, rng: &mut impl Rng) -> [[
 /// Returns number of new particles created
 /// Adaptive split check with thermal history preservation.
 ///
+/// Arguments:
+///   state: Adaptive state with particles
+///   densities_plus: ρ_plus at each particle location (m+ density field)
+///   delta_split_l1: threshold for level 0→1 splits
+///   delta_split_l2: threshold for level 1→2 splits
+///   max_split_level: maximum allowed split level (strict limit)
+///   zoom_cube_size: if > 0, only split particles inside [-size/2, +size/2]³
+///   rng: random number generator for daughter placement
+///   u_plus_old: internal energy array for m+ particles BEFORE split
+///
 /// Returns:
 ///   n_new: number of daughter particles created (= 8 * n_split_events)
 ///   u_new: internal energy array for m+ particles, aligned with the NEW order
 ///          of m+ particles in state.particles after the split.
 ///          Each daughter inherits its parent's u.
-///
-/// u_plus_old: internal energy array for m+ particles BEFORE split, aligned
-///             with the ORIGINAL order of m+ in state.particles.
 fn adaptive_split_check_with_thresholds(
     state: &mut AdaptiveState,
-    densities: &[f64],
-    delta_split: &[f64; 10],
+    densities_plus: &[f64],
+    delta_split_l1: f64,
+    delta_split_l2: f64,
+    max_split_level: u8,
+    zoom_cube_size: f64,
     rng: &mut impl Rng,
     u_plus_old: &[f64],
 ) -> (usize, Vec<f64>) {
@@ -376,14 +403,26 @@ fn adaptive_split_check_with_thresholds(
     }
 
     let mut to_split: Vec<usize> = Vec::new();
+    let zoom_half = zoom_cube_size / 2.0;
 
     // Find m+ particles that need splitting
     for (i, p) in state.particles.iter().enumerate() {
         if p.sign != 1 { continue; }  // Only split m+
-        if p.split_level >= 9 { continue; }  // Max level reached
+        if p.split_level >= max_split_level { continue; }  // Max level reached (strict limit)
 
-        let threshold = delta_split[p.split_level as usize];
-        if densities[i] > threshold {
+        // Spatial condition: if zoom is enabled, particle must be inside zoom cube
+        if zoom_cube_size > 0.0 {
+            let px = p.pos[0] as f64;
+            let py = p.pos[1] as f64;
+            let pz = p.pos[2] as f64;
+            if px.abs() > zoom_half || py.abs() > zoom_half || pz.abs() > zoom_half {
+                continue;  // Outside zoom zone → no split
+            }
+        }
+
+        // Density threshold based on current split level (uses ρ_plus, not ρ_total)
+        let threshold = if p.split_level == 0 { delta_split_l1 } else { delta_split_l2 };
+        if densities_plus[i] > threshold {
             to_split.push(i);
         }
     }
@@ -487,15 +526,22 @@ fn adaptive_split_check_with_thresholds(
 // ═══════════════════════════════════════════════════════════════════════════
 // DENSITY COMPUTATION (Grid-based for now, SPH later)
 // ═══════════════════════════════════════════════════════════════════════════
-fn compute_densities(particles: &[ParticleV3], box_size: f64) -> Vec<f64> {
+
+/// Compute separate density fields for m+ and m- particles.
+/// Returns (densities_plus, densities_minus, rho_plus_max, rho_minus_max)
+/// where densities_X[i] is the density at particle i's location for population X.
+fn compute_densities_split(particles: &[ParticleV3], box_size: f64) -> (Vec<f64>, Vec<f64>, f64, f64) {
     let grid_size = 64;
     let cell_size = box_size / grid_size as f64;
     let cell_vol = cell_size.powi(3);
+    let n_cells = grid_size * grid_size * grid_size;
 
-    // Count particles per cell
-    let mut grid = vec![0.0f64; grid_size * grid_size * grid_size];
+    // Separate grids for m+ and m-
+    let mut grid_plus = vec![0.0f64; n_cells];
+    let mut grid_minus = vec![0.0f64; n_cells];
     let box_half = box_size / 2.0;
 
+    // Accumulate mass per cell, separated by sign
     for p in particles {
         let x = ((p.pos[0] as f64 + box_half) / cell_size) as usize;
         let y = ((p.pos[1] as f64 + box_half) / cell_size) as usize;
@@ -506,16 +552,31 @@ fn compute_densities(particles: &[ParticleV3], box_size: f64) -> Vec<f64> {
         let z = z.min(grid_size - 1);
 
         let idx = x + y * grid_size + z * grid_size * grid_size;
-        grid[idx] += p.mass as f64;
+        let m = p.mass as f64;
+
+        if p.sign == 1 {
+            grid_plus[idx] += m;
+        } else {
+            grid_minus[idx] += m;
+        }
     }
 
     // Convert to density
-    for v in &mut grid {
+    for v in &mut grid_plus {
+        *v /= cell_vol;
+    }
+    for v in &mut grid_minus {
         *v /= cell_vol;
     }
 
-    // Assign density to each particle
-    let mut densities = Vec::with_capacity(particles.len());
+    // Find max densities
+    let rho_plus_max = grid_plus.iter().cloned().fold(0.0f64, f64::max);
+    let rho_minus_max = grid_minus.iter().cloned().fold(0.0f64, f64::max);
+
+    // Assign density to each particle (both populations)
+    let mut densities_plus = Vec::with_capacity(particles.len());
+    let mut densities_minus = Vec::with_capacity(particles.len());
+
     for p in particles {
         let x = ((p.pos[0] as f64 + box_half) / cell_size) as usize;
         let y = ((p.pos[1] as f64 + box_half) / cell_size) as usize;
@@ -526,11 +587,13 @@ fn compute_densities(particles: &[ParticleV3], box_size: f64) -> Vec<f64> {
         let z = z.min(grid_size - 1);
 
         let idx = x + y * grid_size + z * grid_size * grid_size;
-        densities.push(grid[idx]);
+        densities_plus.push(grid_plus[idx]);
+        densities_minus.push(grid_minus[idx]);
     }
 
-    densities
+    (densities_plus, densities_minus, rho_plus_max, rho_minus_max)
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SNAPSHOT V3 SAVE
@@ -988,30 +1051,14 @@ fn generate_zeldovich_ics(n_grid: usize, l_box: f64, z_init: f64, h0: f64, mu: f
 fn main() {
     let args = Args::parse();
 
-    // Compute ρ_mean_plus for density-independent thresholds
+    // Compute ρ_mean_plus for reference (informational logging)
     let rho_crit = 2.775e11 * (args.h0 / 100.0).powi(2);  // M☉/Mpc³
     let rho_mean_plus = args.omega_b * rho_crit;  // ≈ 6.78e9 M☉/Mpc³
-
-    // Build delta_split array: multiples of ρ_mean_plus
-    // First split at 10,000× ρ_mean = 6.78e13 M☉/Mpc³
-    // ICs have ρ_max ≈ 3e12 → factor 22× below threshold → no split at z=10
-    let delta_split: [f64; 10] = [
-        rho_mean_plus * 1.0e4,   // level 0→1 : ×10,000 — real collapse start
-        rho_mean_plus * 3.0e4,   // level 1→2 : ×30,000
-        rho_mean_plus * 1.0e5,   // level 2→3 : ×100,000
-        rho_mean_plus * 3.0e5,   // level 3→4 : ×300,000
-        rho_mean_plus * 1.0e6,   // level 4→5 : ×1,000,000
-        rho_mean_plus * 3.0e6,   // level 5→6 : ×3,000,000
-        rho_mean_plus * 1.0e7,   // level 6→7 : ×10,000,000
-        rho_mean_plus * 3.0e7,   // level 7→8 : ×30,000,000
-        rho_mean_plus * 1.0e8,   // level 8→9 : ×100,000,000
-        rho_mean_plus * 3.0e8,   // level 9→10 : ×300,000,000
-    ];
 
     let n_particles_init = args.n_grid * args.n_grid * args.n_grid;
 
     println!("╔══════════════════════════════════════════════════════════════════════════╗");
-    println!("║           JANUS ADAPTIVE ZOOM — Production Run                           ║");
+    println!("║           JANUS ADAPTIVE ZOOM — Production Run (v8)                      ║");
     println!("╠══════════════════════════════════════════════════════════════════════════╣");
     println!("║  COSMOLOGY: μ = {}, η = {}", args.mu, ETA);
     println!("║    H₀ = {} km/s/Mpc, Ω_b = {}", args.h0, args.omega_b);
@@ -1022,11 +1069,17 @@ fn main() {
     println!("║    z_init = {} → z_final = {}, dt = {} Gyr", args.z_init, args.z_final, args.dt_max);
     println!("║    θ = {}, η = {}", args.theta, args.eta);
     println!("╠══════════════════════════════════════════════════════════════════════════╣");
-    println!("║  ADAPTIVE SPLITTING:");
-    println!("║    Check every {} steps", args.steps_check);
+    println!("║  ADAPTIVE SPLITTING (v8: ρ_plus threshold + spatial zoom):");
+    println!("║    Check every {} steps, max_split_level = {}", args.steps_check, args.max_split_level);
     println!("║    ρ_mean_plus = {:.2e} M☉/Mpc³", rho_mean_plus);
-    println!("║    δ_split[0] = {:.2e} M☉/Mpc³ (×10⁴ ρ_mean)", delta_split[0]);
-    println!("║    δ_split[5] = {:.2e} M☉/Mpc³ (×3×10⁶ ρ_mean)", delta_split[5]);
+    println!("║    δ_split_L1 = {:.2e} M☉/Mpc³ (level 0→1)", args.delta_split_l1);
+    println!("║    δ_split_L2 = {:.2e} M☉/Mpc³ (level 1→2)", args.delta_split_l2);
+    if args.zoom_cube_size > 0.0 {
+        println!("║    ZOOM CUBE: [{:.0}, +{:.0}]³ Mpc (size={} Mpc)",
+            -args.zoom_cube_size / 2.0, args.zoom_cube_size / 2.0, args.zoom_cube_size);
+    } else {
+        println!("║    ZOOM: disabled (splits anywhere based on ρ_plus)");
+    }
     println!("╠══════════════════════════════════════════════════════════════════════════╣");
     println!("║  OUTPUT: {} (v3 format)", args.out_dir);
     println!("║    Snapshots every {} steps, Label: {}", args.snap_interval, args.run_label);
@@ -1107,7 +1160,7 @@ fn main() {
     // CSV output
     let csv_path = format!("{}/time_series.csv", args.out_dir);
     let mut csv = BufWriter::new(File::create(&csv_path).unwrap());
-    writeln!(csv, "step,t_Gyr,z,a,N_total,N_hr,split_max,rho_max,v_rms").unwrap();
+    writeln!(csv, "step,t_Gyr,z,a,N_total,N_hr,split_max,rho_max,v_rms,rho_plus_max").unwrap();
 
     println!("\n[3/5] Starting main loop (z={} → z={})...\n", args.z_init, args.z_final);
 
@@ -1135,9 +1188,12 @@ fn main() {
             let vel = gpu_sim.get_velocities().unwrap();
             state.sync_from_gpu(&pos, &vel);
 
-            // Compute densities
-            let densities = compute_densities(&state.particles, args.l_box);
-            let rho_max = densities.iter().cloned().fold(0.0f64, f64::max);
+            // Compute densities (separated by sign for proper Janus splitting)
+            let (densities_plus, densities_minus, rho_plus_max, _rho_minus_max) =
+                compute_densities_split(&state.particles, args.l_box);
+            let rho_max = densities_plus.iter().zip(densities_minus.iter())
+                .map(|(a, b)| a + b)
+                .fold(0.0f64, f64::max);
 
             // v_rms
             let v_rms: f64 = {
@@ -1147,7 +1203,7 @@ fn main() {
                 (sum / state.particles.len() as f64).sqrt() * MPC_GYR_TO_KMS
             };
 
-            // Adaptive split check
+            // Adaptive split check (uses ρ_plus for threshold, not ρ_total)
             if do_split {
                 let n_before = state.particles.len();
 
@@ -1156,7 +1212,14 @@ fn main() {
                     .expect("Failed to read internal energy before split");
 
                 let (n_new, u_new) = adaptive_split_check_with_thresholds(
-                    &mut state, &densities, &delta_split, &mut rng_split, &u_old,
+                    &mut state,
+                    &densities_plus,          // Use ρ_plus for m+ splitting threshold
+                    args.delta_split_l1,
+                    args.delta_split_l2,
+                    args.max_split_level,
+                    args.zoom_cube_size,
+                    &mut rng_split,
+                    &u_old,
                 );
 
                 if n_new > 0 {
@@ -1201,12 +1264,12 @@ fn main() {
             let split_max = state.max_split_level();
 
             if do_metric {
-                writeln!(csv, "{},{:.6},{:.4},{:.6},{},{},{},{:.3e},{:.2}",
-                    step, t_gyr, z, a, state.particles.len(), n_hr, split_max, rho_max, v_rms).unwrap();
+                writeln!(csv, "{},{:.6},{:.4},{:.6},{},{},{},{:.3e},{:.2},{:.3e}",
+                    step, t_gyr, z, a, state.particles.len(), n_hr, split_max, rho_max, v_rms, rho_plus_max).unwrap();
 
                 if step % 100 == 0 || do_split {
-                    println!("  Step {:5} | z={:.3} | N={:>8} | N_hr={:>6} | ρ_max={:.2e} | v_rms={:.1} km/s",
-                        step, z, state.particles.len(), n_hr, rho_max, v_rms);
+                    println!("  Step {:5} | z={:.3} | N={:>8} | N_hr={:>6} | ρ_max={:.2e} | ρ+_max={:.2e} | v_rms={:.1} km/s",
+                        step, z, state.particles.len(), n_hr, rho_max, rho_plus_max, v_rms);
                 }
             }
 

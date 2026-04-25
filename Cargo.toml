@@ -147,6 +147,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1.0"
 
+# Checksums
+sha2 = "0.10"
+
 # Statistiques / optimisation
 argmin = "0.10"
 argmin-math = "0.4"
@@ -154,6 +157,10 @@ argmin-math = "0.4"
 # Logging
 log = "0.4"
 env_logger = "0.11"
+
+# Fast k-NN for post-processing
+kiddo = "4.2"
+glob = "0.3"
 
 # FFT for Zel'dovich ICs
 rustfft = "6.2"
@@ -167,6 +174,7 @@ clap = { version = "4.4", features = ["derive"] }
 
 [dev-dependencies]
 approx = "0.5"
+tempfile = "3.10"
 
 [profile.release]
 opt-level = 3
@@ -877,3 +885,25 @@ required-features = ["cuda"]
 name = "test_grackle"
 path = "src/bin/test_grackle.rs"
 required-features = ["grackle"]
+
+[[bin]]
+name = "stellar_postprocessing"
+path = "src/bin/stellar_postprocessing.rs"
+
+[[bin]]
+name = "galaxy_analysis"
+path = "src/bin/galaxy_analysis.rs"
+
+[[bin]]
+name = "janus_zoom_l1_v2_adaptive_split"
+path = "src/bin/janus_zoom_l1_v2_adaptive_split.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "migrate_snapshots"
+path = "src/bin/migrate_snapshots.rs"
+
+[[bin]]
+name = "janus_adaptive_zoom"
+path = "src/bin/janus_adaptive_zoom.rs"
+required-features = ["cuda"]

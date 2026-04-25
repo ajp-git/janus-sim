@@ -18,9 +18,9 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 
 # === CONFIGURATION ===
-SNAP_DIR = Path("/mnt/T2/janus-sim/output/test_phase11_translation/snapshots")
-OUT_10P = Path("/mnt/T2/janus-sim/output/test_phase11_translation/frames_10panel")
-OUT_2P5D = Path("/mnt/T2/janus-sim/output/test_phase11_translation/frames_2p5d")
+SNAP_DIR = Path("/mnt/T2/janus-sim/output/janus_production_v8_zoom_20260424_2136/snapshots")
+OUT_10P = Path("/mnt/T2/janus-sim/output/janus_production_v8_zoom_20260424_2136/frames_10panel")
+OUT_2P5D = Path("/mnt/T2/janus-sim/output/janus_production_v8_zoom_20260424_2136/frames_2p5d")
 OUT_10P.mkdir(exist_ok=True, parents=True)
 OUT_2P5D.mkdir(exist_ok=True, parents=True)
 

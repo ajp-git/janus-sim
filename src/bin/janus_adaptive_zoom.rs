@@ -141,7 +141,7 @@ const METRIC_INTERVAL: usize = 10;
 // ═══════════════════════════════════════════════════════════════════════════
 const SEED_IC: u64 = 42;
 const N_S: f64 = 0.965;
-const DELTA_RMS: f64 = 0.10;
+const DELTA_RMS: f64 = 0.15;  // v9: increased from 0.10 for stronger IC perturbations
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -153,6 +153,58 @@ const G_COSMO: f64 = 4.499e-15;  // Mpc³ M☉⁻¹ Gyr⁻²
 // Physique baryonique
 const T_INIT_PLUS: f64 = 10000.0;   // Température initiale m+ [K]
 const T_FLOOR: f64 = 100.0;         // Température plancher [K]
+
+// ═══════════════════════════════════════════════════════════════════════════
+// JANUS EXPANSION (Petit & D'Agostini 2014 + Petit 2018)
+// Two-phase model: radiative era (z > 4.51) + matter era (z < 4.51)
+// ═══════════════════════════════════════════════════════════════════════════
+/// Janus parametric solution constants (calibrated for H₀=69.9, t₀=15.87 Gyr)
+const ALPHA_SQ_JANUS: f64 = 0.1815456201;
+const TAU_0_JANUS: f64 = 23.3011940229;  // Gyr
+/// Transition scale factor: a = α² corresponds to z = 4.5083
+const A_TRANSITION_JANUS: f64 = ALPHA_SQ_JANUS;
+
+/// Compute Hubble parameter H(a) for the Janus cosmological model.
+///
+/// Implements two-phase expansion:
+/// - For a < α²: gauge process era (Petit 2018), EdS-like H = H₀ × a^(-3/2)
+/// - For a ≥ α²: matter era (Petit & D'Agostini 2014), parametric cosh²(μ_p)
+///
+/// Discontinuity at a = α²: physical "Janus point" where the universe
+/// transitions between the two regimes.
+///
+/// # Arguments
+/// * `a` - Scale factor (a=1 today, a→0 at Big Bang)
+/// * `h0_kms_mpc` - Hubble constant in km/s/Mpc (typically 69.9)
+///
+/// # Returns
+/// H(a) in Gyr⁻¹
+///
+/// # Reference values
+/// - H(a=1)    = 0.071487 Gyr⁻¹  = 69.90 km/s/Mpc
+/// - H(z=1)    = 0.117986 Gyr⁻¹  = 115.37 km/s/Mpc
+/// - H(z=4.5)  = 0.017622 Gyr⁻¹  = 17.23 km/s/Mpc (matter era, near transition)
+/// - H(z=10)   = 2.608052 Gyr⁻¹  = 2550 km/s/Mpc (radiative era)
+fn compute_hubble_janus(a: f64, h0_kms_mpc: f64) -> f64 {
+    let h0_gyr_inv = h0_kms_mpc / MPC_GYR_TO_KMS;
+
+    if a < A_TRANSITION_JANUS {
+        // Phase radiative / gauge process (Petit 2018)
+        // t ∝ a^(3/2) → H = H₀ × a^(-3/2)
+        h0_gyr_inv / a.powf(1.5)
+    } else {
+        // Phase matière (Petit & D'Agostini 2014)
+        // a(μ_p) = α² cosh²(μ_p)
+        // H(μ_p) = sinh(2μ_p) / [τ₀ α² cosh²(μ_p) (1 + ½ sinh(2μ_p))]
+        let cosh2_mu = a / ALPHA_SQ_JANUS;
+        // Numerical safety: cosh²(μ) ≥ 1 by definition
+        let cosh2_mu_safe = cosh2_mu.max(1.0);
+        let cosh_mu = cosh2_mu_safe.sqrt();
+        let mu_p = cosh_mu.acosh();
+        let s2mu = (2.0 * mu_p).sinh();
+        s2mu / (TAU_0_JANUS * ALPHA_SQ_JANUS * cosh2_mu_safe * (1.0 + 0.5 * s2mu))
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PARTICLE MASSES (M_sun) — computed from cosmology
@@ -1174,8 +1226,8 @@ fn main() {
             break;
         }
 
-        // H(z) = H₀ × (1+z)^(3/2) for matter-dominated Janus (Ω_tot=1)
-        let h = (args.h0 / MPC_GYR_TO_KMS) / a.powf(1.5);  // Same as janus_baryonic_calibrated
+        // H(a) via Janus two-phase expansion (Petit 2014/2018)
+        let h = compute_hubble_janus(a, args.h0);
 
         // Metrics
         let do_metric = step % METRIC_INTERVAL == 0;
@@ -1369,4 +1421,184 @@ fn main() {
     eprintln!("ERROR: This binary requires --features cuda");
     eprintln!("Usage: cargo run --release --features cuda --bin janus_adaptive_zoom");
     std::process::exit(1);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UNIT TESTS — Janus expansion (Petit 2014/2018)
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hubble_today() {
+        let h = compute_hubble_janus(1.0, 69.9);
+        let h_kms_mpc = h * MPC_GYR_TO_KMS;
+
+        // Must give 69.9 km/s/Mpc within 0.01%
+        assert!(
+            (h_kms_mpc - 69.9).abs() < 0.01,
+            "H(a=1) = {} km/s/Mpc, expected 69.9", h_kms_mpc
+        );
+    }
+
+    #[test]
+    fn test_hubble_matter_era() {
+        let h0 = 69.9;
+
+        // Reference values computed in Python (precision 0.01%)
+        let test_cases = vec![
+            // (z,    expected_H_Gyr_inv,   tol)
+            (0.0,    0.071487,             1e-4),
+            (0.1,    0.077186,             1e-4),
+            (0.5,    0.097594,             1e-4),
+            (1.0,    0.117986,             1e-4),
+            (2.0,    0.142492,             1e-4),
+            (3.0,    0.143787,             1e-4),
+            (4.0,    0.107606,             1e-4),
+        ];
+
+        for (z, expected, tol) in test_cases {
+            let a = 1.0 / (1.0 + z);
+            let h = compute_hubble_janus(a, h0);
+            assert!(
+                (h - expected).abs() < tol,
+                "H(z={}): got {}, expected {}, diff = {}",
+                z, h, expected, (h - expected).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_hubble_radiation_era() {
+        let h0 = 69.9;
+        let h0_gyr = h0 / MPC_GYR_TO_KMS;
+
+        // Radiative phase: H = H₀ / a^(3/2)
+        let test_zs = vec![5.0, 6.0, 8.0, 10.0];
+
+        for z in test_zs {
+            let a = 1.0 / (1.0 + z);
+            let h = compute_hubble_janus(a, h0);
+            let expected = h0_gyr / a.powf(1.5);
+            assert!(
+                (h - expected).abs() < 1e-7,
+                "H(z={}) radiative: got {}, expected {} (EdS)",
+                z, h, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_phase_transition() {
+        let h0 = 69.9;
+
+        // Just below α²: radiative phase, H large
+        let a_below = ALPHA_SQ_JANUS - 1e-6;
+        let h_below = compute_hubble_janus(a_below, h0);
+        assert!(
+            h_below > 0.9,
+            "Just below transition (a={}): H = {} should be ~0.92 (radiation)",
+            a_below, h_below
+        );
+
+        // At α² exactly: matter phase, μ_p=0, H ≈ 0
+        let h_at = compute_hubble_janus(ALPHA_SQ_JANUS, h0);
+        assert!(
+            h_at.abs() < 1e-5,
+            "At transition (a=α²): H = {} should be ~0 (μ_p=0)", h_at
+        );
+
+        // Just above α²: matter phase, H small positive
+        let a_above = ALPHA_SQ_JANUS + 1e-6;
+        let h_above = compute_hubble_janus(a_above, h0);
+        assert!(
+            h_above > 0.0 && h_above < 0.01,
+            "Just above transition (a={}): H = {} should be small positive",
+            a_above, h_above
+        );
+    }
+
+    #[test]
+    fn test_cosmic_age() {
+        let h0 = 69.9;
+
+        // Integrate ∫_{α²}^{1} da/(aH) should give 15.87 Gyr
+        let n_steps = 10000;
+        let log_a_start = ALPHA_SQ_JANUS.ln() + 1e-6;  // avoid exact point
+        let log_a_end = 0.0;  // ln(1) = 0
+        let dlog = (log_a_end - log_a_start) / n_steps as f64;
+
+        let mut t_integral = 0.0;
+        for i in 0..n_steps {
+            let log_a_mid = log_a_start + (i as f64 + 0.5) * dlog;
+            let a = log_a_mid.exp();
+            let h = compute_hubble_janus(a, h0);
+            // dt = da/(aH) = d(ln a)/H
+            t_integral += dlog / h;
+        }
+
+        println!("Cosmic age (matter era only): {:.4} Gyr", t_integral);
+        assert!(
+            (t_integral - 15.87).abs() < 0.05,
+            "Cosmic age: got {} Gyr, expected 15.87 Gyr", t_integral
+        );
+    }
+
+    #[test]
+    fn test_a_progression_through_transition() {
+        let h0 = 69.9;
+
+        // Simulate leapfrog integration around the junction
+        let dt = 0.001;  // Gyr
+        let mut a = 1.0 / 11.0;  // z = 10
+        let mut steps = 0;
+        let max_steps = 50_000;  // safety limit
+
+        while a < 1.0 && steps < max_steps {
+            let h = compute_hubble_janus(a, h0);
+            // da = a * H * dt
+            a += a * h * dt;
+            steps += 1;
+
+            // Sanity: no NaN or Inf
+            assert!(a.is_finite(), "a became {} at step {}", a, steps);
+            assert!(h.is_finite(), "H became {} at step {} (a={})", h, steps, a);
+        }
+
+        println!("Reached a={} in {} steps", a, steps);
+        assert!(steps < max_steps, "Did not reach a=1 in {} steps", max_steps);
+    }
+
+    #[test]
+    fn test_reference_table() {
+        let h0 = 69.9;
+
+        // Table of precisely computed values in Python
+        // Format: (a, H_in_Gyr_inv)
+        let reference = vec![
+            // Radiative phase (a < α² = 0.1815)
+            (0.09091, 2.608052),  // z=10
+            (0.11111, 1.930149),  // z=8
+            (0.14286, 1.323958),  // z=6
+            (0.16667, 1.050640),  // z=5
+            // Matter phase (a > α²)
+            (0.20000, 0.107606),  // z=4
+            (0.25000, 0.143787),  // z=3
+            (0.33333, 0.142492),  // z=2
+            (0.50000, 0.117986),  // z=1
+            (0.66667, 0.097594),  // z=0.5
+            (0.90909, 0.077186),  // z=0.1
+            (1.00000, 0.071487),  // z=0
+        ];
+
+        for (a, expected) in reference {
+            let h = compute_hubble_janus(a, h0);
+            let rel_err = (h - expected).abs() / expected;
+            assert!(
+                rel_err < 1e-3,
+                "a={}: H={}, expected={}, rel_err={}", a, h, expected, rel_err
+            );
+        }
+    }
 }

@@ -181,6 +181,9 @@ fn main() {
         };
         let z = if a > 0.0 { 1.0/a - 1.0 } else { 0.0 };
 
+        // Update current redshift for λ(z) = λ₀/√(1+z) calculation
+        sim.set_current_z(z);
+
         // Step simulation
         if let Err(e) = sim.step_treepm_gpu(dt, r_cut, h, dtau) {
             stop_reason = Some(format!("Simulation error: {}", e));
@@ -292,57 +295,220 @@ fn main() {
     }
 }
 
+/// ΛCDM transfer function (Eisenstein & Hu 1998 approximation)
+fn transfer_function(k: f64) -> f64 {
+    // Simplified ΛCDM transfer function
+    // Parameters for Planck 2018 cosmology
+    let h = 0.7;
+    let omega_m = 0.3;
+    let omega_b = 0.05;
+
+    let theta = 2.725 / 2.7;  // CMB temperature ratio
+    let k_eq = 0.0746 * omega_m * h * h / (theta * theta);  // Mpc^-1
+
+    let q = k / (omega_m * h * h) * theta * theta;
+    let l = (2.718281828 + 1.8 * q).ln();
+    let c = 14.2 + 731.0 / (1.0 + 62.5 * q);
+
+    l / (l + c * q * q)
+}
+
+/// ΛCDM power spectrum P(k)
+fn power_spectrum(k: f64, n_s: f64, _sigma8: f64) -> f64 {
+    if k < 1e-6 { return 0.0; }
+
+    // P(k) = A * k^n_s * T(k)^2
+    let tk = transfer_function(k);
+    let pk_unnorm = k.powf(n_s) * tk * tk;
+
+    // Normalization: A chosen so that σ(R=8 Mpc/h) ≈ σ8
+    // For cosmological simulations, typical amplitude A ~ 2e9 (Mpc/h)^3
+    // We use a large value to ensure visible structure
+    let a_norm = 5e10;  // Large amplitude for clear structure formation
+    a_norm * pk_unnorm
+}
+
 #[cfg(all(feature = "cuda", feature = "cufft"))]
-fn generate_ics(seed: u64, ng: usize, box_size: f64, eta: f64, k_min: usize) -> (Vec<f64>, Vec<f64>, Vec<i32>) {
+fn generate_ics(seed: u64, ng: usize, box_size: f64, eta: f64, _k_min: usize) -> (Vec<f64>, Vec<f64>, Vec<i32>) {
+    use rustfft::{FftPlanner, num_complex::Complex};
+
     let mut rng = StdRng::seed_from_u64(seed);
     let n = ng * ng * ng;
     let cell = box_size / ng as f64;
     let half_box = box_size / 2.0;
+    let dk = 2.0 * PI / box_size;
 
-    let mut pos = Vec::with_capacity(n * 3);
-    let mut vel = Vec::with_capacity(n * 3);
-    let mut signs = Vec::with_capacity(n);
+    // ΛCDM parameters
+    let n_s = 0.965;   // Planck 2018 spectral index
+    let sigma8 = 0.8;  // Amplitude
+    let z_init = 5.0;  // Initial redshift
+    let growth_factor = 1.0 / (1.0 + z_init);  // Linear growth D(z) ~ 1/(1+z) at high z
 
-    // Compute n_positive from eta
-    let n_positive = (n as f64 / (1.0 + eta)).round() as usize;
+    println!("    Generating ΛCDM Zel'dovich ICs (n_s={}, σ8={}, z_init={})...", n_s, sigma8, z_init);
 
-    // Generate grid positions with small perturbation
-    let noise = Normal::new(0.0, 0.1 * cell).unwrap();
+    // Generate Gaussian random field in k-space with P(k) amplitude
+    let normal = Normal::new(0.0, 1.0).unwrap();
+    let mut delta_k: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); n];
 
     for iz in 0..ng {
         for iy in 0..ng {
             for ix in 0..ng {
-                let _idx = iz * ng * ng + iy * ng + ix;
+                let idx = iz * ng * ng + iy * ng + ix;
 
-                // Grid position with noise
-                let x = (ix as f64 + 0.5) * cell - half_box + rng.sample(noise);
-                let y = (iy as f64 + 0.5) * cell - half_box + rng.sample(noise);
-                let z = (iz as f64 + 0.5) * cell - half_box + rng.sample(noise);
+                // Wavenumbers (FFT convention)
+                let kx = if ix <= ng/2 { ix as f64 } else { ix as f64 - ng as f64 } * dk;
+                let ky = if iy <= ng/2 { iy as f64 } else { iy as f64 - ng as f64 } * dk;
+                let kz = if iz <= ng/2 { iz as f64 } else { iz as f64 - ng as f64 } * dk;
+                let k_mag = (kx*kx + ky*ky + kz*kz).sqrt();
+
+                if k_mag > 1e-6 {
+                    // Amplitude from P(k)
+                    let pk = power_spectrum(k_mag, n_s, sigma8);
+                    let amplitude = (pk * growth_factor * growth_factor).sqrt();
+
+                    // Random phase
+                    let re: f64 = rng.sample(normal);
+                    let im: f64 = rng.sample(normal);
+                    delta_k[idx] = Complex::new(re * amplitude, im * amplitude);
+                }
+            }
+        }
+    }
+
+    // Enforce Hermitian symmetry for real output
+    delta_k[0] = Complex::new(0.0, 0.0);
+
+    // Compute displacement field ψ = -i k / k² × δ_k for each direction
+    let mut psi_x_k = delta_k.clone();
+    let mut psi_y_k = delta_k.clone();
+    let mut psi_z_k = delta_k.clone();
+
+    for iz in 0..ng {
+        for iy in 0..ng {
+            for ix in 0..ng {
+                let idx = iz * ng * ng + iy * ng + ix;
+                let kx = if ix <= ng/2 { ix as f64 } else { ix as f64 - ng as f64 } * dk;
+                let ky = if iy <= ng/2 { iy as f64 } else { iy as f64 - ng as f64 } * dk;
+                let kz = if iz <= ng/2 { iz as f64 } else { iz as f64 - ng as f64 } * dk;
+                let k2 = kx*kx + ky*ky + kz*kz;
+
+                if k2 > 1e-12 {
+                    // ψ_i = -i k_i / k² × δ_k
+                    let factor = Complex::new(0.0, -1.0) / k2;
+                    psi_x_k[idx] = delta_k[idx] * factor * kx;
+                    psi_y_k[idx] = delta_k[idx] * factor * ky;
+                    psi_z_k[idx] = delta_k[idx] * factor * kz;
+                } else {
+                    psi_x_k[idx] = Complex::new(0.0, 0.0);
+                    psi_y_k[idx] = Complex::new(0.0, 0.0);
+                    psi_z_k[idx] = Complex::new(0.0, 0.0);
+                }
+            }
+        }
+    }
+
+    // Inverse FFT to get displacement in real space
+    let mut planner = FftPlanner::new();
+    let ifft = planner.plan_fft_inverse(ng);
+
+    // 3D IFFT via series of 1D IFFTs
+    fn ifft_3d(data: &mut [Complex<f64>], ng: usize, ifft: &std::sync::Arc<dyn rustfft::Fft<f64>>) {
+        // X direction
+        for iz in 0..ng {
+            for iy in 0..ng {
+                let mut row: Vec<_> = (0..ng).map(|ix| data[iz*ng*ng + iy*ng + ix]).collect();
+                ifft.process(&mut row);
+                for ix in 0..ng { data[iz*ng*ng + iy*ng + ix] = row[ix]; }
+            }
+        }
+        // Y direction
+        for iz in 0..ng {
+            for ix in 0..ng {
+                let mut col: Vec<_> = (0..ng).map(|iy| data[iz*ng*ng + iy*ng + ix]).collect();
+                ifft.process(&mut col);
+                for iy in 0..ng { data[iz*ng*ng + iy*ng + ix] = col[iy]; }
+            }
+        }
+        // Z direction
+        for iy in 0..ng {
+            for ix in 0..ng {
+                let mut depth: Vec<_> = (0..ng).map(|iz| data[iz*ng*ng + iy*ng + ix]).collect();
+                ifft.process(&mut depth);
+                for iz in 0..ng { data[iz*ng*ng + iy*ng + ix] = depth[iz]; }
+            }
+        }
+    }
+
+    ifft_3d(&mut psi_x_k, ng, &ifft);
+    ifft_3d(&mut psi_y_k, ng, &ifft);
+    ifft_3d(&mut psi_z_k, ng, &ifft);
+
+    // Normalize IFFT and scale displacement
+    // disp_scale > 2 ensures |ψ| > cell, breaking cubic symmetry
+    let norm = 1.0 / (n as f64);
+    let disp_scale = 15.0;  // Scale factor - must give max_disp > cell to break grid
+
+    let psi_x: Vec<f64> = psi_x_k.iter().map(|c| c.re * norm * disp_scale).collect();
+    let psi_y: Vec<f64> = psi_y_k.iter().map(|c| c.re * norm * disp_scale).collect();
+    let psi_z: Vec<f64> = psi_z_k.iter().map(|c| c.re * norm * disp_scale).collect();
+
+    // Report displacement stats
+    let all_disp: Vec<f64> = psi_x.iter().chain(psi_y.iter()).chain(psi_z.iter())
+        .map(|x| x.abs()).collect();
+    let max_disp = all_disp.iter().fold(0.0f64, |a, &b| a.max(b));
+    let mean_disp = all_disp.iter().sum::<f64>() / all_disp.len() as f64;
+    let ratio = max_disp / cell;
+
+    println!("    Displacement stats:");
+    println!("      mean(|ψ|) = {:.3} Mpc", mean_disp);
+    println!("      max(|ψ|)  = {:.3} Mpc", max_disp);
+    println!("      max/cell  = {:.2} (need > 1 to break grid)", ratio);
+    if ratio < 1.0 {
+        println!("    WARNING: Displacements too small, grid artifacts likely!");
+    } else {
+        println!("    OK: Grid symmetry should be broken");
+    }
+
+    // Generate particles with Zel'dovich displacements
+    let mut pos = Vec::with_capacity(n * 3);
+    let mut vel = Vec::with_capacity(n * 3);
+    let mut signs = Vec::with_capacity(n);
+
+    let n_positive = (n as f64 / (1.0 + eta)).round() as usize;
+
+    // Zel'dovich velocity scaling: v = -H(z) * f(Ω) * ψ
+    // where f(Ω) ≈ Ω_m^0.55 ≈ 0.47 for standard ΛCDM (Ω_m = 0.3)
+    // H(z=5) in simulation units (Mpc/Gyr): H_init from cosmology
+    let omega_m: f64 = 0.3;
+    let f_omega = omega_m.powf(0.55);  // ≈ 0.47
+    let h0_gyr = 0.0715;  // H0 = 70 km/s/Mpc in Gyr^-1
+    let e_z = ((omega_m * (1.0 + z_init).powi(3)) + (1.0 - omega_m)).sqrt();  // E(z)
+    let h_z = h0_gyr * e_z;  // H(z) in Gyr^-1
+    let vel_factor = h_z * f_omega;  // v = H(z) * f(Ω) * ψ
+
+    for iz in 0..ng {
+        for iy in 0..ng {
+            for ix in 0..ng {
+                let idx = iz * ng * ng + iy * ng + ix;
+
+                // Grid position + Zel'dovich displacement
+                let x = (ix as f64 + 0.5) * cell - half_box + psi_x[idx];
+                let y = (iy as f64 + 0.5) * cell - half_box + psi_y[idx];
+                let z = (iz as f64 + 0.5) * cell - half_box + psi_z[idx];
 
                 pos.push(x);
                 pos.push(y);
                 pos.push(z);
 
-                // Small random velocity
-                vel.push(rng.sample(noise) * 10.0);
-                vel.push(rng.sample(noise) * 10.0);
-                vel.push(rng.sample(noise) * 10.0);
+                // Velocity from Zel'dovich: v = H(z) * f(Ω) * ψ
+                vel.push(psi_x[idx] * vel_factor);
+                vel.push(psi_y[idx] * vel_factor);
+                vel.push(psi_z[idx] * vel_factor);
 
                 // Random sign assignment
                 signs.push(if rng.random_bool(n_positive as f64 / n as f64) { 1 } else { -1 });
             }
         }
-    }
-
-    // Add coherent perturbation (Zel'dovich-like) for structure
-    let k = 2.0 * PI / box_size * k_min as f64;
-    let amplitude = 0.001 * box_size;
-
-    for i in 0..n {
-        let x = pos[i * 3];
-        let disp = amplitude * (k * x).sin();
-        pos[i * 3] += disp;
-        vel[i * 3] += disp * 50.0;  // velocity from displacement
     }
 
     (pos, vel, signs)

@@ -12,11 +12,11 @@
 
 #[cfg(feature = "cuda")]
 use janus::nbody_gpu::GpuNBodySimulation;
+#[cfg(feature = "cuda")]
+use janus::cooling_gpu::GpuCooling;
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaDevice;
 use janus::vsl_dynamic::CoupledFriedmann;
-#[cfg(feature = "grackle")]
-use janus::baryonic::cooling::init_grackle;
-use janus::baryonic::cooling::apply_cooling;
-use janus::baryonic::pressure::sound_speed;
 use janus::baryonic::feedback::{sf_probability, FeedbackMode, apply_sn_feedback};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -37,7 +37,7 @@ const T0_GYR: f64 = 15.87;      // Universe age at z=0 [Gyr]
 // ═══════════════════════════════════════════════════════════════════════════
 // SIMULATION PARAMETERS
 // ═══════════════════════════════════════════════════════════════════════════
-const N_PARTICLES: usize = 10_000_000;
+const N_PARTICLES: usize = 10_000_000;  // 10M - may hit 12GB VRAM limit
 const L_BOX: f64 = 500.0;       // [Mpc]
 const Z_INIT: f64 = 4.0;        // Initial redshift
 const DT: f64 = 0.001;          // Time step [Gyr]
@@ -60,8 +60,8 @@ const BLASTWAVE_DELAY_GYR: f64 = 0.03; // Blastwave delay [Gyr]
 // ═══════════════════════════════════════════════════════════════════════════
 // OUTPUT
 // ═══════════════════════════════════════════════════════════════════════════
-const SNAPSHOT_INTERVAL: usize = 10;
-const METRIC_INTERVAL: usize = 10;  // Log ratio every 10 steps
+const SNAPSHOT_INTERVAL: usize = 5;   // User requested 5
+const METRIC_INTERVAL: usize = 10;    // Log ratio every 10 steps
 const OUTPUT_DIR: &str = "/app/output/janus_baryonic_calibrated";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -129,14 +129,14 @@ fn main() {
     println!("║    H₀ = {} km/s/Mpc, t₀ = {} Gyr", H0_KMS_MPC, T0_GYR);
     println!("╠══════════════════════════════════════════════════════════════════════════╣");
     println!("║  SIMULATION:");
-    println!("║    N = {} (5M m+ / 5M m-)", N_PARTICLES);
+    println!("║    N = {} (η≈1.045 ⟹ ~52% m+ / ~48% m-)", N_PARTICLES);
     println!("║    L_box = {} Mpc, ε = {} Mpc", L_BOX, EPSILON);
     println!("║    z_init = {} → z_final = 0, dt = {} Gyr", Z_INIT, DT);
     println!("║    Steps = {}, θ = {}", N_STEPS, THETA);
     println!("╠══════════════════════════════════════════════════════════════════════════╣");
     println!("║  BARYONICS (m+ only):");
     println!("║    T_init = {} K, T_floor = {} K", T_INIT_PLUS, T_FLOOR);
-    println!("║    Cooling: Grackle HM2012 + Rahmati self-shielding");
+    println!("║    Cooling: S&D93 GPU native + Rahmati self-shielding");
     println!("║    Star formation: ε* = {}, T < {} K, n > {} cm⁻³", EPSILON_STAR, T_THRESHOLD_SF, N_THRESHOLD_SF);
     println!("║    SN feedback: kinetic, ε_SN = {}%, delay = {} Myr", EPSILON_SN * 100.0, DELAY_SN_MYR);
     println!("╠══════════════════════════════════════════════════════════════════════════╣");
@@ -156,20 +156,8 @@ fn main() {
     fs::create_dir_all(format!("{}/snapshots", OUTPUT_DIR)).expect("Failed to create output dir");
     fs::create_dir_all(format!("{}/frames", OUTPUT_DIR)).expect("Failed to create frames dir");
 
-    // Initialize Grackle cooling
-    #[cfg(feature = "grackle")]
-    {
-        println!("Initializing Grackle cooling tables (HM2012)...");
-        match init_grackle() {
-            Ok(_) => println!("  ✓ Grackle initialized with HM2012 UV background"),
-            Err(e) => {
-                println!("  ⚠ Grackle init failed: {}", e);
-                println!("    Falling back to analytical cooling");
-            }
-        }
-    }
-    #[cfg(not(feature = "grackle"))]
-    println!("⚠ Grackle not compiled in - using analytical cooling approximation");
+    // Note: GPU cooling will be initialized after GPU sim (we need n_plus count)
+    println!("S&D93 GPU cooling will be initialized after particle counts...");
 
     // Generate Zel'dovich ICs
     let (positions, velocities, signs) = generate_zeldovich_ics_dual_seed();
@@ -195,6 +183,21 @@ fn main() {
     gpu_sim.set_c_ratio(c_ratio_init);
     println!("  GPU init: {:.2}s", start_time.elapsed().as_secs_f64());
     println!("  c_ratio_sq(z={}) = {:.6}", Z_INIT, c_ratio_sq_init);
+
+    // Initialize S&D93 GPU cooling (native CUDA kernel)
+    println!("\nInitializing S&D93 GPU cooling (native CUDA)...");
+    let cuda_device = CudaDevice::new(0).expect("Failed to create CUDA device");
+    let m_particle = 3e11 * (L_BOX / 500.0).powi(3) / (N_PARTICLES as f64);  // M_sun per particle
+    let mut gpu_cooling = GpuCooling::new(cuda_device, n_plus, L_BOX, m_particle)
+        .expect("Failed to create GPU cooling module");
+
+    // Initialize temperatures: m+ only (cooling module only handles m+)
+    // Create signs array for m+ particles only (all +1)
+    let signs_plus: Vec<i32> = vec![1i32; n_plus];
+    gpu_cooling.init_from_temperature(T_INIT_PLUS, T_INIT_PLUS, &signs_plus)
+        .expect("Failed to init cooling temperatures");
+    println!("  ✓ S&D93 tabulated cooling initialized (validated <2% error)");
+    println!("  ✓ T_init(m+) = {} K", T_INIT_PLUS);
 
     // Initialize particle temperatures (m+ only)
     let mut temperatures: Vec<f64> = vec![T_INIT_PLUS; n_plus];
@@ -282,8 +285,8 @@ fn main() {
             let eta_h = eta_s / 3600.0;
 
             if do_metric {
-                // Compute mean temperature
-                let t_mean: f64 = temperatures.iter().sum::<f64>() / temperatures.len().max(1) as f64;
+                // Compute mean temperature from GPU cooling module
+                let t_mean: f64 = gpu_cooling.get_mean_temperature_plus().unwrap_or(T_INIT_PLUS);
 
                 writeln!(csv, "{},{:.6},{:.4},{:.6},{:.4},{:.4},{:.1},{:.1},{:.4},{:.1},{:.1},{:.4},{},{:.2e},{:.0}",
                     step, t_gyr, z, a, segregation, corr,
@@ -351,93 +354,41 @@ fn main() {
             gpu_sim.step_with_expansion_dkd_gpu(DT, a, h, 0.0).unwrap();
 
             // ═══════════════════════════════════════════════════════════════════
-            // BARYONIC PHYSICS (m+ only, every step)
+            // BARYONIC PHYSICS (m+ only, every step) — GPU ACCELERATED
             // ═══════════════════════════════════════════════════════════════════
             let pos = gpu_sim.get_positions().unwrap();
-            let vel = gpu_sim.get_velocities().unwrap();
             let signs_data = gpu_sim.signs();
 
             // Compute local overdensities for m+ particles using grid
             let overdensities = compute_local_overdensities(&pos, &signs_data, 32, L_BOX);
 
-            // Mean overdensity (should be ~1)
-            let mean_rho = 1.0;  // By definition of overdensity
+            // Convert overdensities to physical densities for GPU cooling
+            // ρ_code → n_H [cm^-3] = 2e-7 × (1+z)³ × overdensity
+            let rho_to_nh = 2e-7 * (1.0 + z).powi(3);
+            let densities: Vec<f64> = overdensities.iter()
+                .map(|&od| od * rho_to_nh / 3.07e-17)  // Convert to code units expected by kernel
+                .collect();
 
-            // Mean particle mass [M_sun]
-            let m_particle = 3e11 * (L_BOX / 500.0).powi(3) / (N_PARTICLES as f64);
+            // Upload densities to GPU
+            gpu_cooling.upload_densities(&densities).expect("Failed to upload densities");
 
-            let mut new_stars_this_step = 0;
-            let mut stellar_mass_formed = 0.0;
+            // Apply GPU cooling (S&D93 tabulated)
+            gpu_cooling.apply_cooling(DT, z).expect("GPU cooling failed");
 
-            // Process each m+ particle
-            let mut plus_idx = 0;
-            for i in 0..signs_data.len() {
-                if signs_data[i] <= 0 {
-                    continue;  // Skip m- particles
-                }
+            // Apply star formation on GPU
+            let new_stars_this_step = gpu_cooling.apply_star_formation(DT).unwrap_or(0);
+            n_stars += new_stars_this_step as usize;
 
-                if is_star[plus_idx] {
-                    // Update stellar age
-                    stellar_ages[plus_idx] += DT;
-
-                    // SN feedback after delay (blastwave)
-                    if stellar_ages[plus_idx] >= BLASTWAVE_DELAY_GYR
-                       && stellar_ages[plus_idx] < BLASTWAVE_DELAY_GYR + DT * 2.0 {
-                        // Apply kinetic SN feedback to nearby gas
-                        // (simplified: heat temperature of surrounding region)
-                        // In full implementation: identify neighbors and kick velocities
-                    }
-                    plus_idx += 1;
-                    continue;
-                }
-
-                let overdensity = overdensities[plus_idx];
-                let temp = temperatures[plus_idx];
-
-                // 1. Self-shielding Rahmati 2013
-                // Convert overdensity to n_H [cm^-3]
-                let n_h = 2e-7 * (1.0 + z).powi(3) * overdensity;
-                let gamma_eff = gamma_uv_effective(n_h, z);
-
-                // 2. Radiative cooling (with UV background)
-                let new_temp = apply_cooling(temp, overdensity, z, DT);
-                temperatures[plus_idx] = new_temp.max(T_FLOOR);
-
-                // 3. Star formation criteria (MCJ calibrated)
-                // n_threshold = 30 cm^-3 corresponds to overdensity ~ 1.5e8
-                let n_threshold_overdensity = N_THRESHOLD_SF / (2e-7 * (1.0 + z).powi(3));
-
-                if overdensity > n_threshold_overdensity
-                   && temperatures[plus_idx] < T_THRESHOLD_SF {
-                    // Check probability of forming star
-                    let prob = sf_probability(
-                        overdensity * mean_rho,  // density in code units
-                        EPSILON_STAR,
-                        DT
-                    ).min(0.1);  // Cap at 10% per timestep
-
-                    if rng_sf.random::<f64>() < prob {
-                        // Convert gas particle to star
-                        is_star[plus_idx] = true;
-                        stellar_ages[plus_idx] = 0.0;
-                        n_stars += 1;
-                        new_stars_this_step += 1;
-                        stellar_mass_formed += m_particle;
-                    }
-                }
-
-                plus_idx += 1;
-            }
-
-            // Update SFR (M_sun/Gyr)
-            sfr = stellar_mass_formed / DT;
-
-            // Report star formation events (only when stars form)
+            // Report star formation events
             if new_stars_this_step > 0 && step % 100 == 0 {
-                let t_mean: f64 = temperatures.iter().sum::<f64>() / temperatures.len() as f64;
-                println!("    ★ Step {}: {} new stars, N_stars={}, T_mean={:.0} K, SFR={:.2e} M☉/Gyr",
-                    step, new_stars_this_step, n_stars, t_mean, sfr);
+                let t_mean = gpu_cooling.get_mean_temperature_plus().unwrap_or(0.0);
+                println!("    ★ Step {}: {} new stars, N_stars={}, T_mean={:.0} K",
+                    step, new_stars_this_step, n_stars, t_mean);
             }
+
+            // Update SFR estimate
+            let m_particle_local = 3e11 * (L_BOX / 500.0).powi(3) / (N_PARTICLES as f64);
+            sfr = (new_stars_this_step as f64) * m_particle_local / DT;
 
             a += a * h * DT;
             t_gyr += DT;

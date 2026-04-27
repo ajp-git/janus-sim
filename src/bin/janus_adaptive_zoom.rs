@@ -19,6 +19,7 @@ use janus::nbody_gpu::GpuNBodySimulation;
 #[cfg(feature = "cuda")]
 use janus::cooling_gpu::GpuCooling;
 use janus::vsl_dynamic::CoupledFriedmann;
+use janus::janus_expansion::{compute_total_energy, energy_drift_pct, a_minus_from_a_plus, compute_phi_factors};
 use janus::snapshot_v3::{SnapshotHeaderV3, ParticleV3, write_snapshot_v3, snapshot_info};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -106,6 +107,23 @@ struct Args {
     /// Barnes-Hut opening angle θ
     #[arg(long, default_value = "0.7")]
     theta: f64,
+
+    /// Zoom cube size in Mpc (0 = disabled, splits anywhere based on density)
+    /// If > 0, only particles inside [-size/2, +size/2]³ centered at origin can split
+    #[arg(long, default_value = "0.0")]
+    zoom_cube_size: f64,
+
+    /// Maximum split level (strict limit to prevent runaway splitting)
+    #[arg(long, default_value = "2")]
+    max_split_level: u8,
+
+    /// Split threshold for level 0→1 (M_sun/Mpc³). Default ~10× ρ_plus_mean
+    #[arg(long, default_value = "6.78e10")]
+    delta_split_l1: f64,
+
+    /// Split threshold for level 1→2 (M_sun/Mpc³). Default ~100× ρ_plus_mean
+    #[arg(long, default_value = "6.78e11")]
+    delta_split_l2: f64,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -124,7 +142,7 @@ const METRIC_INTERVAL: usize = 10;
 // ═══════════════════════════════════════════════════════════════════════════
 const SEED_IC: u64 = 42;
 const N_S: f64 = 0.965;
-const DELTA_RMS: f64 = 0.10;
+const DELTA_RMS: f64 = 0.15;  // v9: increased from 0.10 for stronger IC perturbations
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -136,6 +154,58 @@ const G_COSMO: f64 = 4.499e-15;  // Mpc³ M☉⁻¹ Gyr⁻²
 // Physique baryonique
 const T_INIT_PLUS: f64 = 10000.0;   // Température initiale m+ [K]
 const T_FLOOR: f64 = 100.0;         // Température plancher [K]
+
+// ═══════════════════════════════════════════════════════════════════════════
+// JANUS EXPANSION (Petit & D'Agostini 2014 + Petit 2018)
+// Two-phase model: radiative era (z > 4.51) + matter era (z < 4.51)
+// ═══════════════════════════════════════════════════════════════════════════
+/// Janus parametric solution constants (calibrated for H₀=69.9, t₀=15.87 Gyr)
+const ALPHA_SQ_JANUS: f64 = 0.1815456201;
+const TAU_0_JANUS: f64 = 23.3011940229;  // Gyr
+/// Transition scale factor: a = α² corresponds to z = 4.5083
+const A_TRANSITION_JANUS: f64 = ALPHA_SQ_JANUS;
+
+/// Compute Hubble parameter H(a) for the Janus cosmological model.
+///
+/// Implements two-phase expansion:
+/// - For a < α²: gauge process era (Petit 2018), EdS-like H = H₀ × a^(-3/2)
+/// - For a ≥ α²: matter era (Petit & D'Agostini 2014), parametric cosh²(μ_p)
+///
+/// Discontinuity at a = α²: physical "Janus point" where the universe
+/// transitions between the two regimes.
+///
+/// # Arguments
+/// * `a` - Scale factor (a=1 today, a→0 at Big Bang)
+/// * `h0_kms_mpc` - Hubble constant in km/s/Mpc (typically 69.9)
+///
+/// # Returns
+/// H(a) in Gyr⁻¹
+///
+/// # Reference values
+/// - H(a=1)    = 0.071487 Gyr⁻¹  = 69.90 km/s/Mpc
+/// - H(z=1)    = 0.117986 Gyr⁻¹  = 115.37 km/s/Mpc
+/// - H(z=4.5)  = 0.017622 Gyr⁻¹  = 17.23 km/s/Mpc (matter era, near transition)
+/// - H(z=10)   = 2.608052 Gyr⁻¹  = 2550 km/s/Mpc (radiative era)
+fn compute_hubble_janus(a: f64, h0_kms_mpc: f64) -> f64 {
+    let h0_gyr_inv = h0_kms_mpc / MPC_GYR_TO_KMS;
+
+    if a < A_TRANSITION_JANUS {
+        // Phase radiative / gauge process (Petit 2018)
+        // t ∝ a^(3/2) → H = H₀ × a^(-3/2)
+        h0_gyr_inv / a.powf(1.5)
+    } else {
+        // Phase matière (Petit & D'Agostini 2014)
+        // a(μ_p) = α² cosh²(μ_p)
+        // H(μ_p) = sinh(2μ_p) / [τ₀ α² cosh²(μ_p) (1 + ½ sinh(2μ_p))]
+        let cosh2_mu = a / ALPHA_SQ_JANUS;
+        // Numerical safety: cosh²(μ) ≥ 1 by definition
+        let cosh2_mu_safe = cosh2_mu.max(1.0);
+        let cosh_mu = cosh2_mu_safe.sqrt();
+        let mu_p = cosh_mu.acosh();
+        let s2mu = (2.0 * mu_p).sinh();
+        s2mu / (TAU_0_JANUS * ALPHA_SQ_JANUS * cosh2_mu_safe * (1.0 + 0.5 * s2mu))
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PARTICLE MASSES (M_sun) — computed from cosmology
@@ -340,18 +410,28 @@ fn blue_noise_daughters(center: [f32; 3], radius: f32, rng: &mut impl Rng) -> [[
 /// Returns number of new particles created
 /// Adaptive split check with thermal history preservation.
 ///
+/// Arguments:
+///   state: Adaptive state with particles
+///   densities_plus: ρ_plus at each particle location (m+ density field)
+///   delta_split_l1: threshold for level 0→1 splits
+///   delta_split_l2: threshold for level 1→2 splits
+///   max_split_level: maximum allowed split level (strict limit)
+///   zoom_cube_size: if > 0, only split particles inside [-size/2, +size/2]³
+///   rng: random number generator for daughter placement
+///   u_plus_old: internal energy array for m+ particles BEFORE split
+///
 /// Returns:
 ///   n_new: number of daughter particles created (= 8 * n_split_events)
 ///   u_new: internal energy array for m+ particles, aligned with the NEW order
 ///          of m+ particles in state.particles after the split.
 ///          Each daughter inherits its parent's u.
-///
-/// u_plus_old: internal energy array for m+ particles BEFORE split, aligned
-///             with the ORIGINAL order of m+ in state.particles.
 fn adaptive_split_check_with_thresholds(
     state: &mut AdaptiveState,
-    densities: &[f64],
-    delta_split: &[f64; 10],
+    densities_plus: &[f64],
+    delta_split_l1: f64,
+    delta_split_l2: f64,
+    max_split_level: u8,
+    zoom_cube_size: f64,
     rng: &mut impl Rng,
     u_plus_old: &[f64],
 ) -> (usize, Vec<f64>) {
@@ -376,14 +456,26 @@ fn adaptive_split_check_with_thresholds(
     }
 
     let mut to_split: Vec<usize> = Vec::new();
+    let zoom_half = zoom_cube_size / 2.0;
 
     // Find m+ particles that need splitting
     for (i, p) in state.particles.iter().enumerate() {
         if p.sign != 1 { continue; }  // Only split m+
-        if p.split_level >= 9 { continue; }  // Max level reached
+        if p.split_level >= max_split_level { continue; }  // Max level reached (strict limit)
 
-        let threshold = delta_split[p.split_level as usize];
-        if densities[i] > threshold {
+        // Spatial condition: if zoom is enabled, particle must be inside zoom cube
+        if zoom_cube_size > 0.0 {
+            let px = p.pos[0] as f64;
+            let py = p.pos[1] as f64;
+            let pz = p.pos[2] as f64;
+            if px.abs() > zoom_half || py.abs() > zoom_half || pz.abs() > zoom_half {
+                continue;  // Outside zoom zone → no split
+            }
+        }
+
+        // Density threshold based on current split level (uses ρ_plus, not ρ_total)
+        let threshold = if p.split_level == 0 { delta_split_l1 } else { delta_split_l2 };
+        if densities_plus[i] > threshold {
             to_split.push(i);
         }
     }
@@ -487,15 +579,22 @@ fn adaptive_split_check_with_thresholds(
 // ═══════════════════════════════════════════════════════════════════════════
 // DENSITY COMPUTATION (Grid-based for now, SPH later)
 // ═══════════════════════════════════════════════════════════════════════════
-fn compute_densities(particles: &[ParticleV3], box_size: f64) -> Vec<f64> {
+
+/// Compute separate density fields for m+ and m- particles.
+/// Returns (densities_plus, densities_minus, rho_plus_max, rho_minus_max)
+/// where densities_X[i] is the density at particle i's location for population X.
+fn compute_densities_split(particles: &[ParticleV3], box_size: f64) -> (Vec<f64>, Vec<f64>, f64, f64) {
     let grid_size = 64;
     let cell_size = box_size / grid_size as f64;
     let cell_vol = cell_size.powi(3);
+    let n_cells = grid_size * grid_size * grid_size;
 
-    // Count particles per cell
-    let mut grid = vec![0.0f64; grid_size * grid_size * grid_size];
+    // Separate grids for m+ and m-
+    let mut grid_plus = vec![0.0f64; n_cells];
+    let mut grid_minus = vec![0.0f64; n_cells];
     let box_half = box_size / 2.0;
 
+    // Accumulate mass per cell, separated by sign
     for p in particles {
         let x = ((p.pos[0] as f64 + box_half) / cell_size) as usize;
         let y = ((p.pos[1] as f64 + box_half) / cell_size) as usize;
@@ -506,16 +605,31 @@ fn compute_densities(particles: &[ParticleV3], box_size: f64) -> Vec<f64> {
         let z = z.min(grid_size - 1);
 
         let idx = x + y * grid_size + z * grid_size * grid_size;
-        grid[idx] += p.mass as f64;
+        let m = p.mass as f64;
+
+        if p.sign == 1 {
+            grid_plus[idx] += m;
+        } else {
+            grid_minus[idx] += m;
+        }
     }
 
     // Convert to density
-    for v in &mut grid {
+    for v in &mut grid_plus {
+        *v /= cell_vol;
+    }
+    for v in &mut grid_minus {
         *v /= cell_vol;
     }
 
-    // Assign density to each particle
-    let mut densities = Vec::with_capacity(particles.len());
+    // Find max densities
+    let rho_plus_max = grid_plus.iter().cloned().fold(0.0f64, f64::max);
+    let rho_minus_max = grid_minus.iter().cloned().fold(0.0f64, f64::max);
+
+    // Assign density to each particle (both populations)
+    let mut densities_plus = Vec::with_capacity(particles.len());
+    let mut densities_minus = Vec::with_capacity(particles.len());
+
     for p in particles {
         let x = ((p.pos[0] as f64 + box_half) / cell_size) as usize;
         let y = ((p.pos[1] as f64 + box_half) / cell_size) as usize;
@@ -526,11 +640,13 @@ fn compute_densities(particles: &[ParticleV3], box_size: f64) -> Vec<f64> {
         let z = z.min(grid_size - 1);
 
         let idx = x + y * grid_size + z * grid_size * grid_size;
-        densities.push(grid[idx]);
+        densities_plus.push(grid_plus[idx]);
+        densities_minus.push(grid_minus[idx]);
     }
 
-    densities
+    (densities_plus, densities_minus, rho_plus_max, rho_minus_max)
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SNAPSHOT V3 SAVE
@@ -988,30 +1104,14 @@ fn generate_zeldovich_ics(n_grid: usize, l_box: f64, z_init: f64, h0: f64, mu: f
 fn main() {
     let args = Args::parse();
 
-    // Compute ρ_mean_plus for density-independent thresholds
+    // Compute ρ_mean_plus for reference (informational logging)
     let rho_crit = 2.775e11 * (args.h0 / 100.0).powi(2);  // M☉/Mpc³
     let rho_mean_plus = args.omega_b * rho_crit;  // ≈ 6.78e9 M☉/Mpc³
-
-    // Build delta_split array: multiples of ρ_mean_plus
-    // First split at 10,000× ρ_mean = 6.78e13 M☉/Mpc³
-    // ICs have ρ_max ≈ 3e12 → factor 22× below threshold → no split at z=10
-    let delta_split: [f64; 10] = [
-        rho_mean_plus * 1.0e4,   // level 0→1 : ×10,000 — real collapse start
-        rho_mean_plus * 3.0e4,   // level 1→2 : ×30,000
-        rho_mean_plus * 1.0e5,   // level 2→3 : ×100,000
-        rho_mean_plus * 3.0e5,   // level 3→4 : ×300,000
-        rho_mean_plus * 1.0e6,   // level 4→5 : ×1,000,000
-        rho_mean_plus * 3.0e6,   // level 5→6 : ×3,000,000
-        rho_mean_plus * 1.0e7,   // level 6→7 : ×10,000,000
-        rho_mean_plus * 3.0e7,   // level 7→8 : ×30,000,000
-        rho_mean_plus * 1.0e8,   // level 8→9 : ×100,000,000
-        rho_mean_plus * 3.0e8,   // level 9→10 : ×300,000,000
-    ];
 
     let n_particles_init = args.n_grid * args.n_grid * args.n_grid;
 
     println!("╔══════════════════════════════════════════════════════════════════════════╗");
-    println!("║           JANUS ADAPTIVE ZOOM — Production Run                           ║");
+    println!("║           JANUS ADAPTIVE ZOOM — Production Run (v8)                      ║");
     println!("╠══════════════════════════════════════════════════════════════════════════╣");
     println!("║  COSMOLOGY: μ = {}, η = {}", args.mu, ETA);
     println!("║    H₀ = {} km/s/Mpc, Ω_b = {}", args.h0, args.omega_b);
@@ -1022,11 +1122,17 @@ fn main() {
     println!("║    z_init = {} → z_final = {}, dt = {} Gyr", args.z_init, args.z_final, args.dt_max);
     println!("║    θ = {}, η = {}", args.theta, args.eta);
     println!("╠══════════════════════════════════════════════════════════════════════════╣");
-    println!("║  ADAPTIVE SPLITTING:");
-    println!("║    Check every {} steps", args.steps_check);
+    println!("║  ADAPTIVE SPLITTING (v8: ρ_plus threshold + spatial zoom):");
+    println!("║    Check every {} steps, max_split_level = {}", args.steps_check, args.max_split_level);
     println!("║    ρ_mean_plus = {:.2e} M☉/Mpc³", rho_mean_plus);
-    println!("║    δ_split[0] = {:.2e} M☉/Mpc³ (×10⁴ ρ_mean)", delta_split[0]);
-    println!("║    δ_split[5] = {:.2e} M☉/Mpc³ (×3×10⁶ ρ_mean)", delta_split[5]);
+    println!("║    δ_split_L1 = {:.2e} M☉/Mpc³ (level 0→1)", args.delta_split_l1);
+    println!("║    δ_split_L2 = {:.2e} M☉/Mpc³ (level 1→2)", args.delta_split_l2);
+    if args.zoom_cube_size > 0.0 {
+        println!("║    ZOOM CUBE: [{:.0}, +{:.0}]³ Mpc (size={} Mpc)",
+            -args.zoom_cube_size / 2.0, args.zoom_cube_size / 2.0, args.zoom_cube_size);
+    } else {
+        println!("║    ZOOM: disabled (splits anywhere based on ρ_plus)");
+    }
     println!("╠══════════════════════════════════════════════════════════════════════════╣");
     println!("║  OUTPUT: {} (v3 format)", args.out_dir);
     println!("║    Snapshots every {} steps, Label: {}", args.snap_interval, args.run_label);
@@ -1107,7 +1213,10 @@ fn main() {
     // CSV output
     let csv_path = format!("{}/time_series.csv", args.out_dir);
     let mut csv = BufWriter::new(File::create(&csv_path).unwrap());
-    writeln!(csv, "step,t_Gyr,z,a,N_total,N_hr,split_max,rho_max,v_rms").unwrap();
+    writeln!(csv, "step,t_Gyr,z,a,N_total,N_hr,split_max,rho_max,v_rms,rho_plus_max,phi,E_total,E_plus,E_minus,E_drift_pct").unwrap();
+
+    // Energy tracking: E = ρ⁺c²a⁺³ + ρ⁻c̄²a⁻³ (should be constant, and < 0 for μ > 1)
+    let mut e_total_0: Option<f64> = None;
 
     println!("\n[3/5] Starting main loop (z={} → z={})...\n", args.z_init, args.z_final);
 
@@ -1121,8 +1230,8 @@ fn main() {
             break;
         }
 
-        // H(z) = H₀ × (1+z)^(3/2) for matter-dominated Janus (Ω_tot=1)
-        let h = (args.h0 / MPC_GYR_TO_KMS) / a.powf(1.5);  // Same as janus_baryonic_calibrated
+        // H(a) via Janus two-phase expansion (Petit 2014/2018)
+        let h = compute_hubble_janus(a, args.h0);
 
         // Metrics
         let do_metric = step % METRIC_INTERVAL == 0;
@@ -1135,9 +1244,12 @@ fn main() {
             let vel = gpu_sim.get_velocities().unwrap();
             state.sync_from_gpu(&pos, &vel);
 
-            // Compute densities
-            let densities = compute_densities(&state.particles, args.l_box);
-            let rho_max = densities.iter().cloned().fold(0.0f64, f64::max);
+            // Compute densities (separated by sign for proper Janus splitting)
+            let (densities_plus, densities_minus, rho_plus_max, _rho_minus_max) =
+                compute_densities_split(&state.particles, args.l_box);
+            let rho_max = densities_plus.iter().zip(densities_minus.iter())
+                .map(|(a, b)| a + b)
+                .fold(0.0f64, f64::max);
 
             // v_rms
             let v_rms: f64 = {
@@ -1147,7 +1259,7 @@ fn main() {
                 (sum / state.particles.len() as f64).sqrt() * MPC_GYR_TO_KMS
             };
 
-            // Adaptive split check
+            // Adaptive split check (uses ρ_plus for threshold, not ρ_total)
             if do_split {
                 let n_before = state.particles.len();
 
@@ -1156,7 +1268,14 @@ fn main() {
                     .expect("Failed to read internal energy before split");
 
                 let (n_new, u_new) = adaptive_split_check_with_thresholds(
-                    &mut state, &densities, &delta_split, &mut rng_split, &u_old,
+                    &mut state,
+                    &densities_plus,          // Use ρ_plus for m+ splitting threshold
+                    args.delta_split_l1,
+                    args.delta_split_l2,
+                    args.max_split_level,
+                    args.zoom_cube_size,
+                    &mut rng_split,
+                    &u_old,
                 );
 
                 if n_new > 0 {
@@ -1200,13 +1319,63 @@ fn main() {
             let n_hr = state.particles.iter().filter(|p| p.split_level > 0).count();
             let split_max = state.max_split_level();
 
+            // ═══════════════════════════════════════════════════════
+            // ENERGY CONSERVATION CHECK (Petit et al. 2024)
+            // E = ρ⁺c²a⁺³ + ρ⁻c̄²a⁻³ should be constant (and negative for μ > 1)
+            // ═══════════════════════════════════════════════════════
+            let (phi, _phi_inv) = compute_phi_factors(a, ETA);
+
+            // Compute total masses accounting for split levels
+            let (m_plus_total, m_minus_total) = {
+                let mut m_p = 0.0f64;
+                let mut m_m = 0.0f64;
+                for p in &state.particles {
+                    let mass_factor = if p.split_level == 0 { 1.0 } else { 1.0 / 8.0_f64.powi(p.split_level as i32) };
+                    if p.sign == 1 {
+                        m_p += state.m_plus_base * mass_factor;
+                    } else {
+                        m_m += state.m_minus_base * mass_factor;
+                    }
+                }
+                (m_p, m_m)
+            };
+
+            // Comoving densities (M☉/Mpc³)
+            let vol = args.l_box * args.l_box * args.l_box;
+            let rho_plus_comoving = m_plus_total / vol;
+            let rho_minus_comoving = -m_minus_total / vol;  // Negative mass density!
+
+            // VSL: c̄/c at this redshift
+            let c_ratio_sq = CoupledFriedmann::c_ratio_sq_at_z(z, ETA);
+            let c_plus = 1.0;  // Code units
+            let c_minus = c_ratio_sq.sqrt();
+
+            // Scale factors for both sectors
+            let a_plus = a;
+            let a_minus = a_minus_from_a_plus(a, ETA);
+
+            // Compute total energy
+            let (e_total, e_plus, e_minus) = compute_total_energy(
+                rho_plus_comoving, rho_minus_comoving,
+                c_plus, c_minus,
+                a_plus, a_minus
+            );
+
+            // Track initial E for drift calculation
+            if e_total_0.is_none() {
+                e_total_0 = Some(e_total);
+                println!("  📊 Initial E_total = {:.6e} (should be < 0 for μ > 1)", e_total);
+            }
+            let e_drift = energy_drift_pct(e_total, e_total_0.unwrap());
+
             if do_metric {
-                writeln!(csv, "{},{:.6},{:.4},{:.6},{},{},{},{:.3e},{:.2}",
-                    step, t_gyr, z, a, state.particles.len(), n_hr, split_max, rho_max, v_rms).unwrap();
+                writeln!(csv, "{},{:.6},{:.4},{:.6},{},{},{},{:.3e},{:.2},{:.3e},{:.6},{:.6e},{:.6e},{:.6e},{:.4}",
+                    step, t_gyr, z, a, state.particles.len(), n_hr, split_max, rho_max, v_rms, rho_plus_max,
+                    phi, e_total, e_plus, e_minus, e_drift).unwrap();
 
                 if step % 100 == 0 || do_split {
-                    println!("  Step {:5} | z={:.3} | N={:>8} | N_hr={:>6} | ρ_max={:.2e} | v_rms={:.1} km/s",
-                        step, z, state.particles.len(), n_hr, rho_max, v_rms);
+                    println!("  Step {:5} | z={:.3} | N={:>8} | N_hr={:>6} | ρ_max={:.2e} | ρ+_max={:.2e} | v_rms={:.1} km/s | E_drift={:.3}%",
+                        step, z, state.particles.len(), n_hr, rho_max, rho_plus_max, v_rms, e_drift);
                 }
             }
 
@@ -1306,4 +1475,184 @@ fn main() {
     eprintln!("ERROR: This binary requires --features cuda");
     eprintln!("Usage: cargo run --release --features cuda --bin janus_adaptive_zoom");
     std::process::exit(1);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UNIT TESTS — Janus expansion (Petit 2014/2018)
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hubble_today() {
+        let h = compute_hubble_janus(1.0, 69.9);
+        let h_kms_mpc = h * MPC_GYR_TO_KMS;
+
+        // Must give 69.9 km/s/Mpc within 0.01%
+        assert!(
+            (h_kms_mpc - 69.9).abs() < 0.01,
+            "H(a=1) = {} km/s/Mpc, expected 69.9", h_kms_mpc
+        );
+    }
+
+    #[test]
+    fn test_hubble_matter_era() {
+        let h0 = 69.9;
+
+        // Reference values computed in Python (precision 0.01%)
+        let test_cases = vec![
+            // (z,    expected_H_Gyr_inv,   tol)
+            (0.0,    0.071487,             1e-4),
+            (0.1,    0.077186,             1e-4),
+            (0.5,    0.097594,             1e-4),
+            (1.0,    0.117986,             1e-4),
+            (2.0,    0.142492,             1e-4),
+            (3.0,    0.143787,             1e-4),
+            (4.0,    0.107606,             1e-4),
+        ];
+
+        for (z, expected, tol) in test_cases {
+            let a = 1.0 / (1.0 + z);
+            let h = compute_hubble_janus(a, h0);
+            assert!(
+                (h - expected).abs() < tol,
+                "H(z={}): got {}, expected {}, diff = {}",
+                z, h, expected, (h - expected).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_hubble_radiation_era() {
+        let h0 = 69.9;
+        let h0_gyr = h0 / MPC_GYR_TO_KMS;
+
+        // Radiative phase: H = H₀ / a^(3/2)
+        let test_zs = vec![5.0, 6.0, 8.0, 10.0];
+
+        for z in test_zs {
+            let a = 1.0 / (1.0 + z);
+            let h = compute_hubble_janus(a, h0);
+            let expected = h0_gyr / a.powf(1.5);
+            assert!(
+                (h - expected).abs() < 1e-7,
+                "H(z={}) radiative: got {}, expected {} (EdS)",
+                z, h, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_phase_transition() {
+        let h0 = 69.9;
+
+        // Just below α²: radiative phase, H large
+        let a_below = ALPHA_SQ_JANUS - 1e-6;
+        let h_below = compute_hubble_janus(a_below, h0);
+        assert!(
+            h_below > 0.9,
+            "Just below transition (a={}): H = {} should be ~0.92 (radiation)",
+            a_below, h_below
+        );
+
+        // At α² exactly: matter phase, μ_p=0, H ≈ 0
+        let h_at = compute_hubble_janus(ALPHA_SQ_JANUS, h0);
+        assert!(
+            h_at.abs() < 1e-5,
+            "At transition (a=α²): H = {} should be ~0 (μ_p=0)", h_at
+        );
+
+        // Just above α²: matter phase, H small positive
+        let a_above = ALPHA_SQ_JANUS + 1e-6;
+        let h_above = compute_hubble_janus(a_above, h0);
+        assert!(
+            h_above > 0.0 && h_above < 0.01,
+            "Just above transition (a={}): H = {} should be small positive",
+            a_above, h_above
+        );
+    }
+
+    #[test]
+    fn test_cosmic_age() {
+        let h0 = 69.9;
+
+        // Integrate ∫_{α²}^{1} da/(aH) should give 15.87 Gyr
+        let n_steps = 10000;
+        let log_a_start = ALPHA_SQ_JANUS.ln() + 1e-6;  // avoid exact point
+        let log_a_end = 0.0;  // ln(1) = 0
+        let dlog = (log_a_end - log_a_start) / n_steps as f64;
+
+        let mut t_integral = 0.0;
+        for i in 0..n_steps {
+            let log_a_mid = log_a_start + (i as f64 + 0.5) * dlog;
+            let a = log_a_mid.exp();
+            let h = compute_hubble_janus(a, h0);
+            // dt = da/(aH) = d(ln a)/H
+            t_integral += dlog / h;
+        }
+
+        println!("Cosmic age (matter era only): {:.4} Gyr", t_integral);
+        assert!(
+            (t_integral - 15.87).abs() < 0.05,
+            "Cosmic age: got {} Gyr, expected 15.87 Gyr", t_integral
+        );
+    }
+
+    #[test]
+    fn test_a_progression_through_transition() {
+        let h0 = 69.9;
+
+        // Simulate leapfrog integration around the junction
+        let dt = 0.001;  // Gyr
+        let mut a = 1.0 / 11.0;  // z = 10
+        let mut steps = 0;
+        let max_steps = 50_000;  // safety limit
+
+        while a < 1.0 && steps < max_steps {
+            let h = compute_hubble_janus(a, h0);
+            // da = a * H * dt
+            a += a * h * dt;
+            steps += 1;
+
+            // Sanity: no NaN or Inf
+            assert!(a.is_finite(), "a became {} at step {}", a, steps);
+            assert!(h.is_finite(), "H became {} at step {} (a={})", h, steps, a);
+        }
+
+        println!("Reached a={} in {} steps", a, steps);
+        assert!(steps < max_steps, "Did not reach a=1 in {} steps", max_steps);
+    }
+
+    #[test]
+    fn test_reference_table() {
+        let h0 = 69.9;
+
+        // Table of precisely computed values in Python
+        // Format: (a, H_in_Gyr_inv)
+        let reference = vec![
+            // Radiative phase (a < α² = 0.1815)
+            (0.09091, 2.608052),  // z=10
+            (0.11111, 1.930149),  // z=8
+            (0.14286, 1.323958),  // z=6
+            (0.16667, 1.050640),  // z=5
+            // Matter phase (a > α²)
+            (0.20000, 0.107606),  // z=4
+            (0.25000, 0.143787),  // z=3
+            (0.33333, 0.142492),  // z=2
+            (0.50000, 0.117986),  // z=1
+            (0.66667, 0.097594),  // z=0.5
+            (0.90909, 0.077186),  // z=0.1
+            (1.00000, 0.071487),  // z=0
+        ];
+
+        for (a, expected) in reference {
+            let h = compute_hubble_janus(a, h0);
+            let rel_err = (h - expected).abs() / expected;
+            assert!(
+                rel_err < 1e-3,
+                "a={}: H={}, expected={}, rel_err={}", a, h, expected, rel_err
+            );
+        }
+    }
 }

@@ -18,15 +18,15 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 
 # === CONFIGURATION ===
-SNAP_DIR = Path("/mnt/T2/janus-sim/output/test_phase11_translation/snapshots")
-OUT_10P = Path("/mnt/T2/janus-sim/output/test_phase11_translation/frames_10panel")
-OUT_2P5D = Path("/mnt/T2/janus-sim/output/test_phase11_translation/frames_2p5d")
+SNAP_DIR = Path("/mnt/T2/janus-sim/output/janus_jpp_production/snapshots")
+OUT_10P = Path("/mnt/T2/janus-sim/output/janus_jpp_production/frames_10panel")
+OUT_2P5D = Path("/mnt/T2/janus-sim/output/janus_jpp_production/frames_2p5d")
 OUT_10P.mkdir(exist_ok=True, parents=True)
 OUT_2P5D.mkdir(exist_ok=True, parents=True)
 
 RESOLUTION_4K = (3840, 2160)
 DPI = 200
-ZOOM_SIZE = 100.0  # For 500 Mpc box (larger zoom to see structure better)
+ZOOM_SIZE = 100.0  # For 500 Mpc box (JPP production)
 GRID_SIZE = 64
 SUBSAMPLE = 200000  # Max particles to plot for performance
 GLOBAL_RADIUS = 200.0  # Only show particles within this radius from center (removes edge artifacts)

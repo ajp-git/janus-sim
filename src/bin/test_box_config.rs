@@ -245,7 +245,7 @@ fn run_config(config_name: &str, box_size: f64, output_dir: &str) -> Result<(f64
         let (a, h) = cosmo.get_params_at_tau(tau);
         let z = (1.0 / a - 1.0).max(0.0);
 
-        sim.step_treepm_gpu_morton(DT, r_cut, h, dtau_per_dt)?;
+        sim.step_treepm_gpu(DT, r_cut, h, dtau_per_dt)?;
         tau += dtau_per_dt * DT;
 
         if step % 10 == 0 || step == 1 {

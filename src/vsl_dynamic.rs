@@ -126,6 +126,21 @@ impl CoupledFriedmann {
         Self::c_ratio_sq_at_z(z, eta)
     }
 
+    /// Compute a⁻ from a⁺ — CANONICAL SOURCE OF TRUTH (Petit 2014)
+    ///
+    /// a⁻(z) = a⁺(z) × (1+z)^(-δ)  where δ = (η-1)/η
+    ///
+    /// Properties:
+    /// - At z=0: a⁻ = a⁺ = 1
+    /// - At z>0 with η>1: a⁻ < a⁺ (negative sector more contracted)
+    /// - Identity: c̄²(z) = a⁺/a⁻
+    #[inline]
+    pub fn a_minus_from_a_plus(a_plus: f64, eta: f64) -> f64 {
+        let z = 1.0 / a_plus - 1.0;
+        let delta = (eta - 1.0) / eta;
+        a_plus * (1.0_f64 + z).powf(-delta)
+    }
+
     /// Update state for new scale factor a⁺
     pub fn update_a_plus(&mut self, a_plus: f64) {
         self.state.a_plus = a_plus;
@@ -330,5 +345,35 @@ mod tests {
             let c_ratio = c_ratio_sq.sqrt();
             println!("{:.1}\t\t{:.6}\t{:.6}", z, c_ratio, c_ratio_sq);
         }
+    }
+
+    #[test]
+    fn test_a_minus_petit_2014() {
+        // Pin the exact Petit 2014 formula for a_minus
+        let eta = 1.045;
+        let z_test = 10.0;
+        let a_plus = 1.0 / (1.0 + z_test);
+        let a_minus = CoupledFriedmann::a_minus_from_a_plus(a_plus, eta);
+
+        // Expected from Petit 2014: a⁻ = a⁺ × (1+z)^(-δ) where δ = (η-1)/η
+        let delta = (eta - 1.0) / eta;
+        let expected = a_plus * (1.0_f64 + z_test).powf(-delta);
+        assert!((a_minus - expected).abs() / expected < 1e-10,
+            "a_minus formula mismatch: got {}, expected {}", a_minus, expected);
+
+        // Sanity: a_minus < a_plus at z>0 when η>1
+        assert!(a_minus < a_plus,
+            "a_minus should be < a_plus at z>0 for η>1: a_minus={}, a_plus={}", a_minus, a_plus);
+
+        // Sanity: a_minus = a_plus at z=0
+        let a_minus_today = CoupledFriedmann::a_minus_from_a_plus(1.0, eta);
+        assert!((a_minus_today - 1.0).abs() < 1e-10,
+            "a_minus should equal 1.0 at z=0: got {}", a_minus_today);
+
+        // Identity: c̄²(z) = a⁺/a⁻
+        let c_bar_sq = CoupledFriedmann::c_ratio_sq_at_z(z_test, eta);
+        let ratio = a_plus / a_minus;
+        assert!((c_bar_sq - ratio).abs() < 1e-10,
+            "Identity c̄² = a⁺/a⁻ violated: c̄²={}, a⁺/a⁻={}", c_bar_sq, ratio);
     }
 }

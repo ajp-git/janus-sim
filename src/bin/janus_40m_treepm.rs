@@ -4,7 +4,7 @@
 //!   - Positions: grid + FFT-based P(k) displacement spectrum
 //!   - Velocities: random, scaled by virial_factor = 0.8
 //!
-//! TreePM using optimized step_treepm_gpu_morton:
+//! TreePM using optimized step_treepm_gpu:
 //!   - Morton ordering: 7.4x speedup
 //!   - Warp-coherent kernel: 3x additional
 //!   - Expected: ~15s/step @ 40M → 2 days for 12000 steps
@@ -505,7 +505,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let dtau_eff = if current_tau <= cosmo.tau_end { dtau_per_dt } else { 0.0 };
 
         // TreePM step with Morton ordering + warp-coherent kernel
-        sim.step_treepm_gpu_morton(DT, r_cut, h, dtau_eff)?;
+        sim.step_treepm_gpu(DT, r_cut, h, dtau_eff)?;
         step += 1;
         current_tau += dtau_cosmo;
 

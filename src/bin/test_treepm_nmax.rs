@@ -113,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for step in 1..=TEST_STEPS {
         let (a, h) = cosmo.get_params_at_tau(tau);
-        sim.step_treepm_gpu_morton(DT, r_cut, h, dtau_per_dt)?;
+        sim.step_treepm_gpu(DT, r_cut, h, dtau_per_dt)?;
         tau += dtau_per_step;
 
         if step % 10 == 0 {

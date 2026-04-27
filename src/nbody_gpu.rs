@@ -87,8 +87,8 @@ extern "C" __global__ void compute_forces_simple(
     int n_particles,
     double theta,
     double softening,
-    double c_ratio_sq,  // (c_minus/c_plus)^2, default=1.0, VSL=100.0
-    double repulsion_scale,  // 0.0=no cross-species, 1.0=full Janus (gradual ramp)
+    double cross_minus_plus,  // Effective factor for m- ← m+: c_ratio_sq * phi_inv * repulsion_scale
+    double cross_plus_minus,  // Effective factor for m+ ← m-: phi * repulsion_scale
     double box_size  // Box size for periodic boundary conditions
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -148,13 +148,13 @@ extern "C" __global__ void compute_forces_simple(
                 double dpz = minimum_image(com_plus_z - pz, box_size, box_half);
                 double rp2 = dpx*dpx + dpy*dpy + dpz*dpz + eps2;
                 double inv_rp3 = 1.0 / (rp2 * sqrt(rp2));
-                // VSL Option B: m- feels AMPLIFIED repulsion from m+ (factor c_ratio_sq)
-                // repulsion_scale: 0.0 = no cross-species, 1.0 = full Janus
+                // Cross-species interaction: m- ← m+ repulsion
+                // Includes VSL c_ratio_sq, Petit 2024 phi_inv, and repulsion_scale
                 double interaction;
                 if (my_sign > 0) {
                     interaction = 1.0;  // m+ ← m+ attraction (always)
                 } else {
-                    interaction = -c_ratio_sq * repulsion_scale;  // m- ← m+ repulsion (scaled)
+                    interaction = -cross_minus_plus;  // m- ← m+ repulsion
                 }
                 double f = interaction * mass_plus * inv_rp3;
                 ax += f * dpx;
@@ -168,13 +168,13 @@ extern "C" __global__ void compute_forces_simple(
                 double dmz = minimum_image(com_minus_z - pz, box_size, box_half);
                 double rm2 = dmx*dmx + dmy*dmy + dmz*dmz + eps2;
                 double inv_rm3 = 1.0 / (rm2 * sqrt(rm2));
-                // VSL Option B: m+ feels STANDARD repulsion from m- (factor 1.0)
-                // repulsion_scale: 0.0 = no cross-species, 1.0 = full Janus
+                // Cross-species interaction: m+ ← m- repulsion
+                // Includes Petit 2024 phi and repulsion_scale
                 double interaction;
                 if (my_sign < 0) {
                     interaction = 1.0;  // m- ← m- attraction (always)
                 } else {
-                    interaction = -1.0 * repulsion_scale;  // m+ ← m- repulsion (scaled)
+                    interaction = -cross_plus_minus;  // m+ ← m- repulsion
                 }
                 double f = interaction * mass_minus * inv_rm3;
                 ax += f * dmx;
@@ -285,6 +285,66 @@ extern "C" __global__ void kick_only(
     }
 }
 
+// COSMOLOGICAL DRIFT (peculiar convention)
+//   x_co  : comoving Mpc
+//   v_pec : peculiar proper velocity = a * dx_co/dt   (Mpc/Gyr)
+//   dx_co/dt = v_pec / a   ->   pos += vel * dt / a
+// signs[tid] selects per-particle scale factor (+ -> a_plus, - -> a_minus).
+extern "C" __global__ void drift_only_cosmo(
+    double* __restrict__ pos,
+    const double* __restrict__ vel,
+    const int* __restrict__ signs,
+    double dt,
+    double box_half,
+    double a_plus,
+    double a_minus,
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    int base = tid * 3;
+    double a_eff = (signs[tid] > 0) ? a_plus : a_minus;
+    double inv_a = 1.0 / a_eff;
+    pos[base]     += vel[base]     * dt * inv_a;
+    pos[base + 1] += vel[base + 1] * dt * inv_a;
+    pos[base + 2] += vel[base + 2] * dt * inv_a;
+    // Robust periodic BC for arbitrary-size displacements
+    double box = 2.0 * box_half;
+    for (int i = 0; i < 3; i++) {
+        double p = pos[base + i] + box_half;     // shift to [0, box]
+        p = p - box * floor(p / box);            // wrap
+        pos[base + i] = p - box_half;            // shift back to [-box_half, box_half]
+    }
+}
+
+// COSMOLOGICAL KICK (peculiar convention)
+//   acc[]  : bare comoving accel = G*m / r_co^2   (output of compute_forces_bvh, no a-factor)
+//   dv_pec/dt = -H * v_pec  -  G*m / (a^2 * r_co^2) =  acc / a^2  -  H * v_pec
+// Per-particle a and H selected by sign.
+extern "C" __global__ void kick_only_cosmo(
+    double* __restrict__ vel,
+    const double* __restrict__ acc,
+    const int* __restrict__ signs,
+    double dt,
+    int n,
+    double a_plus,
+    double a_minus,
+    double h_plus,
+    double h_minus
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    int base = tid * 3;
+    double a_eff = (signs[tid] > 0) ? a_plus  : a_minus;
+    double h_eff = (signs[tid] > 0) ? h_plus  : h_minus;
+    double inv_a2 = 1.0 / (a_eff * a_eff);
+    for (int d = 0; d < 3; d++) {
+        double grav = acc[base + d] * inv_a2;
+        double friction = -h_eff * vel[base + d];
+        vel[base + d] += (grav + friction) * dt;
+    }
+}
+
 // Morton code computation for spatial sorting
 // Maps 3D position to 1D Morton code (Z-order curve) for cache locality
 // Expand 10-bit integer to 30 bits with 2 zeros between each bit
@@ -303,16 +363,34 @@ extern "C" __global__ void compute_morton_codes(
     int* __restrict__ indices,
     int n,
     double box_half,
-    double inv_cell_size
+    double inv_cell_size,
+    double offset_x,  // Phase 13: random octree offset
+    double offset_y,
+    double offset_z
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n) return;
 
-    // Read position and normalize to [0, 1024) range (10 bits per axis)
-    double scale = 1024.0 / (2.0 * box_half);
-    double x = (pos[tid * 3]     + box_half) * scale;
-    double y = (pos[tid * 3 + 1] + box_half) * scale;
-    double z = (pos[tid * 3 + 2] + box_half) * scale;
+    // Phase 13: Shift positions by random offset before Morton computation
+    // This breaks the fixed grid alignment that causes cardinal-direction artifacts
+    double box_size = 2.0 * box_half;
+    double px = pos[tid * 3]     + offset_x;
+    double py = pos[tid * 3 + 1] + offset_y;
+    double pz = pos[tid * 3 + 2] + offset_z;
+
+    // Periodic wrap to [-box_half, box_half]
+    if (px >  box_half) px -= box_size;
+    if (px < -box_half) px += box_size;
+    if (py >  box_half) py -= box_size;
+    if (py < -box_half) py += box_size;
+    if (pz >  box_half) pz -= box_size;
+    if (pz < -box_half) pz += box_size;
+
+    // Normalize to [0, 1024) range (10 bits per axis)
+    double scale = 1024.0 / box_size;
+    double x = (px + box_half) * scale;
+    double y = (py + box_half) * scale;
+    double z = (pz + box_half) * scale;
 
     // Clamp to valid range (10 bits = 0..1023)
     unsigned int ix = min(max((unsigned int)x, 0u), 0x3ffu);
@@ -796,6 +874,7 @@ extern "C" __global__ void reduce_com(
 }
 
 // Compute forces using GPU-built BVH
+// Note: theta is hardcoded to 0.7 (standard Barnes-Hut opening angle)
 extern "C" __global__ void compute_forces_bvh(
     const double* __restrict__ pos,
     const int* __restrict__ signs,
@@ -805,14 +884,16 @@ extern "C" __global__ void compute_forces_bvh(
     const int* __restrict__ node_types,
     double* __restrict__ acc,
     int n_particles,
-    double theta,
     double softening,
-    double c_ratio_sq,  // VSL: (c_minus/c_plus)^2, default=1.0, VSL=100.0
+    double cross_minus_plus,  // Effective factor for m- ← m+: c_ratio_sq * phi_inv * repulsion_scale
+    double cross_ratio,       // Ratio cross_plus_minus / cross_minus_plus
     double box_size  // Box size for periodic boundary conditions
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_particles) return;
 
+    const double theta = 0.7;  // Standard Barnes-Hut opening angle
+    double cross_plus_minus = cross_minus_plus * cross_ratio;  // Compute from ratio
     double box_half = 0.5 * box_size;
     double px = pos[tid * 3];
     double py = pos[tid * 3 + 1];
@@ -865,8 +946,8 @@ extern "C" __global__ void compute_forces_bvh(
                 double dpz = minimum_image(com_plus_z - pz, box_size, box_half);
                 double rp2 = dpx*dpx + dpy*dpy + dpz*dpz + eps2;
                 double inv_rp3 = 1.0 / (rp2 * sqrt(rp2));
-                // VSL Option B: m- feels AMPLIFIED repulsion from m+ (factor c_ratio_sq)
-                double interaction = (my_sign > 0) ? 1.0 : -c_ratio_sq;
+                // Cross-species: m- feels repulsion from m+ (cross_minus_plus factor)
+                double interaction = (my_sign > 0) ? 1.0 : -cross_minus_plus;
                 double f = interaction * mass_plus * inv_rp3;
                 ax += f * dpx;
                 ay += f * dpy;
@@ -883,8 +964,8 @@ extern "C" __global__ void compute_forces_bvh(
                 double dmz = minimum_image(com_minus_z - pz, box_size, box_half);
                 double rm2 = dmx*dmx + dmy*dmy + dmz*dmz + eps2;
                 double inv_rm3 = 1.0 / (rm2 * sqrt(rm2));
-                // VSL Option B: m+ feels STANDARD repulsion from m- (factor 1.0)
-                double interaction = (my_sign < 0) ? 1.0 : -1.0;
+                // Cross-species: m+ feels repulsion from m- (cross_plus_minus factor)
+                double interaction = (my_sign < 0) ? 1.0 : -cross_plus_minus;
                 double f = interaction * mass_minus * inv_rm3;
                 ax += f * dmx;
                 ay += f * dmy;
@@ -1619,11 +1700,17 @@ pub struct GpuNBodySimulation {
     /// Repulsion scale: 0.0 = no cross-species, 1.0 = full Janus physics
     /// Used for gradual ramp-up during initialization
     pub repulsion_scale: f64,
+    /// Cross-species coupling Φ = (ā/a)³ for force m⁻ → m⁺
+    /// (Petit et al. 2024, Eq. 95-96)
+    pub phi: f64,
+    /// Inverse coupling 1/Φ = (a/ā)³ for force m⁺ → m⁻
+    pub phi_inv: f64,
 }
 
 /// Kernel names used in PTX
 const KERNEL_NAMES: &[&str] = &[
     "compute_forces_simple", "leapfrog_kick_drift", "drift_only", "kick_only",
+    "drift_only_cosmo", "kick_only_cosmo",
     "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs", "reorder_masses",
     "build_bvh_internal", "init_leaves", "reduce_com", "compute_forces_bvh",
     "compute_forces_bvh_cross", "compute_forces_bvh_yukawa", "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
@@ -1762,6 +1849,8 @@ impl GpuNBodySimulation {
             c_ratio_sq: 1.0,  // VSL: (c_minus/c_plus)^2, default=1.0
             relax_mode: false,
             repulsion_scale: 1.0,
+            phi: 1.0,      // Cross-coupling (ā/a)³, default=1.0 (at z=0)
+            phi_inv: 1.0,  // Inverse coupling (a/ā)³
         })
     }
 
@@ -1773,6 +1862,7 @@ impl GpuNBodySimulation {
         let ptx = cudarc::nvrtc::compile_ptx(CUDA_KERNEL_SRC)?;
         device.load_ptx(ptx, "nbody", &[
             "compute_forces_simple", "leapfrog_kick_drift", "drift_only", "kick_only",
+            "drift_only_cosmo", "kick_only_cosmo",
             "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs", "reorder_masses",
             "build_bvh_internal", "init_leaves", "reduce_com", "compute_forces_bvh",
             "compute_forces_bvh_cross", "compute_forces_bvh_yukawa", "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
@@ -1921,6 +2011,8 @@ impl GpuNBodySimulation {
             c_ratio_sq: 1.0,  // VSL: (c_minus/c_plus)^2, default=1.0
             relax_mode: false,
             repulsion_scale: 1.0,
+            phi: 1.0,      // Cross-coupling (ā/a)³, default=1.0 (at z=0)
+            phi_inv: 1.0,  // Inverse coupling (a/ā)³
         })
     }
 
@@ -1935,6 +2027,7 @@ impl GpuNBodySimulation {
         let ptx = cudarc::nvrtc::compile_ptx(CUDA_KERNEL_SRC)?;
         device.load_ptx(ptx, "nbody", &[
             "compute_forces_simple", "leapfrog_kick_drift", "drift_only", "kick_only",
+            "drift_only_cosmo", "kick_only_cosmo",
             "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs", "reorder_masses",
             "build_bvh_internal", "init_leaves", "reduce_com", "compute_forces_bvh",
             "compute_forces_bvh_cross", "compute_forces_bvh_yukawa", "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
@@ -2010,6 +2103,8 @@ impl GpuNBodySimulation {
             c_ratio_sq: 1.0,  // VSL: (c_minus/c_plus)^2, default=1.0
             relax_mode: false,
             repulsion_scale: 1.0,
+            phi: 1.0,      // Cross-coupling (ā/a)³, default=1.0 (at z=0)
+            phi_inv: 1.0,  // Inverse coupling (a/ā)³
         })
     }
 
@@ -2097,6 +2192,8 @@ impl GpuNBodySimulation {
             c_ratio_sq: 1.0,  // VSL: (c_minus/c_plus)^2, default=1.0
             relax_mode: false,
             repulsion_scale: 1.0,
+            phi: 1.0,      // Cross-coupling (ā/a)³, default=1.0 (at z=0)
+            phi_inv: 1.0,  // Inverse coupling (a/ā)³
         })
     }
 
@@ -2197,6 +2294,19 @@ impl GpuNBodySimulation {
         self.repulsion_scale
     }
 
+    /// Set cross-species coupling factors (Petit et al. 2024)
+    /// phi: (ā/a)³ for m⁻ → m⁺ forces
+    /// phi_inv: (a/ā)³ for m⁺ → m⁻ forces
+    pub fn set_phi(&mut self, phi: f64, phi_inv: f64) {
+        self.phi = phi;
+        self.phi_inv = phi_inv;
+    }
+
+    /// Get current phi coupling factor
+    pub fn get_phi(&self) -> (f64, f64) {
+        (self.phi, self.phi_inv)
+    }
+
     /// Step sans expansion cosmologique (a=1, H=0)
     pub fn step(&mut self, dt: f64) -> Result<(), Box<dyn std::error::Error>> {
         self.step_with_expansion(dt, 1.0, 0.0, 0.0)
@@ -2242,15 +2352,20 @@ impl GpuNBodySimulation {
         let leapfrog = self.device.get_func("nbody", "leapfrog_kick_drift")
             .ok_or("Failed to get leapfrog_kick_drift kernel")?;
 
-        // Compute forces (12 args with VSL c_ratio_sq + repulsion_scale + box_size)
+        // Compute effective cross-species factors (Petit 2024)
+        let phi_inv = 1.0 / self.phi;
+        let cross_minus_plus = self.c_ratio_sq * phi_inv * self.repulsion_scale;
+        let cross_plus_minus = self.phi * self.repulsion_scale;
+
+        // Compute forces (12 args)
         unsafe {
             compute_forces.clone().launch(cfg, (
                 &self.pos, &self.signs,
                 &self.node_data, &self.node_children, &self.node_types,
                 &mut self.acc,
                 self.n_particles as i32,
-                self.theta, self.softening, self.c_ratio_sq, self.repulsion_scale,
-                self.box_size,  // Periodic boundary conditions
+                self.theta, self.softening, cross_minus_plus, cross_plus_minus,
+                self.box_size,
             ))?;
         }
 
@@ -2279,14 +2394,15 @@ impl GpuNBodySimulation {
         self.node_children = self.device.htod_sync_copy(&tree.node_children)?;
         self.node_types = self.device.htod_sync_copy(&tree.node_types)?;
 
-        // Compute forces again
+        // Compute forces again (reuse effective cross-species factors)
         unsafe {
             compute_forces.clone().launch(cfg, (
                 &self.pos, &self.signs,
                 &self.node_data, &self.node_children, &self.node_types,
                 &mut self.acc,
-                self.n_particles as i32, self.n_nodes as i32,
-                self.theta, self.softening, self.c_ratio_sq, self.repulsion_scale,
+                self.n_particles as i32,
+                self.theta, self.softening, cross_minus_plus, cross_plus_minus,
+                self.box_size,
             ))?;
         }
 
@@ -2321,6 +2437,11 @@ impl GpuNBodySimulation {
             grid_dim: (blocks as u32, 1, 1),
             shared_mem_bytes: 0,
         };
+
+        // Compute effective cross-species factors (Petit 2024)
+        let phi_inv = 1.0 / self.phi;
+        let cross_minus_plus = self.c_ratio_sq * phi_inv * self.repulsion_scale;
+        let cross_plus_minus = self.phi * self.repulsion_scale;
 
         // Get kernel functions
         let compute_forces = self.device.get_func("nbody", "compute_forces_simple")
@@ -2361,8 +2482,8 @@ impl GpuNBodySimulation {
                 &self.node_data, &self.node_children, &self.node_types,
                 &mut self.acc,
                 self.n_particles as i32,
-                self.theta, self.softening, self.c_ratio_sq, self.repulsion_scale,
-                self.box_size,  // Periodic boundary conditions
+                self.theta, self.softening, cross_minus_plus, cross_plus_minus,
+                self.box_size,
             ))?;
         }
 
@@ -2420,6 +2541,7 @@ impl GpuNBodySimulation {
         let inv_cell_size = 2097152.0 / self.box_size;
 
         // Step 1: Compute Morton codes on GPU
+        // Note: For pure sorting, we use zero offset (no grid randomization needed)
         let morton_kernel = self.device.get_func("nbody", "compute_morton_codes")
             .ok_or("Failed to get compute_morton_codes kernel")?;
 
@@ -2431,6 +2553,9 @@ impl GpuNBodySimulation {
                 self.n_particles as i32,
                 box_half,
                 inv_cell_size,
+                0.0_f64,  // offset_x = 0 (Phase 13: no offset for pure sorting)
+                0.0_f64,  // offset_y = 0
+                0.0_f64,  // offset_z = 0
             ))?;
         }
         self.device.synchronize()?;
@@ -2530,7 +2655,16 @@ impl GpuNBodySimulation {
             shared_mem_bytes: 0,
         };
 
-        // Step 1: Compute Morton codes
+        // Phase 13: Random octree offset to break grid alignment artifacts
+        // Each rebuild uses a different offset, so tree structure varies per step
+        // This prevents cumulative cardinal-direction contamination
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let offset_x = (rng.gen::<f64>() - 0.5) * self.box_size;
+        let offset_y = (rng.gen::<f64>() - 0.5) * self.box_size;
+        let offset_z = (rng.gen::<f64>() - 0.5) * self.box_size;
+
+        // Step 1: Compute Morton codes (with random offset)
         let morton_kernel = self.device.get_func("nbody", "compute_morton_codes")
             .ok_or("Failed to get compute_morton_codes kernel")?;
         unsafe {
@@ -2541,6 +2675,9 @@ impl GpuNBodySimulation {
                 n as i32,
                 box_half,
                 inv_cell_size,
+                offset_x,
+                offset_y,
+                offset_z,
             ))?;
         }
         self.device.synchronize()?;
@@ -2728,6 +2865,13 @@ impl GpuNBodySimulation {
             shared_mem_bytes: 0,
         };
 
+        // Phase 13: Random octree offset
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let offset_x = (rng.gen::<f64>() - 0.5) * self.box_size;
+        let offset_y = (rng.gen::<f64>() - 0.5) * self.box_size;
+        let offset_z = (rng.gen::<f64>() - 0.5) * self.box_size;
+
         // Step 1: Compute Morton codes
         let t1 = Instant::now();
         let morton_kernel = self.device.get_func("nbody", "compute_morton_codes")
@@ -2740,6 +2884,9 @@ impl GpuNBodySimulation {
                 n as i32,
                 box_half,
                 inv_cell_size,
+                offset_x,
+                offset_y,
+                offset_z,
             ))?;
         }
         self.device.synchronize()?;
@@ -2979,7 +3126,109 @@ impl GpuNBodySimulation {
         Ok(())
     }
 
-    /// DKD integrator with GPU-built BVH tree
+    /// COSMOLOGICAL DKD integrator (peculiar convention) — Janus bi-sector
+    ///
+    /// Conventions (Peebles, peculiar):
+    ///   pos[i]    : comoving Mpc, fixed box
+    ///   vel[i]    : peculiar proper velocity v_pec = a * dx_co/dt   [Mpc/Gyr]
+    ///   acc[i]    : output of compute_forces_bvh, bare G*m/r_co^2  (no a-factor)
+    ///
+    /// EOM:
+    ///   dx_co/dt   = v_pec / a
+    ///   dv_pec/dt  = -H * v_pec  -  G*m / (a^2 * r_co^2)  =  acc/a^2 - H*v_pec
+    ///
+    /// Per-particle a and H selected by sign (signs[tid] > 0 -> +sector, else -sector).
+    /// VSL/Petit cross-coupling (phi, c_ratio_sq) preserved unchanged in the BVH force kernel.
+    pub fn step_with_expansion_dkd_gpu_cosmo(
+        &mut self,
+        dt: f64,
+        a_plus: f64,
+        a_minus: f64,
+        h_plus: f64,
+        h_minus: f64,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    {
+        let half_dt = dt * 0.5;
+        let box_half = self.box_size / 2.0;
+        let n = self.n_particles;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let phi_inv = 1.0 / self.phi;
+        let cross_minus_plus = self.c_ratio_sq * phi_inv * self.repulsion_scale;
+        let cross_plus_minus = self.phi * self.repulsion_scale;
+
+        let drift_kernel = self.device.get_func("nbody", "drift_only_cosmo")
+            .ok_or("Failed to get drift_only_cosmo kernel")?;
+        let kick_kernel = self.device.get_func("nbody", "kick_only_cosmo")
+            .ok_or("Failed to get kick_only_cosmo kernel")?;
+        let force_kernel = self.device.get_func("nbody", "compute_forces_bvh")
+            .ok_or("Failed to get compute_forces_bvh kernel")?;
+
+        // D1: Drift(dt/2) at a_plus(t), a_minus(t)
+        unsafe {
+            drift_kernel.clone().launch(cfg, (
+                &mut self.pos, &self.vel, &self.signs,
+                half_dt, box_half,
+                a_plus, a_minus,
+                n as i32,
+            ))?;
+        }
+
+        // Tree at t+dt/2 (after D1)
+        self.build_gpu_tree()?;
+
+        // Force compute
+        unsafe {
+            force_kernel.launch(cfg, (
+                &self.pos,
+                &self.signs,
+                &self.bvh_node_data,
+                &self.bvh_left_child,
+                &self.bvh_right_child,
+                &self.bvh_node_types,
+                &mut self.acc,
+                n as i32,
+                self.softening,
+                cross_minus_plus, cross_plus_minus / cross_minus_plus,
+                self.box_size
+            ))?;
+        }
+
+        // K: full Kick(dt). a/H evaluated at t+dt/2 (centered) — caller passes those.
+        unsafe {
+            kick_kernel.clone().launch(cfg, (
+                &mut self.vel, &self.acc, &self.signs,
+                dt, n as i32,
+                a_plus, a_minus,
+                h_plus, h_minus,
+            ))?;
+        }
+
+        // D2: Drift(dt/2) at a_plus(t+dt), a_minus(t+dt) — for proper DKD the caller should
+        // pass a different (a,H) for D1 vs D2, but for small dt the centered approximation
+        // (single a,H per call) is acceptable.
+        unsafe {
+            drift_kernel.launch(cfg, (
+                &mut self.pos, &self.vel, &self.signs,
+                half_dt, box_half,
+                a_plus, a_minus,
+                n as i32,
+            ))?;
+        }
+
+        self.device.synchronize()?;
+        self.time += dt;
+
+        Ok(())
+    }
+
+    /// DKD integrator with GPU-built BVH tree (LEGACY, no cosmological coupling)
     /// Structure: Drift(dt/2) → GPU Tree Build → Force → Kick(dt) → Drift(dt/2)
     pub fn step_with_expansion_dkd_gpu(&mut self, dt: f64, _scale_factor: f64, hubble: f64, dtau_per_dt: f64)
         -> Result<(), Box<dyn std::error::Error>>
@@ -2994,6 +3243,11 @@ impl GpuNBodySimulation {
             grid_dim: (blocks as u32, 1, 1),
             shared_mem_bytes: 0,
         };
+
+        // Compute effective cross-species factors (Petit 2024)
+        let phi_inv = 1.0 / self.phi;
+        let cross_minus_plus = self.c_ratio_sq * phi_inv * self.repulsion_scale;
+        let cross_plus_minus = self.phi * self.repulsion_scale;
 
         // Get kernels
         let drift_kernel = self.device.get_func("nbody", "drift_only")
@@ -3026,10 +3280,9 @@ impl GpuNBodySimulation {
                 &self.bvh_node_types,
                 &mut self.acc,
                 n as i32,
-                self.theta,
                 self.softening,
-                self.c_ratio_sq,  // VSL: (c_minus/c_plus)^2
-                self.box_size,    // Periodic boundary conditions
+                cross_minus_plus, cross_plus_minus / cross_minus_plus,  // BVH: pass ratio
+                self.box_size  // theta hardcoded in kernel
             ))?;
         }
 
@@ -3240,6 +3493,11 @@ impl GpuNBodySimulation {
             shared_mem_bytes: 0,
         };
 
+        // Compute effective cross-species factors (Petit 2024)
+        let phi_inv = 1.0 / self.phi;
+        let cross_minus_plus = self.c_ratio_sq * phi_inv * self.repulsion_scale;
+        let cross_plus_minus = self.phi * self.repulsion_scale;
+
         // Get kernels
         let drift_kernel = self.device.get_func("nbody", "drift_only")
             .ok_or("Failed to get drift_only kernel")?;
@@ -3277,10 +3535,9 @@ impl GpuNBodySimulation {
                 &self.bvh_node_types,
                 &mut self.acc,
                 n as i32,
-                self.theta,
                 self.softening,
-                self.c_ratio_sq,  // VSL: (c_minus/c_plus)^2
-                self.box_size,    // Periodic boundary conditions
+                cross_minus_plus, cross_plus_minus / cross_minus_plus,  // BVH: pass ratio
+                self.box_size  // theta hardcoded in kernel
             ))?;
         }
 
@@ -3360,6 +3617,13 @@ impl GpuNBodySimulation {
             shared_mem_bytes: 0,
         };
 
+        // Phase 13: Random octree offset
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let offset_x = (rng.gen::<f64>() - 0.5) * self.box_size;
+        let offset_y = (rng.gen::<f64>() - 0.5) * self.box_size;
+        let offset_z = (rng.gen::<f64>() - 0.5) * self.box_size;
+
         // Step 1: Morton codes
         let morton_kernel = self.device.get_func("nbody", "compute_morton_codes")
             .ok_or("Failed to get compute_morton_codes kernel")?;
@@ -3371,6 +3635,9 @@ impl GpuNBodySimulation {
                 n as i32,
                 box_half,
                 inv_cell_size,
+                offset_x,
+                offset_y,
+                offset_z,
             ))?;
         }
         self.device.synchronize()?;
@@ -3510,6 +3777,11 @@ impl GpuNBodySimulation {
         let box_half = self.box_size / 2.0;
         let n = self.n_particles;
 
+        // Compute effective cross-species factors (Petit 2024)
+        let phi_inv = 1.0 / self.phi;
+        let cross_minus_plus = self.c_ratio_sq * phi_inv * self.repulsion_scale;
+        let cross_plus_minus = self.phi * self.repulsion_scale;
+
         let blocks = (n + 255) / 256;
         let cfg = LaunchConfig {
             block_dim: (256, 1, 1),
@@ -3561,10 +3833,9 @@ impl GpuNBodySimulation {
                     &buf.node_types,
                     &mut self.acc,
                     n as i32,
-                    self.theta,
                     self.softening,
-                    self.c_ratio_sq,  // VSL: (c_minus/c_plus)^2
-                    self.box_size,    // Periodic boundary conditions
+                    cross_minus_plus, cross_plus_minus / cross_minus_plus,  // BVH: pass ratio
+                    self.box_size,  // theta hardcoded in kernel
                 ))?;
             }
         }
@@ -3621,6 +3892,11 @@ impl GpuNBodySimulation {
             shared_mem_bytes: 0,
         };
 
+        // Compute effective cross-species factors (Petit 2024)
+        let phi_inv = 1.0 / self.phi;
+        let cross_minus_plus = self.c_ratio_sq * phi_inv * self.repulsion_scale;
+        let cross_plus_minus = self.phi * self.repulsion_scale;
+
         // Get kernel functions
         let compute_forces = self.device.get_func("nbody", "compute_forces_simple")
             .ok_or("Failed to get compute_forces_simple kernel")?;
@@ -3660,8 +3936,8 @@ impl GpuNBodySimulation {
                 &self.node_data, &self.node_children, &self.node_types,
                 &mut self.acc,
                 self.n_particles as i32,
-                self.theta, self.softening, self.c_ratio_sq, self.repulsion_scale,
-                self.box_size,  // Periodic boundary conditions
+                self.theta, self.softening, cross_minus_plus, cross_plus_minus,
+                self.box_size,
             ))?;
         }
 
@@ -4019,6 +4295,11 @@ impl GpuNBodySimulation {
     pub fn compare_forces_debug(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let n = self.n_particles;
 
+        // Compute effective cross-species factors (Petit 2024)
+        let phi_inv = 1.0 / self.phi;
+        let cross_minus_plus = self.c_ratio_sq * phi_inv * self.repulsion_scale;
+        let cross_plus_minus = self.phi * self.repulsion_scale;
+
         let blocks = (n + 255) / 256;
         let cfg = cudarc::driver::LaunchConfig {
             block_dim: (256, 1, 1),
@@ -4041,10 +4322,9 @@ impl GpuNBodySimulation {
                 &self.bvh_node_types,
                 &mut self.acc,
                 n as i32,
-                self.theta,
                 self.softening,
-                self.c_ratio_sq,  // VSL: (c_minus/c_plus)^2
-                self.box_size,    // Periodic boundary conditions
+                cross_minus_plus, cross_plus_minus / cross_minus_plus,  // BVH: pass ratio
+                self.box_size  // theta hardcoded in kernel
             ))?;
         }
         self.device.synchronize()?;
@@ -4078,8 +4358,8 @@ impl GpuNBodySimulation {
                 &self.node_data, &self.node_children, &self.node_types,
                 &mut self.acc,
                 n as i32,
-                self.theta, self.softening, self.c_ratio_sq, self.repulsion_scale,
-                self.box_size,  // Periodic boundary conditions
+                self.theta, self.softening, cross_minus_plus, cross_plus_minus,
+                self.box_size,
             ))?;
         }
         self.device.synchronize()?;

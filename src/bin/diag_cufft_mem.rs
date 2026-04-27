@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nRunning TreePM step (triggers cuFFT plan creation)...");
     sim.set_theta(0.7);
     let r_cut = box_size / 16.0;
-    sim.step_treepm_gpu_morton(0.01, r_cut, 0.0, 0.0)?;
+    sim.step_treepm_gpu(0.01, r_cut, 0.0, 0.0)?;
 
     let after_cufft = get_vram_mb();
     println!("After cuFFT step: {:.0} MB (+{:.0} MB from init)", after_cufft, after_cufft - after_init);

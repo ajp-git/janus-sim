@@ -209,7 +209,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let z = 1.0 / a - 1.0;
 
         // TreePM step with Morton ordering
-        sim.step_treepm_gpu_morton(DT, r_cut, h, dtau_per_dt)?;
+        sim.step_treepm_gpu(DT, r_cut, h, dtau_per_dt)?;
         tau += dtau_per_dt * DT;
 
         let step_ms = t_step.elapsed().as_millis();

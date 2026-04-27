@@ -1,15 +1,21 @@
 //! VSL SPH Bimetric Test
 //!
 //! Test run validating velocity balance between m+ and m- populations.
+//! SPH pressure applied to BOTH m+ and m- populations.
 //! Auto-stop if velocity runaway detected.
 
 use std::fs::{File, create_dir_all};
 use std::io::{BufWriter, Write};
+use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(feature = "cuda")]
-use janus_sim::nbody_gpu::GpuNBodySimulation;
-use janus_sim::vsl_dynamic::CoupledFriedmann;
+use cudarc::driver::CudaDevice;
+#[cfg(feature = "cuda")]
+use janus::nbody_gpu::GpuNBodySimulation;
+#[cfg(feature = "cuda")]
+use janus::sph_pressure_gpu::GpuSphPressure;
+use janus::vsl_dynamic::CoupledFriedmann;
 
 // Parameters
 const N_PLUS: usize = 250_000;
@@ -19,13 +25,17 @@ const MU: f64 = 19.0;
 const ETA: f64 = 1.045;
 const Z_INIT: f64 = 4.0;
 const DT: f64 = 0.001;  // Gyr
-const STEPS: usize = 5000;
+const STEPS: usize = 5000;  // Full production run
 const SNAPSHOT_INTERVAL: usize = 500;
 const CSV_INTERVAL: usize = 5;
 
 // Auto-stop thresholds
 const VRMS_RATIO_MAX: f64 = 1.5;
 const VRMS_CRITICAL: f64 = 100_000.0;  // km/s
+
+// SPH parameters
+const T_FLOOR: f64 = 100.0;  // Temperature floor in K
+const PARTICLE_MASS: f64 = 1e10;  // Solar masses (arbitrary normalization)
 
 fn main() {
     #[cfg(not(feature = "cuda"))]
@@ -82,6 +92,35 @@ fn run_simulation() {
     gpu_sim.set_softening(0.5);
     gpu_sim.set_c_ratio(c_ratio_init);
 
+    // Initialize CUDA device for SPH modules
+    println!("Initializing SPH pressure modules...");
+    let device = Arc::new(CudaDevice::new(0).expect("Failed to create CUDA device"));
+
+    // Create SPH calculator for m+ population
+    let mut sph_plus = GpuSphPressure::new(
+        Arc::clone(&device),
+        N_PLUS,
+        PARTICLE_MASS,
+        BOX_SIZE,
+    ).expect("Failed to create SPH+ module");
+
+    // Create SPH calculator for m- population
+    let mut sph_minus = GpuSphPressure::new(
+        Arc::clone(&device),
+        N_MINUS,
+        PARTICLE_MASS,
+        BOX_SIZE,
+    ).expect("Failed to create SPH- module");
+
+    // Initialize temperature arrays (T_FLOOR for all particles)
+    let temp_plus = vec![T_FLOOR; N_PLUS];
+    let temp_minus = vec![T_FLOOR; N_MINUS];
+
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║  SPH actif : m+ ✓ m- ✓                                       ║");
+    println!("║  T_floor = {} K, N_sph+ = {}, N_sph- = {}            ║", T_FLOOR as i32, N_PLUS, N_MINUS);
+    println!("╚══════════════════════════════════════════════════════════════╝");
+
     let start_time = Instant::now();
     let mut t_gyr = 0.0;
     let mut z = Z_INIT;
@@ -98,9 +137,9 @@ fn run_simulation() {
         gpu_sim.set_c_ratio(c_ratio);
 
         // Get current state
-        let pos = gpu_sim.get_positions();
-        let vel = gpu_sim.get_velocities();
-        let signs = gpu_sim.get_signs();
+        let pos = gpu_sim.get_positions().expect("get_positions failed");
+        let vel = gpu_sim.get_velocities().expect("get_velocities failed");
+        let signs = gpu_sim.get_signs().expect("get_signs failed");
 
         // Compute v_rms for each population
         let (v_rms_plus, v_rms_minus) = compute_vrms_by_sign(&vel, &signs);
@@ -184,8 +223,19 @@ fn run_simulation() {
             let hubble_gyr = hubble * 1.022e-3;   // 1 km/s/Mpc = 1.022e-3 Gyr^-1
             let dtau_per_dt = 1.0;  // Conformal time
 
+            // Step 1: Gravity + Hubble (DKD integrator)
             gpu_sim.step_with_expansion_dkd_gpu(DT, scale_factor, hubble_gyr, dtau_per_dt)
                 .expect("Step failed");
+
+            // Step 2: SPH pressure kick for both populations
+            apply_sph_kick(
+                &mut gpu_sim,
+                &mut sph_plus,
+                &mut sph_minus,
+                &temp_plus,
+                &temp_minus,
+                DT,
+            );
 
             t_gyr += DT;
             z = compute_redshift_from_time(t_gyr, Z_INIT, ETA);
@@ -196,8 +246,8 @@ fn run_simulation() {
 
     // Final snapshot if not already saved
     if final_step % SNAPSHOT_INTERVAL != 0 {
-        let pos = gpu_sim.get_positions();
-        let signs = gpu_sim.get_signs();
+        let pos = gpu_sim.get_positions().expect("get_positions failed");
+        let signs = gpu_sim.get_signs().expect("get_signs failed");
         let snap_path = format!("{}/snapshots/snap_{:06}.bin", output_dir, final_step);
         save_snapshot(&snap_path, &pos, &signs, z, BOX_SIZE);
         println!("  → Final snapshot saved: snap_{:06}.bin", final_step);
@@ -377,4 +427,73 @@ fn save_snapshot(path: &str, pos: &[f64], signs: &[i32], z: f64, box_size: f64) 
     }
 
     w.flush().unwrap();
+}
+
+/// Apply SPH pressure kick to both m+ and m- populations
+#[cfg(feature = "cuda")]
+fn apply_sph_kick(
+    gpu_sim: &mut GpuNBodySimulation,
+    sph_plus: &mut GpuSphPressure,
+    sph_minus: &mut GpuSphPressure,
+    temp_plus: &[f64],
+    temp_minus: &[f64],
+    dt: f64,
+) {
+    // Get current state
+    let pos = gpu_sim.get_positions().expect("Failed to get positions");
+    let mut vel = gpu_sim.get_velocities().expect("Failed to get velocities");
+    let signs = gpu_sim.get_signs().expect("Failed to get signs");
+    let n = signs.len();
+
+    // Build index maps for each population
+    let mut idx_plus: Vec<usize> = Vec::with_capacity(N_PLUS);
+    let mut idx_minus: Vec<usize> = Vec::with_capacity(N_MINUS);
+
+    for i in 0..n {
+        if signs[i] > 0 {
+            idx_plus.push(i);
+        } else {
+            idx_minus.push(i);
+        }
+    }
+
+    // Extract positions for m+ population
+    let mut pos_plus = vec![0.0f64; idx_plus.len() * 3];
+    for (j, &i) in idx_plus.iter().enumerate() {
+        pos_plus[j * 3] = pos[i * 3];
+        pos_plus[j * 3 + 1] = pos[i * 3 + 1];
+        pos_plus[j * 3 + 2] = pos[i * 3 + 2];
+    }
+
+    // Extract positions for m- population
+    let mut pos_minus = vec![0.0f64; idx_minus.len() * 3];
+    for (j, &i) in idx_minus.iter().enumerate() {
+        pos_minus[j * 3] = pos[i * 3];
+        pos_minus[j * 3 + 1] = pos[i * 3 + 1];
+        pos_minus[j * 3 + 2] = pos[i * 3 + 2];
+    }
+
+    // Compute SPH accelerations for m+ population
+    let acc_plus = sph_plus.compute_pressure_accelerations(&pos_plus, temp_plus)
+        .expect("SPH+ computation failed");
+
+    // Compute SPH accelerations for m- population
+    let acc_minus = sph_minus.compute_pressure_accelerations(&pos_minus, temp_minus)
+        .expect("SPH- computation failed");
+
+    // Apply SPH kick: v += a * dt
+    for (j, &i) in idx_plus.iter().enumerate() {
+        vel[i * 3] += acc_plus[j * 3] * dt;
+        vel[i * 3 + 1] += acc_plus[j * 3 + 1] * dt;
+        vel[i * 3 + 2] += acc_plus[j * 3 + 2] * dt;
+    }
+
+    for (j, &i) in idx_minus.iter().enumerate() {
+        vel[i * 3] += acc_minus[j * 3] * dt;
+        vel[i * 3 + 1] += acc_minus[j * 3 + 1] * dt;
+        vel[i * 3 + 2] += acc_minus[j * 3 + 2] * dt;
+    }
+
+    // Upload modified velocities back to GPU
+    gpu_sim.set_velocities(&vel).expect("Failed to set velocities");
 }

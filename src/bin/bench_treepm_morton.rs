@@ -57,8 +57,8 @@ fn main() {
     let avg_no_morton = times_no_morton.iter().sum::<u128>() / times_no_morton.len() as u128;
     println!("  AVG: {} ms\n", avg_no_morton);
 
-    // === BENCHMARK 2: step_treepm_gpu_morton (with Morton) ===
-    println!("=== step_treepm_gpu_morton (with Morton) ===");
+    // === BENCHMARK 2: step_treepm_gpu (with Morton) ===
+    println!("=== step_treepm_gpu (with Morton) ===");
     let t0 = std::time::Instant::now();
     let mut sim2 = GpuNBodyTwoPass::new(n/2, n/2, box_size).expect("GPU init failed");
     sim2.set_theta(theta);
@@ -66,14 +66,14 @@ fn main() {
 
     println!("Warmup (2 steps)...");
     for _ in 0..2 {
-        sim2.step_treepm_gpu_morton(dt, r_cut, 0.0, 0.0).unwrap();
+        sim2.step_treepm_gpu(dt, r_cut, 0.0, 0.0).unwrap();
     }
 
     println!("\nBenchmark:");
     let mut times_morton = Vec::new();
     for i in 0..steps {
         let t0 = std::time::Instant::now();
-        sim2.step_treepm_gpu_morton(dt, r_cut, 0.0, 0.0).unwrap();
+        sim2.step_treepm_gpu(dt, r_cut, 0.0, 0.0).unwrap();
         let ms = t0.elapsed().as_millis();
         println!("  step {}: {} ms", i+1, ms);
         times_morton.push(ms);
@@ -84,7 +84,7 @@ fn main() {
     // === SUMMARY ===
     println!("=== Summary @ {} particles ===", n);
     println!("  step_treepm_gpu (no Morton):   {} ms", avg_no_morton);
-    println!("  step_treepm_gpu_morton:        {} ms", avg_morton);
+    println!("  step_treepm_gpu:        {} ms", avg_morton);
 
     let speedup = avg_no_morton as f64 / avg_morton as f64;
     if speedup > 1.0 {

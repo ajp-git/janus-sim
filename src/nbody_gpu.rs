@@ -285,6 +285,66 @@ extern "C" __global__ void kick_only(
     }
 }
 
+// COSMOLOGICAL DRIFT (peculiar convention)
+//   x_co  : comoving Mpc
+//   v_pec : peculiar proper velocity = a * dx_co/dt   (Mpc/Gyr)
+//   dx_co/dt = v_pec / a   ->   pos += vel * dt / a
+// signs[tid] selects per-particle scale factor (+ -> a_plus, - -> a_minus).
+extern "C" __global__ void drift_only_cosmo(
+    double* __restrict__ pos,
+    const double* __restrict__ vel,
+    const int* __restrict__ signs,
+    double dt,
+    double box_half,
+    double a_plus,
+    double a_minus,
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    int base = tid * 3;
+    double a_eff = (signs[tid] > 0) ? a_plus : a_minus;
+    double inv_a = 1.0 / a_eff;
+    pos[base]     += vel[base]     * dt * inv_a;
+    pos[base + 1] += vel[base + 1] * dt * inv_a;
+    pos[base + 2] += vel[base + 2] * dt * inv_a;
+    // Robust periodic BC for arbitrary-size displacements
+    double box = 2.0 * box_half;
+    for (int i = 0; i < 3; i++) {
+        double p = pos[base + i] + box_half;     // shift to [0, box]
+        p = p - box * floor(p / box);            // wrap
+        pos[base + i] = p - box_half;            // shift back to [-box_half, box_half]
+    }
+}
+
+// COSMOLOGICAL KICK (peculiar convention)
+//   acc[]  : bare comoving accel = G*m / r_co^2   (output of compute_forces_bvh, no a-factor)
+//   dv_pec/dt = -H * v_pec  -  G*m / (a^2 * r_co^2) =  acc / a^2  -  H * v_pec
+// Per-particle a and H selected by sign.
+extern "C" __global__ void kick_only_cosmo(
+    double* __restrict__ vel,
+    const double* __restrict__ acc,
+    const int* __restrict__ signs,
+    double dt,
+    int n,
+    double a_plus,
+    double a_minus,
+    double h_plus,
+    double h_minus
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    int base = tid * 3;
+    double a_eff = (signs[tid] > 0) ? a_plus  : a_minus;
+    double h_eff = (signs[tid] > 0) ? h_plus  : h_minus;
+    double inv_a2 = 1.0 / (a_eff * a_eff);
+    for (int d = 0; d < 3; d++) {
+        double grav = acc[base + d] * inv_a2;
+        double friction = -h_eff * vel[base + d];
+        vel[base + d] += (grav + friction) * dt;
+    }
+}
+
 // Morton code computation for spatial sorting
 // Maps 3D position to 1D Morton code (Z-order curve) for cache locality
 // Expand 10-bit integer to 30 bits with 2 zeros between each bit
@@ -1650,6 +1710,7 @@ pub struct GpuNBodySimulation {
 /// Kernel names used in PTX
 const KERNEL_NAMES: &[&str] = &[
     "compute_forces_simple", "leapfrog_kick_drift", "drift_only", "kick_only",
+    "drift_only_cosmo", "kick_only_cosmo",
     "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs", "reorder_masses",
     "build_bvh_internal", "init_leaves", "reduce_com", "compute_forces_bvh",
     "compute_forces_bvh_cross", "compute_forces_bvh_yukawa", "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
@@ -1801,6 +1862,7 @@ impl GpuNBodySimulation {
         let ptx = cudarc::nvrtc::compile_ptx(CUDA_KERNEL_SRC)?;
         device.load_ptx(ptx, "nbody", &[
             "compute_forces_simple", "leapfrog_kick_drift", "drift_only", "kick_only",
+            "drift_only_cosmo", "kick_only_cosmo",
             "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs", "reorder_masses",
             "build_bvh_internal", "init_leaves", "reduce_com", "compute_forces_bvh",
             "compute_forces_bvh_cross", "compute_forces_bvh_yukawa", "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
@@ -1965,6 +2027,7 @@ impl GpuNBodySimulation {
         let ptx = cudarc::nvrtc::compile_ptx(CUDA_KERNEL_SRC)?;
         device.load_ptx(ptx, "nbody", &[
             "compute_forces_simple", "leapfrog_kick_drift", "drift_only", "kick_only",
+            "drift_only_cosmo", "kick_only_cosmo",
             "compute_morton_codes", "reorder_positions", "reorder_velocities", "reorder_signs", "reorder_masses",
             "build_bvh_internal", "init_leaves", "reduce_com", "compute_forces_bvh",
             "compute_forces_bvh_cross", "compute_forces_bvh_yukawa", "bitonic_sort_step", "reset_atomic_counters", "memset_i32", "memset_f64"
@@ -3063,7 +3126,109 @@ impl GpuNBodySimulation {
         Ok(())
     }
 
-    /// DKD integrator with GPU-built BVH tree
+    /// COSMOLOGICAL DKD integrator (peculiar convention) — Janus bi-sector
+    ///
+    /// Conventions (Peebles, peculiar):
+    ///   pos[i]    : comoving Mpc, fixed box
+    ///   vel[i]    : peculiar proper velocity v_pec = a * dx_co/dt   [Mpc/Gyr]
+    ///   acc[i]    : output of compute_forces_bvh, bare G*m/r_co^2  (no a-factor)
+    ///
+    /// EOM:
+    ///   dx_co/dt   = v_pec / a
+    ///   dv_pec/dt  = -H * v_pec  -  G*m / (a^2 * r_co^2)  =  acc/a^2 - H*v_pec
+    ///
+    /// Per-particle a and H selected by sign (signs[tid] > 0 -> +sector, else -sector).
+    /// VSL/Petit cross-coupling (phi, c_ratio_sq) preserved unchanged in the BVH force kernel.
+    pub fn step_with_expansion_dkd_gpu_cosmo(
+        &mut self,
+        dt: f64,
+        a_plus: f64,
+        a_minus: f64,
+        h_plus: f64,
+        h_minus: f64,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    {
+        let half_dt = dt * 0.5;
+        let box_half = self.box_size / 2.0;
+        let n = self.n_particles;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let phi_inv = 1.0 / self.phi;
+        let cross_minus_plus = self.c_ratio_sq * phi_inv * self.repulsion_scale;
+        let cross_plus_minus = self.phi * self.repulsion_scale;
+
+        let drift_kernel = self.device.get_func("nbody", "drift_only_cosmo")
+            .ok_or("Failed to get drift_only_cosmo kernel")?;
+        let kick_kernel = self.device.get_func("nbody", "kick_only_cosmo")
+            .ok_or("Failed to get kick_only_cosmo kernel")?;
+        let force_kernel = self.device.get_func("nbody", "compute_forces_bvh")
+            .ok_or("Failed to get compute_forces_bvh kernel")?;
+
+        // D1: Drift(dt/2) at a_plus(t), a_minus(t)
+        unsafe {
+            drift_kernel.clone().launch(cfg, (
+                &mut self.pos, &self.vel, &self.signs,
+                half_dt, box_half,
+                a_plus, a_minus,
+                n as i32,
+            ))?;
+        }
+
+        // Tree at t+dt/2 (after D1)
+        self.build_gpu_tree()?;
+
+        // Force compute
+        unsafe {
+            force_kernel.launch(cfg, (
+                &self.pos,
+                &self.signs,
+                &self.bvh_node_data,
+                &self.bvh_left_child,
+                &self.bvh_right_child,
+                &self.bvh_node_types,
+                &mut self.acc,
+                n as i32,
+                self.softening,
+                cross_minus_plus, cross_plus_minus / cross_minus_plus,
+                self.box_size
+            ))?;
+        }
+
+        // K: full Kick(dt). a/H evaluated at t+dt/2 (centered) — caller passes those.
+        unsafe {
+            kick_kernel.clone().launch(cfg, (
+                &mut self.vel, &self.acc, &self.signs,
+                dt, n as i32,
+                a_plus, a_minus,
+                h_plus, h_minus,
+            ))?;
+        }
+
+        // D2: Drift(dt/2) at a_plus(t+dt), a_minus(t+dt) — for proper DKD the caller should
+        // pass a different (a,H) for D1 vs D2, but for small dt the centered approximation
+        // (single a,H per call) is acceptable.
+        unsafe {
+            drift_kernel.launch(cfg, (
+                &mut self.pos, &self.vel, &self.signs,
+                half_dt, box_half,
+                a_plus, a_minus,
+                n as i32,
+            ))?;
+        }
+
+        self.device.synchronize()?;
+        self.time += dt;
+
+        Ok(())
+    }
+
+    /// DKD integrator with GPU-built BVH tree (LEGACY, no cosmological coupling)
     /// Structure: Drift(dt/2) → GPU Tree Build → Force → Kick(dt) → Drift(dt/2)
     pub fn step_with_expansion_dkd_gpu(&mut self, dt: f64, _scale_factor: f64, hubble: f64, dtau_per_dt: f64)
         -> Result<(), Box<dyn std::error::Error>>

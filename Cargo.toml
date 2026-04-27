@@ -933,5 +933,30 @@ path = "src/bin/janus_jpp_production.rs"
 required-features = ["cuda"]
 
 [[bin]]
+name = "test_eds_validation"
+path = "src/bin/test_eds_validation.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_bisector_trivial"
+path = "src/bin/test_bisector_trivial.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_force_calibration"
+path = "src/bin/test_force_calibration.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_eds_growing_mode"
+path = "src/bin/test_eds_growing_mode.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_zeldovich_virial"
+path = "src/bin/test_zeldovich_virial.rs"
+required-features = ["cuda"]
+
+[[bin]]
 name = "test_growth_factor"
 path = "src/bin/test_growth_factor.rs"

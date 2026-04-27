@@ -280,6 +280,10 @@ fn generate_zeldovich_ics(n_grid: usize, l_box: f64, z_init: f64, h0: f64, mu: f
 
     let h_gyr = h0 / MPC_GYR_TO_KMS;
     let a_init = 1.0 / (1.0 + z_init);
+    // Peculiar convention: ψ here is CURRENT displacement (already scaled by D(z_init)).
+    // For Zel'dovich with D=a (EdS-like): ẋ_co = (Ḋ/D)·ψ = H·ψ;  v_pec = a·ẋ_co = a·H·ψ.
+    // The vel_scale was already correct in the original code; integrator's drift /a
+    // and kick /a² are what was missing.
     let vel_scale = a_init * h_gyr * scale;
 
     let half_box = l_box / 2.0;
@@ -313,8 +317,8 @@ fn generate_zeldovich_ics(n_grid: usize, l_box: f64, z_init: f64, h0: f64, mu: f
         positions.push(y);
         positions.push(z);
 
-        // Zel'dovich velocity in Mpc/Gyr (code units, NOT km/s)
-        // v = a * H * ψ where vel_scale = a * H
+        // Zel'dovich peculiar velocity in Mpc/Gyr (code units, NOT km/s)
+        // v_pec = a·H·ψ where vel_scale = a·H  (ψ = current displacement, D=a)
         velocities.push(dx * vel_scale / scale);
         velocities.push(dy * vel_scale / scale);
         velocities.push(dz * vel_scale / scale);
@@ -451,6 +455,120 @@ fn compute_local_overdensities(positions: &[f64], signs: &[i32], n_grid: usize, 
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ADVANCED METRICS: Corr(δ⁺, δ⁻), void_frac, σ8
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Compute overdensity grids δ⁺ and δ⁻ (returns mean-normalized)
+fn compute_overdensity_grids(positions: &[f64], signs: &[i32], n_grid: usize, l_box: f64)
+    -> (Vec<f64>, Vec<f64>)
+{
+    let n = signs.len();
+    let cell = l_box / n_grid as f64;
+    let half_box = l_box / 2.0;
+    let n_cells = n_grid.pow(3);
+
+    let mut grid_plus = vec![0u32; n_cells];
+    let mut grid_minus = vec![0u32; n_cells];
+    let mut n_plus = 0usize;
+    let mut n_minus = 0usize;
+
+    for i in 0..n {
+        let x = positions[i * 3] + half_box;
+        let y = positions[i * 3 + 1] + half_box;
+        let z = positions[i * 3 + 2] + half_box;
+
+        let ix = ((x / cell) as usize).min(n_grid - 1);
+        let iy = ((y / cell) as usize).min(n_grid - 1);
+        let iz = ((z / cell) as usize).min(n_grid - 1);
+        let idx = iz * n_grid * n_grid + iy * n_grid + ix;
+
+        if signs[i] > 0 {
+            grid_plus[idx] += 1;
+            n_plus += 1;
+        } else {
+            grid_minus[idx] += 1;
+            n_minus += 1;
+        }
+    }
+
+    let mean_plus = n_plus as f64 / n_cells as f64;
+    let mean_minus = n_minus as f64 / n_cells as f64;
+
+    // Convert to overdensity δ = ρ/ρ̄ - 1
+    let delta_plus: Vec<f64> = grid_plus.iter()
+        .map(|&c| if mean_plus > 0.0 { c as f64 / mean_plus - 1.0 } else { 0.0 })
+        .collect();
+    let delta_minus: Vec<f64> = grid_minus.iter()
+        .map(|&c| if mean_minus > 0.0 { c as f64 / mean_minus - 1.0 } else { 0.0 })
+        .collect();
+
+    (delta_plus, delta_minus)
+}
+
+/// Compute Pearson correlation between δ⁺ and δ⁻ fields
+fn compute_delta_correlation(delta_plus: &[f64], delta_minus: &[f64]) -> f64 {
+    let n = delta_plus.len() as f64;
+    if n == 0.0 { return 0.0; }
+
+    let mean_p: f64 = delta_plus.iter().sum::<f64>() / n;
+    let mean_m: f64 = delta_minus.iter().sum::<f64>() / n;
+
+    let mut cov = 0.0f64;
+    let mut var_p = 0.0f64;
+    let mut var_m = 0.0f64;
+
+    for i in 0..delta_plus.len() {
+        let dp = delta_plus[i] - mean_p;
+        let dm = delta_minus[i] - mean_m;
+        cov += dp * dm;
+        var_p += dp * dp;
+        var_m += dm * dm;
+    }
+
+    if var_p > 0.0 && var_m > 0.0 {
+        cov / (var_p.sqrt() * var_m.sqrt())
+    } else {
+        0.0
+    }
+}
+
+/// Compute void fraction: cells where δ_total < -0.8
+fn compute_void_fraction(delta_plus: &[f64], delta_minus: &[f64]) -> f64 {
+    let n = delta_plus.len();
+    if n == 0 { return 0.0; }
+
+    let void_count = (0..n)
+        .filter(|&i| {
+            // Combined overdensity (simple average)
+            let delta_total = (delta_plus[i] + delta_minus[i]) / 2.0;
+            delta_total < -0.8
+        })
+        .count();
+
+    void_count as f64 / n as f64
+}
+
+/// Estimate σ8 from power spectrum (simplified: use grid variance scaled to 8 Mpc/h)
+/// Full computation would require FFT - this is an approximation
+fn compute_sigma8_approx(delta_plus: &[f64], l_box: f64, h: f64) -> f64 {
+    // σ8 is the RMS of δ in 8 Mpc/h spheres
+    // Approximation: scale grid variance by (8 Mpc/h / cell_size)
+    let n_grid = (delta_plus.len() as f64).powf(1.0/3.0) as usize;
+    let cell_size = l_box / n_grid as f64;  // Mpc
+    let r8 = 8.0 / h;  // 8 Mpc/h in Mpc
+
+    // Variance of δ⁺
+    let mean: f64 = delta_plus.iter().sum::<f64>() / delta_plus.len() as f64;
+    let var: f64 = delta_plus.iter().map(|&d| (d - mean).powi(2)).sum::<f64>() / delta_plus.len() as f64;
+
+    // Scale factor for smoothing (approximate)
+    let n_cells_in_r8 = (r8 / cell_size).powi(3);
+    let sigma8 = (var / n_cells_in_r8.max(1.0)).sqrt();
+
+    sigma8
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // MAIN
 // ═══════════════════════════════════════════════════════════════════════════
 #[cfg(feature = "cuda")]
@@ -535,7 +653,7 @@ fn main() {
     // CSV output
     let csv_path = format!("{}/evolution_phase2.csv", out_dir);
     let mut csv = BufWriter::new(File::create(&csv_path).unwrap());
-    writeln!(csv, "step,z,t_Gyr,a_plus,a_minus,c_bar,rho_max_plus,rho_max_minus,v_rms_plus,v_rms_minus,ratio_v,phi,E_naive,E_plus,E_minus,E_naive_drift_pct,S_VSL,E_VSL,E_VSL_drift_pct,N_stars,SFR").unwrap();
+    writeln!(csv, "step,z,t_Gyr,a_plus,a_minus,c_bar,rho_max_plus,rho_max_minus,v_rms_plus,v_rms_minus,ratio_v,phi,E_naive,E_plus,E_minus,E_naive_drift_pct,S_VSL,E_VSL,E_VSL_drift_pct,corr_delta,void_frac,sigma8_approx,N_stars,SFR").unwrap();
 
     // Run log
     let log_path = format!("{}/run.log", out_dir);
@@ -555,7 +673,10 @@ fn main() {
     let c_bar_sq_init = CoupledFriedmann::c_ratio_sq_at_z(Z_INIT, ETA);
     println!("[VSL] c̄²(z_init={}) = {:.8}", Z_INIT, c_bar_sq_init);
 
-    println!("\n[RUN] Starting main loop (z={} → z={})...\n", Z_INIT, Z_FINAL);
+    let max_steps_env: Option<usize> = std::env::var("MAX_STEPS")
+        .ok().and_then(|s| s.parse().ok());
+    println!("\n[RUN] Starting main loop (z={} → z={}{})\n", Z_INIT, Z_FINAL,
+        max_steps_env.map(|n| format!(", capped at {} steps", n)).unwrap_or_default());
 
     let mut step = 0;
     loop {
@@ -564,6 +685,12 @@ fn main() {
         if z < Z_FINAL {
             println!("\n  ✓ Reached z_final = {:.2} at step {}", Z_FINAL, step);
             break;
+        }
+        if let Some(ms) = max_steps_env {
+            if step >= ms {
+                println!("\n  ✓ Reached MAX_STEPS = {} (z={:.4})", ms, z);
+                break;
+            }
         }
 
         // H(a) Janus 2014+2018
@@ -645,12 +772,19 @@ fn main() {
             }
 
             if do_metric {
-                writeln!(csv, "{},{:.6},{:.6},{:.8},{:.8},{:.8},{:.4e},{:.4e},{:.2},{:.2},{:.4},{:.8},{:.6e},{:.6e},{:.6e},{:.6},{:.6e},{:.6e},{:.6},{},{:.4e}",
+                // Advanced metrics: Corr(δ⁺, δ⁻), void_frac, σ8
+                let (delta_plus, delta_minus) = compute_overdensity_grids(&pos, &signs_gpu, 64, L_BOX);
+                let corr_delta = compute_delta_correlation(&delta_plus, &delta_minus);
+                let void_frac = compute_void_fraction(&delta_plus, &delta_minus);
+                let sigma8_approx = compute_sigma8_approx(&delta_plus, L_BOX, H0 / 100.0);
+
+                writeln!(csv, "{},{:.6},{:.6},{:.8},{:.8},{:.8},{:.4e},{:.4e},{:.2},{:.2},{:.4},{:.8},{:.6e},{:.6e},{:.6e},{:.6},{:.6e},{:.6e},{:.6},{:.6},{:.6},{:.6},{},{:.4e}",
                     step, z, t_gyr, a, a_minus, c_bar,
                     rho_max_plus, rho_max_minus,
                     v_rms_plus, v_rms_minus, ratio_v,
                     phi, e_naive, e_plus, e_minus, e_naive_drift,
                     s_vsl, e_vsl, e_vsl_drift,
+                    corr_delta, void_frac, sigma8_approx,
                     n_stars, sfr
                 ).unwrap();
 
@@ -725,8 +859,13 @@ fn main() {
             log.flush().unwrap();
         }
 
-        // Time integration with Hubble friction
-        gpu_sim.step_with_expansion_dkd_gpu(DT, a, h, 1.0).unwrap();
+        // Time integration — peculiar convention (cosmological coupling correct)
+        // a_plus = a, a_minus = a_minus_from_a_plus(a, ETA)
+        // h_plus = compute_hubble_janus(a, H0)
+        // h_minus: approximation — evaluate same H(z) function at a_minus.
+        // (Exact bi-sector H from coupled Friedmann is a future refinement.)
+        let h_minus = compute_hubble_janus(a_minus, H0);
+        gpu_sim.step_with_expansion_dkd_gpu_cosmo(DT, a, a_minus, h, h_minus).unwrap();
         let da = a * h * DT;
         a += da;
         t_gyr += DT;

@@ -1,0 +1,31 @@
+simulation:
+  box_size_mpc: 200.0
+  n_particles: 10000
+  n_steps: 100
+  z_start: 5.0
+  z_end: 4.0
+  seed: 42
+  theta: 0.7
+  softening_mpc: null
+
+physics:
+  eta: 0.001         # Presque pas de masse négative (all m+)
+  lambda_base_mpc: 0.0
+  r_smooth_mpc: 0.0
+  lambda_floor: 0.0
+  hubble_friction: true
+  cross_force_asymmetry: 1.0
+  cross_force_z_start: 10.0
+  cross_force_z_width: 0.5
+
+pm_grid:
+  n_cells: 64
+  k_min: 2
+
+output:
+  dir: output/diag_lcdm
+  snapshot_redshifts:
+  - 4.5
+  - 4.0
+  metrics_every_steps: 10
+  save_snapshots: true

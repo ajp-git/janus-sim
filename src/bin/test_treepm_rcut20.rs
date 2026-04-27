@@ -134,7 +134,7 @@ fn main() {
         if step > 0 {
             sim.set_current_z(z);
             // Use TreePM with r_cut = 20 Mpc
-            sim.step_treepm_gpu_morton(DT, R_CUT, h, dtau_per_dt)
+            sim.step_treepm_gpu(DT, R_CUT, h, dtau_per_dt)
                 .expect("TreePM step failed");
         }
 

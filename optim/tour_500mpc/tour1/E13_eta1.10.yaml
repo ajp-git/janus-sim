@@ -1,0 +1,33 @@
+simulation:
+  box_size_mpc: 500.0
+  n_particles: 500000
+  n_steps: 800
+  z_start: 5.0
+  z_end: 0.0
+  seed: 42
+  theta: 0.7
+  softening_mpc: null
+
+physics:
+  eta: 1.10
+  lambda_base_mpc: 25.0
+  r_smooth_mpc: 5.0
+  lambda_floor: 0.01
+  hubble_friction: true
+  cross_force_asymmetry: 1.0
+  cross_force_z_start: 2.0
+  cross_force_z_width: 0.5
+
+pm_grid:
+  n_cells: 128
+  k_min: 2
+
+output:
+  dir: output/tour_500mpc/tour1/E13
+  snapshot_redshifts:
+  - 3.0
+  - 2.0
+  - 1.0
+  - 0.0
+  metrics_every_steps: 20
+  save_snapshots: true

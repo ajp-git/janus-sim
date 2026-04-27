@@ -1,0 +1,411 @@
+--- src/bin/janus_adaptive_zoom.rs	2026-04-19 17:22:52.000000000 +0000
++++ src_patched/bin/janus_adaptive_zoom.rs	2026-04-21 13:52:20.287919808 +0000
+@@ -141,14 +141,17 @@
+ // PARTICLE MASSES (M_sun) — computed from cosmology
+ // ═══════════════════════════════════════════════════════════════════════════
+ fn compute_particle_masses(n_total: usize, l_box: f64, h0: f64, omega_b: f64, mu: f64) -> (f64, f64) {
+-    // Cosmological mass calculation
++    // Cosmological mass calculation — Janus convention: ONE grid, signs shuffled
++    //   N+ = N_total / (1+mu)   (5% pour mu=19)
++    //   N- = N_total * mu/(1+mu) (95%)
++    //   masse INDIVIDUELLE identique pour m+ et m- ; μ est le rapport de DENSITÉ, pas de masse par particule.
++    //   M+ = Omega_b * rho_crit * L^3
++    //   M- = mu * Omega_b * rho_crit * L^3
++    //   m_plus  = M+ / N+ = Omega_b rho_crit L^3 * (1+mu) / N_total
++    //   m_minus = M- / N- = mu Omega_b rho_crit L^3 * (1+mu) / (N_total*mu) = m_plus  (identique)
+     let rho_crit = 2.775e11 * (h0 / 100.0).powi(2);  // M☉/Mpc³
+-    let rho_mean_plus = omega_b * rho_crit;
+-
+-    // n+ = N_total / (1 + μ) for 50/50 split with mass ratio μ
+-    let n_plus = (n_total as f64) / (1.0 + mu);
+-    let m_plus = rho_mean_plus * l_box.powi(3) / n_plus;
+-    let m_minus = mu * m_plus;
++    let m_plus = omega_b * rho_crit * l_box.powi(3) * (1.0 + mu) / (n_total as f64);
++    let m_minus = m_plus;
+ 
+     (m_plus, m_minus)
+ }
+@@ -335,14 +338,41 @@
+ // ═══════════════════════════════════════════════════════════════════════════
+ /// Check and perform adaptive splits for particles exceeding density threshold
+ /// Returns number of new particles created
++/// Adaptive split check with thermal history preservation.
++///
++/// Returns:
++///   n_new: number of daughter particles created (= 8 * n_split_events)
++///   u_new: internal energy array for m+ particles, aligned with the NEW order
++///          of m+ particles in state.particles after the split.
++///          Each daughter inherits its parent's u.
++///
++/// u_plus_old: internal energy array for m+ particles BEFORE split, aligned
++///             with the ORIGINAL order of m+ in state.particles.
+ fn adaptive_split_check_with_thresholds(
+     state: &mut AdaptiveState,
+     densities: &[f64],
+     delta_split: &[f64; 10],
+     rng: &mut impl Rng,
+-) -> usize {
++    u_plus_old: &[f64],
++) -> (usize, Vec<f64>) {
++    // Build initial mapping: m+ particle index (in state.particles) -> u index (in u_plus_old)
++    // u_plus_old[k] corresponds to the k-th m+ particle in state.particles (in iteration order).
++    let mut particle_to_u: Vec<i32> = vec![-1; state.particles.len()];
++    {
++        let mut k = 0usize;
++        for (i, p) in state.particles.iter().enumerate() {
++            if p.sign == 1 {
++                if k < u_plus_old.len() {
++                    particle_to_u[i] = k as i32;
++                }
++                k += 1;
++            }
++        }
++    }
++
+     if state.particles.len() >= N_MAX_TOTAL {
+-        return 0;  // At capacity
++        // No split -> u unchanged
++        return (0, u_plus_old.to_vec());
+     }
+ 
+     let mut to_split: Vec<usize> = Vec::new();
+@@ -367,14 +397,22 @@
+     }
+ 
+     if to_split.is_empty() {
+-        return 0;
++        return (0, u_plus_old.to_vec());
+     }
+ 
+     // Perform splits (process in reverse to avoid index invalidation)
++    // For each daughter we also track which u slot the parent had.
+     let mut new_particles: Vec<ParticleV3> = Vec::new();
++    let mut new_particle_u: Vec<f64> = Vec::new();  // u for daughters, in extend-order
+ 
+     for &idx in to_split.iter().rev() {
+         let parent = &state.particles[idx];
++        let parent_u_idx = particle_to_u[idx];
++        let parent_u: f64 = if parent_u_idx >= 0 && (parent_u_idx as usize) < u_plus_old.len() {
++            u_plus_old[parent_u_idx as usize]
++        } else {
++            0.0  // should not happen; safety fallback
++        };
+         let new_level = parent.split_level + 1;
+         let new_mass = parent.mass / 8.0;
+         let new_eps = parent.epsilon / 2.0;
+@@ -385,7 +423,7 @@
+ 
+         let daughter_positions = blue_noise_daughters(parent.pos, daughter_radius, rng);
+ 
+-        // Create 8 daughters
++        // Create 8 daughters, each inheriting parent's u
+         for pos in daughter_positions.iter() {
+             new_particles.push(ParticleV3 {
+                 pos: *pos,
+@@ -397,21 +435,53 @@
+                 is_star: parent.is_star,
+                 flags: parent.flags | 0x01,  // Mark as HR (high-resolution)
+             });
++            new_particle_u.push(parent_u);
+         }
+     }
+ 
+-    // Remove parents (in reverse order)
++    // Remove parents (in reverse order). swap_remove brings the tail particle
++    // into the removed slot — we must update particle_to_u accordingly.
+     for &idx in to_split.iter().rev() {
++        let last = state.particles.len() - 1;
+         state.particles.swap_remove(idx);
++        // particle_to_u tracks the sign->u mapping; do the same swap
++        if idx != last {
++            particle_to_u[idx] = particle_to_u[last];
++        }
++        particle_to_u.pop();  // last element removed
+     }
+ 
+-    // Add daughters
++    // Add daughters (their u goes into new_particle_u, aligned with new_particles)
+     let n_new = new_particles.len();
+     state.particles.extend(new_particles);
+     state.header.n_total = state.particles.len() as u64;
+     state.header.n_split_max = state.max_split_level() as u32;
+ 
+-    n_new
++    // Build final u array in the NEW m+ order.
++    // Preserved m+ particles: occupy the first N_preserved slots of state.particles (in altered order),
++    //   their u comes from u_plus_old via particle_to_u.
++    // Daughters (appended): their u is in new_particle_u, in extend-order.
++    let n_preserved_particles = state.particles.len() - n_new;
++    let mut u_new: Vec<f64> = Vec::new();
++    // First pass: preserved m+ particles
++    for i in 0..n_preserved_particles {
++        let p = &state.particles[i];
++        if p.sign == 1 {
++            let u_idx = particle_to_u[i];
++            if u_idx >= 0 && (u_idx as usize) < u_plus_old.len() {
++                u_new.push(u_plus_old[u_idx as usize]);
++            } else {
++                u_new.push(0.0);
++            }
++        }
++    }
++    // Second pass: daughters (all m+ since only m+ split)
++    // Daughters appear at the end of state.particles in the same order as new_particle_u.
++    for &u in new_particle_u.iter() {
++        u_new.push(u);
++    }
++
++    (n_new, u_new)
+ }
+ 
+ // ═══════════════════════════════════════════════════════════════════════════
+@@ -609,7 +679,7 @@
+         .collect()
+ }
+ 
+-fn generate_zeldovich_ics(n_grid: usize, l_box: f64, z_init: f64, h0: f64) -> (Vec<f64>, Vec<f64>, Vec<i32>) {
++fn generate_zeldovich_ics(n_grid: usize, l_box: f64, z_init: f64, h0: f64, mu: f64) -> (Vec<f64>, Vec<f64>, Vec<i32>) {
+     println!("\n[1/5] Generating Zel'dovich ICs (correct 3D displacement)...");
+ 
+     let n_total = n_grid * n_grid * n_grid;
+@@ -743,13 +813,15 @@
+     }
+     println!("  Max displacement (raw): {:.6e} Mpc", max_disp);
+ 
+-    // Scale to target: 70% of cell size for better structure visibility
+-    // Pas de croisement car les déplacements Zel'dovich sont cohérents
+-    // (modes longues corrélés) pas aléatoires par particule
+-    let target_disp = spacing * 0.7;  // = 1.628 Mpc pour N_grid=215
++    // Scale to target: 30% of cell size (Zel'dovich standard practice)
++    // 0.7 × spacing causait un artefact de « croix » aligné sur axes car les
++    // particules traversaient leur cellule d'origine et s'alignaient sur les
++    // modes Fourier dominants de la grille. 0.3 × spacing est la valeur
++    // utilisée dans janus_baryonic_calibrated (run 10M validé, preprint JPP).
++    let target_disp = spacing * 0.3;
+     let scale = if max_disp > 1e-10 { target_disp / max_disp } else { 1.0 };
+     println!("  Target displacement: {:.4} Mpc ({:.1}% of cell = {:.3} Mpc)",
+-             target_disp, 70.0, spacing);
++             target_disp, 30.0, spacing);
+     println!("  Scale factor: {:.6e} (max_disp_raw={:.6e} → {:.4} Mpc)",
+              scale, max_disp, target_disp);
+ 
+@@ -766,34 +838,106 @@
+     let mut velocities = vec![0.0f64; n_total * 3];
+     let mut signs = vec![0i32; n_total];
+ 
+-    for iz in 0..n_grid {
+-        for iy in 0..n_grid {
+-            for ix in 0..n_grid {
+-                let idx = iz * n_grid * n_grid + iy * n_grid + ix;
++    // Sign assignment — Janus convention: N+ = N_total/(1+μ), rest is m-
++    let n_positive: usize = (n_total as f64 / (1.0 + mu)).round() as usize;
++    let n_negative: usize = n_total - n_positive;
++    println!("  Sign assignment (Janus, μ={}):", mu);
++    println!("    N+ = N/(1+μ) = {}", n_positive);
++    println!("    N- = Nμ/(1+μ) = {}", n_negative);
++    let mut sign_indices: Vec<usize> = (0..n_total).collect();
++    let mut rng_sign = StdRng::seed_from_u64(SEED_IC + 12345);
++    sign_indices.shuffle(&mut rng_sign);
++    let mut sign_by_idx = vec![-1i32; n_total];
++    for &idx in &sign_indices[..n_positive] {
++        sign_by_idx[idx] = 1;
++    }
++
++    // ═══════════════════════════════════════════════════════════════════════
++    // IC generation: PURE RANDOM positions + CIC-interpolated Zel'dovich displacement
++    //
++    // Historiquement validé dans le run 40M_v3 (février 2026, preprint).
++    // Une grille régulière + jitter produit encore un motif visible à step 100.
++    // La seule méthode qui a fonctionné sans artefact de grille est :
++    //   (1) positions tirées uniformément dans [-L/2, L/2]³
++    //   (2) ψ(x, y, z) interpolé depuis le champ ψ grille par CIC trilinéaire
++    //
++    // Le spectre de puissance des perturbations est préservé (les modes FFT de
++    // ψ ne sont pas dégradés par l'interpolation CIC sur N particules, qui lisse
++    // juste à l'échelle sous-cellule).
++    // ═══════════════════════════════════════════════════════════════════════
++    println!("  Using PURE RANDOM positions + CIC-interpolated Zel'dovich ψ");
++    println!("    (grid+jitter produit encore des artefacts — approche validée run 40M_v3)");
++
++    let mut rng_pos = StdRng::seed_from_u64(SEED_IC + 67890);
++
++    // Helper : interpolation CIC trilinéaire du champ ψ aux coordonnées (x, y, z)
++    // avec conditions périodiques. ψ est stocké sur grille n_grid³ avec indexation
++    // idx = iz * n_grid * n_grid + iy * n_grid + ix, coordonnées centrées [-L/2, L/2].
++    let cic_interp = |field: &[f64], x: f64, y: f64, z: f64| -> f64 {
++        // Coordonnées en unités de cellule, repère [0, n_grid)
++        let fx = ((x + half_box) / spacing) % (n_grid as f64);
++        let fy = ((y + half_box) / spacing) % (n_grid as f64);
++        let fz = ((z + half_box) / spacing) % (n_grid as f64);
++        let fx = if fx < 0.0 { fx + n_grid as f64 } else { fx };
++        let fy = if fy < 0.0 { fy + n_grid as f64 } else { fy };
++        let fz = if fz < 0.0 { fz + n_grid as f64 } else { fz };
++
++        let ix0 = fx.floor() as usize % n_grid;
++        let iy0 = fy.floor() as usize % n_grid;
++        let iz0 = fz.floor() as usize % n_grid;
++        let ix1 = (ix0 + 1) % n_grid;
++        let iy1 = (iy0 + 1) % n_grid;
++        let iz1 = (iz0 + 1) % n_grid;
++
++        let dx = fx - fx.floor();
++        let dy = fy - fy.floor();
++        let dz = fz - fz.floor();
++
++        let idx = |i: usize, j: usize, k: usize| k * n_grid * n_grid + j * n_grid + i;
++
++        // 8 coins
++        let c000 = field[idx(ix0, iy0, iz0)];
++        let c100 = field[idx(ix1, iy0, iz0)];
++        let c010 = field[idx(ix0, iy1, iz0)];
++        let c110 = field[idx(ix1, iy1, iz0)];
++        let c001 = field[idx(ix0, iy0, iz1)];
++        let c101 = field[idx(ix1, iy0, iz1)];
++        let c011 = field[idx(ix0, iy1, iz1)];
++        let c111 = field[idx(ix1, iy1, iz1)];
++
++        // Interpolation trilinéaire
++        let c00 = c000 * (1.0 - dx) + c100 * dx;
++        let c10 = c010 * (1.0 - dx) + c110 * dx;
++        let c01 = c001 * (1.0 - dx) + c101 * dx;
++        let c11 = c011 * (1.0 - dx) + c111 * dx;
++        let c0 = c00 * (1.0 - dy) + c10 * dy;
++        let c1 = c01 * (1.0 - dy) + c11 * dy;
++        c0 * (1.0 - dz) + c1 * dz
++    };
+ 
+-                // Grid position (centered at cell)
+-                let x0 = (ix as f64 + 0.5) * spacing - half_box;
+-                let y0 = (iy as f64 + 0.5) * spacing - half_box;
+-                let z0 = (iz as f64 + 0.5) * spacing - half_box;
+-
+-                // Apply Zel'dovich 3D displacement (30% of cell) with periodic wrapping
+-                let dx = psi_x[idx] * scale;
+-                let dy = psi_y[idx] * scale;
+-                let dz = psi_z[idx] * scale;
+-
+-                positions[idx * 3]     = ((x0 + dx + half_box) % l_box + l_box) % l_box - half_box;
+-                positions[idx * 3 + 1] = ((y0 + dy + half_box) % l_box + l_box) % l_box - half_box;
+-                positions[idx * 3 + 2] = ((z0 + dz + half_box) % l_box + l_box) % l_box - half_box;
+-
+-                // Zel'dovich velocity: v = H0 × sqrt(1+z) × ψ_scaled
+-                velocities[idx * 3]     = psi_x[idx] * scale * vel_scale;
+-                velocities[idx * 3 + 1] = psi_y[idx] * scale * vel_scale;
+-                velocities[idx * 3 + 2] = psi_z[idx] * scale * vel_scale;
++    for i in 0..n_total {
++        // Position aléatoire uniforme dans [-L/2, L/2]³
++        let x0 = (rng_pos.random::<f64>() - 0.5) * l_box;
++        let y0 = (rng_pos.random::<f64>() - 0.5) * l_box;
++        let z0 = (rng_pos.random::<f64>() - 0.5) * l_box;
++
++        // Interpoler ψ à cette position aléatoire (CIC)
++        let psi_xi = cic_interp(&psi_x, x0, y0, z0) * scale;
++        let psi_yi = cic_interp(&psi_y, x0, y0, z0) * scale;
++        let psi_zi = cic_interp(&psi_z, x0, y0, z0) * scale;
++
++        // Position finale : random + ψ, avec conditions périodiques
++        positions[i * 3]     = ((x0 + psi_xi + half_box) % l_box + l_box) % l_box - half_box;
++        positions[i * 3 + 1] = ((y0 + psi_yi + half_box) % l_box + l_box) % l_box - half_box;
++        positions[i * 3 + 2] = ((z0 + psi_zi + half_box) % l_box + l_box) % l_box - half_box;
++
++        // Vitesse Zel'dovich : v = H(z) × ψ_phys (même ψ interpolé)
++        velocities[i * 3]     = psi_xi * vel_scale;
++        velocities[i * 3 + 1] = psi_yi * vel_scale;
++        velocities[i * 3 + 2] = psi_zi * vel_scale;
+ 
+-                // Random sign assignment (η=1.045 → ~52% m+)
+-                signs[idx] = if rng.random::<f64>() < 0.52 { 1 } else { -1 };
+-            }
+-        }
++        // Signe Janus (pré-calculé plus haut)
++        signs[i] = sign_by_idx[i];
+     }
+ 
+     let n_plus = signs.iter().filter(|&&s| s > 0).count();
+@@ -861,7 +1005,7 @@
+     fs::create_dir_all(format!("{}/frames", args.out_dir)).expect("Failed to create frames dir");
+ 
+     // Generate Zel'dovich ICs
+-    let (positions, velocities, signs) = generate_zeldovich_ics(args.n_grid, args.l_box, args.z_init, args.h0);
++    let (positions, velocities, signs) = generate_zeldovich_ics(args.n_grid, args.l_box, args.z_init, args.h0, args.mu);
+ 
+     let n_plus = signs.iter().filter(|&&s| s > 0).count();
+     let n_minus = signs.len() - n_plus;
+@@ -967,7 +1111,14 @@
+             // Adaptive split check
+             if do_split {
+                 let n_before = state.particles.len();
+-                let n_new = adaptive_split_check_with_thresholds(&mut state, &densities, &delta_split, &mut rng_split);
++
++                // SAVE thermal state BEFORE split and drop, so it survives the reallocation.
++                let u_old = gpu_cooling.get_internal_energy()
++                    .expect("Failed to read internal energy before split");
++
++                let (n_new, u_new) = adaptive_split_check_with_thresholds(
++                    &mut state, &densities, &delta_split, &mut rng_split, &u_old,
++                );
+ 
+                 if n_new > 0 {
+                     println!("  🔬 Step {}: Split +{} particles, N={} → {}",
+@@ -989,14 +1140,19 @@
+                     gpu_sim.set_softening(args.eps_plus);
+                     gpu_sim.set_c_ratio(CoupledFriedmann::c_ratio_sq_at_z(z, ETA).sqrt());
+ 
+-                    // Réinitialiser GpuCooling avec le nouveau n_plus (reuse device)
++                    // Recreate GpuCooling with new n_plus, THEN RESTORE thermal state.
++                    // Daughters inherit parent u (already done inside adaptive_split_check).
+                     let n_plus_new = state.particles.iter().filter(|p| p.sign == 1).count();
++                    assert_eq!(n_plus_new, u_new.len(),
++                        "u_new length mismatch: got {} for {} m+ particles", u_new.len(), n_plus_new);
+                     gpu_cooling = GpuCooling::new(
+                         cuda_device.clone(), n_plus_new, args.l_box, state.m_plus_base
+                     ).expect("Failed to recreate GpuCooling after split");
+                     let signs_plus_new: Vec<i32> = vec![1i32; n_plus_new];
+-                    gpu_cooling.init_from_temperature(T_INIT_PLUS, T_INIT_PLUS, &signs_plus_new)
+-                        .expect("Failed to reinit cooling");
++                    gpu_cooling.upload_signs(&signs_plus_new)
++                        .expect("Failed to upload signs after split");
++                    gpu_cooling.set_internal_energy(&u_new)
++                        .expect("Failed to restore internal energy after split");
+                 }
+             }
+ 
+@@ -1016,7 +1172,7 @@
+             // Snapshot
+             if do_snapshot {
+                 let snap_path = Path::new(&args.out_dir).join("snapshots").join(format!("snap_{:05}.bin", step));
+-                save_snapshot(&snap_path, &state, a, t_gyr, 0, 0.0, rho_max);
++                save_snapshot(&snap_path, &state, a, t_gyr, n_stars as u64, sfr, rho_max);
+ 
+                 // Use snapshot_info to verify
+                 if let Ok(info) = snapshot_info(&snap_path) {
+@@ -1055,18 +1211,18 @@
+                 &pos, &signs_data, 32, args.l_box
+             );
+ 
+-            // Conversion correcte : overdensité → nH [cm⁻³]
+-            // ρ_mean_baryon(z) = ρ_crit_0 × Ω_b × (1+z)³
+-            // ρ_crit_0 = 9.47e-30 g/cm³
+-            // Ω_b = 0.05, X_H = 0.76, m_H = 1.673e-24 g
+-            // nH = ρ_mean × Ω_b × (1+z)³ × X_H / m_H × overdensity
+-            let rho_mean_0_cgs = 9.47e-30_f64;  // g/cm³
+-            let omega_b = args.omega_b;
+-            let x_h = 0.76_f64;
+-            let m_h = 1.673e-24_f64;  // g
+-            let nH_mean = rho_mean_0_cgs * omega_b * (1.0 + z).powi(3) * x_h / m_h;
++            // Le kernel GpuCooling attend des densités en M☉/Mpc³ et applique
++            // rho_to_nh (defini dans cooling_gpu.rs) pour convertir en nH [cm⁻³].
++            // Ne PAS pré-convertir ici, sinon double conversion → nH ~1e-17× trop petit
++            // et la SF ne se déclenche jamais.
++            //
++            // ρ_baryon(z) en M☉/Mpc³ :
++            //   ρ_crit_0 = 2.775e11 * h² M☉/Mpc³
++            //   ρ_mean_b(z) = Ω_b * ρ_crit_0 * (1+z)³   (en comobile, constante ; en propre, ×(1+z)³)
++            let rho_crit_0 = 2.775e11_f64 * (args.h0 / 100.0).powi(2);  // M☉/Mpc³
++            let rho_mean_b_z = args.omega_b * rho_crit_0 * (1.0 + z).powi(3);  // M☉/Mpc³
+             let densities: Vec<f64> = overdensities.iter()
+-                .map(|&od| od * nH_mean)
++                .map(|&od| od * rho_mean_b_z)
+                 .collect();
+ 
+             // Refroidissement GPU

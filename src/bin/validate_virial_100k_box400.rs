@@ -329,7 +329,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let z = 1.0 / a - 1.0;
         current_tau += dtau_cosmo;
 
-        sim.step_treepm_gpu_morton(DT, r_cut, h, dtau_per_dt)?;
+        sim.step_treepm_gpu(DT, r_cut, h, dtau_per_dt)?;
 
         let ke = sim.kinetic_energy()?;
         let seg = sim.segregation()?;

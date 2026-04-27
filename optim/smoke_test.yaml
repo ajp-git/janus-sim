@@ -1,0 +1,27 @@
+simulation:
+  box_size_mpc: 100.0
+  n_particles: 10000
+  n_steps: 50
+  z_start: 5.0
+  z_end: 3.0
+  seed: 42
+  theta: 0.7
+
+physics:
+  eta: 1.0
+  lambda_base_mpc: 30.0
+  r_smooth_mpc: 5.0
+  lambda_floor: 0.01
+  hubble_friction: true
+
+pm_grid:
+  n_cells: 64
+  k_min: 2
+
+output:
+  dir: output/smoke_test
+  snapshot_redshifts:
+    - 5.0
+    - 3.0
+  metrics_every_steps: 10
+  save_snapshots: true

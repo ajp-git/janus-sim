@@ -762,9 +762,9 @@ path = "src/bin/scan_mu_janus.rs"
 name = "janus_30m_production"
 path = "src/bin/janus_30m_production.rs"
 
-[[bin]]
-name = "janus_mu8_production"
-path = "src/bin/janus_mu8_production.rs"
+# [[bin]]
+# name = "janus_mu8_production"
+# path = "src/bin/janus_mu8_production.rs"
 
 [[bin]]
 name = "janus_mu16_production"
@@ -907,3 +907,31 @@ path = "src/bin/migrate_snapshots.rs"
 name = "janus_adaptive_zoom"
 path = "src/bin/janus_adaptive_zoom.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "janus_screening"
+path = "src/bin/janus_screening.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "janus_screening_highmu"
+path = "src/bin/janus_screening_highmu.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "janus_screening_phase3"
+path = "src/bin/janus_screening_phase3.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_expansion_pure"
+path = "src/bin/test_expansion_pure.rs"
+
+[[bin]]
+name = "janus_jpp_production"
+path = "src/bin/janus_jpp_production.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_growth_factor"
+path = "src/bin/test_growth_factor.rs"

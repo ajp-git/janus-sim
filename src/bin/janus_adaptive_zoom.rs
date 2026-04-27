@@ -19,6 +19,7 @@ use janus::nbody_gpu::GpuNBodySimulation;
 #[cfg(feature = "cuda")]
 use janus::cooling_gpu::GpuCooling;
 use janus::vsl_dynamic::CoupledFriedmann;
+use janus::janus_expansion::{compute_total_energy, energy_drift_pct, a_minus_from_a_plus, compute_phi_factors};
 use janus::snapshot_v3::{SnapshotHeaderV3, ParticleV3, write_snapshot_v3, snapshot_info};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -1212,7 +1213,10 @@ fn main() {
     // CSV output
     let csv_path = format!("{}/time_series.csv", args.out_dir);
     let mut csv = BufWriter::new(File::create(&csv_path).unwrap());
-    writeln!(csv, "step,t_Gyr,z,a,N_total,N_hr,split_max,rho_max,v_rms,rho_plus_max").unwrap();
+    writeln!(csv, "step,t_Gyr,z,a,N_total,N_hr,split_max,rho_max,v_rms,rho_plus_max,phi,E_total,E_plus,E_minus,E_drift_pct").unwrap();
+
+    // Energy tracking: E = ρ⁺c²a⁺³ + ρ⁻c̄²a⁻³ (should be constant, and < 0 for μ > 1)
+    let mut e_total_0: Option<f64> = None;
 
     println!("\n[3/5] Starting main loop (z={} → z={})...\n", args.z_init, args.z_final);
 
@@ -1315,13 +1319,63 @@ fn main() {
             let n_hr = state.particles.iter().filter(|p| p.split_level > 0).count();
             let split_max = state.max_split_level();
 
+            // ═══════════════════════════════════════════════════════
+            // ENERGY CONSERVATION CHECK (Petit et al. 2024)
+            // E = ρ⁺c²a⁺³ + ρ⁻c̄²a⁻³ should be constant (and negative for μ > 1)
+            // ═══════════════════════════════════════════════════════
+            let (phi, _phi_inv) = compute_phi_factors(a, ETA);
+
+            // Compute total masses accounting for split levels
+            let (m_plus_total, m_minus_total) = {
+                let mut m_p = 0.0f64;
+                let mut m_m = 0.0f64;
+                for p in &state.particles {
+                    let mass_factor = if p.split_level == 0 { 1.0 } else { 1.0 / 8.0_f64.powi(p.split_level as i32) };
+                    if p.sign == 1 {
+                        m_p += state.m_plus_base * mass_factor;
+                    } else {
+                        m_m += state.m_minus_base * mass_factor;
+                    }
+                }
+                (m_p, m_m)
+            };
+
+            // Comoving densities (M☉/Mpc³)
+            let vol = args.l_box * args.l_box * args.l_box;
+            let rho_plus_comoving = m_plus_total / vol;
+            let rho_minus_comoving = -m_minus_total / vol;  // Negative mass density!
+
+            // VSL: c̄/c at this redshift
+            let c_ratio_sq = CoupledFriedmann::c_ratio_sq_at_z(z, ETA);
+            let c_plus = 1.0;  // Code units
+            let c_minus = c_ratio_sq.sqrt();
+
+            // Scale factors for both sectors
+            let a_plus = a;
+            let a_minus = a_minus_from_a_plus(a, ETA);
+
+            // Compute total energy
+            let (e_total, e_plus, e_minus) = compute_total_energy(
+                rho_plus_comoving, rho_minus_comoving,
+                c_plus, c_minus,
+                a_plus, a_minus
+            );
+
+            // Track initial E for drift calculation
+            if e_total_0.is_none() {
+                e_total_0 = Some(e_total);
+                println!("  📊 Initial E_total = {:.6e} (should be < 0 for μ > 1)", e_total);
+            }
+            let e_drift = energy_drift_pct(e_total, e_total_0.unwrap());
+
             if do_metric {
-                writeln!(csv, "{},{:.6},{:.4},{:.6},{},{},{},{:.3e},{:.2},{:.3e}",
-                    step, t_gyr, z, a, state.particles.len(), n_hr, split_max, rho_max, v_rms, rho_plus_max).unwrap();
+                writeln!(csv, "{},{:.6},{:.4},{:.6},{},{},{},{:.3e},{:.2},{:.3e},{:.6},{:.6e},{:.6e},{:.6e},{:.4}",
+                    step, t_gyr, z, a, state.particles.len(), n_hr, split_max, rho_max, v_rms, rho_plus_max,
+                    phi, e_total, e_plus, e_minus, e_drift).unwrap();
 
                 if step % 100 == 0 || do_split {
-                    println!("  Step {:5} | z={:.3} | N={:>8} | N_hr={:>6} | ρ_max={:.2e} | ρ+_max={:.2e} | v_rms={:.1} km/s",
-                        step, z, state.particles.len(), n_hr, rho_max, rho_plus_max, v_rms);
+                    println!("  Step {:5} | z={:.3} | N={:>8} | N_hr={:>6} | ρ_max={:.2e} | ρ+_max={:.2e} | v_rms={:.1} km/s | E_drift={:.3}%",
+                        step, z, state.particles.len(), n_hr, rho_max, rho_plus_max, v_rms, e_drift);
                 }
             }
 

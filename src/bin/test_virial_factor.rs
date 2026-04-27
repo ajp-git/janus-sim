@@ -267,7 +267,7 @@ fn run_test(virial_factor: f64) -> (f64, f64, f64) {
         let dtau_eff = dtau_per_dt;
         current_tau += dtau_cosmo;
 
-        sim.step_treepm_gpu_morton(DT, r_cut, h, dtau_eff).expect("step failed");
+        sim.step_treepm_gpu(DT, r_cut, h, dtau_eff).expect("step failed");
 
         let seg = sim.segregation().unwrap();
         s_max = s_max.max(seg);

@@ -168,7 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Step (except last)
         if step < TOTAL_STEPS {
-            sim.step_treepm_gpu_morton(DT, r_cut, h, dtau_per_dt)?;
+            sim.step_treepm_gpu(DT, r_cut, h, dtau_per_dt)?;
             tau += dtau_per_step;
         }
     }

@@ -43,13 +43,8 @@ const K_MAX: f64 = 2.0 * PI / 10.0;     // suppress lambda < 10 Mpc
 const N_S: f64 = 0.965;
 const K0: f64 = 0.02;
 
+#[cfg(feature = "cuda")]
 fn main() {
-    #[cfg(not(feature = "cuda"))]
-    {
-        eprintln!("Requires --features cuda");
-        std::process::exit(1);
-    }
-    #[cfg(feature = "cuda")]
     run_champion();
 }
 

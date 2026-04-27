@@ -270,7 +270,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let z: f64 = 1.0 / a - 1.0;
         let dtau_eff = if current_tau <= cosmo.tau_end { dtau_per_dt } else { 0.0 };
 
-        sim.step_treepm_gpu_morton(DT, r_cut, h, dtau_eff)?;
+        sim.step_treepm_gpu(DT, r_cut, h, dtau_eff)?;
         current_tau += dtau_cosmo;
 
         let ke = sim.kinetic_energy()?;

@@ -1,0 +1,28 @@
+output:
+  dir: output/trichotomie/phase1/T1_eta0.88_lam8_z3.0
+  metrics_every_steps: 25
+  save_snapshots: true
+  snapshot_redshifts:
+  - 2.0
+  - 1.0
+  - 0.5
+  - 0.0
+physics:
+  cross_force_z_start: 3.0
+  cross_force_z_width: 0.5
+  eta: 0.88
+  hubble_friction: true
+  lambda_base_mpc: 8.0
+  lambda_floor: 0.01
+  r_smooth_mpc: 1.6
+pm_grid:
+  k_min: 2
+  n_cells: 256
+simulation:
+  box_size_mpc: 150.0
+  n_particles: 500000
+  n_steps: 600
+  seed: 42
+  theta: 0.7
+  z_end: 0.0
+  z_start: 5.0

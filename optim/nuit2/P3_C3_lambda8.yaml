@@ -1,0 +1,24 @@
+output:
+  dir: output/nuit2/P3_C3_lambda8
+  metrics_every_steps: 10
+  save_snapshots: true
+  snapshot_redshifts: [3.0, 2.0, 1.5, 1.0, 0.5, 0.2, 0.0]
+physics:
+  eta: 0.50
+  hubble_friction: true
+  lambda_base_mpc: 8.0
+  lambda_floor: 0.01
+  r_smooth_mpc: 3.0
+  cross_force_z_start: 2.0
+  cross_force_z_width: 0.5
+pm_grid:
+  k_min: 2
+  n_cells: 256
+simulation:
+  box_size_mpc: 150.0
+  n_particles: 1000000
+  n_steps: 2000
+  seed: 42
+  theta: 0.7
+  z_end: 0.0
+  z_start: 5.0

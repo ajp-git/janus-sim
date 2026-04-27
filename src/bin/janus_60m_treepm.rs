@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let z = 1.0 / a - 1.0;
 
         // TreePM step with Hubble friction (Morton + warp-coherent)
-        sim.step_treepm_gpu_morton(DT, R_CUT, h, dtau_per_dt)?;
+        sim.step_treepm_gpu(DT, R_CUT, h, dtau_per_dt)?;
         tau += DT * dtau_per_dt;
 
         let step_time = t_step.elapsed().as_millis() as f64;

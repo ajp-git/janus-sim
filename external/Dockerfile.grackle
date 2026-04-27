@@ -1,0 +1,43 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    gfortran \
+    libhdf5-dev \
+    git \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /grackle
+
+COPY grackle/ /grackle/
+
+RUN mkdir build && cd build && \
+    cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGRACKLE_USE_DOUBLE=ON \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DBUILD_SHARED_LIBS=ON \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    && make -j$(nproc) \
+    && make install
+
+# Copy data files
+RUN mkdir -p /usr/local/share/grackle && \
+    cp -r /grackle/grackle_data_files/input /usr/local/share/grackle/
+
+# Build bridge library
+COPY grackle_bridge.c grackle_bridge.h test_grackle.c /bridge/
+WORKDIR /bridge
+
+RUN gcc -shared -fPIC -O2 \
+    -I/usr/local/include \
+    -I/usr/include/hdf5/serial \
+    -o libgrackle_bridge.so grackle_bridge.c \
+    -L/usr/local/lib -Wl,-rpath,/usr/local/lib -lgrackle \
+    -L/usr/lib/x86_64-linux-gnu/hdf5/serial -lhdf5 \
+    -lgfortran -lm \
+    && cp libgrackle_bridge.so /usr/local/lib/ \
+    && cp grackle_bridge.h /usr/local/include/ \
+    && ldconfig

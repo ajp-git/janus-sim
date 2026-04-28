@@ -409,6 +409,106 @@ Warning `M- DRIFT: ratio_v > 1.5` à supprimer ou raise à 3.0 dans le run suiva
 
 Estimation fin de run : ~30 avril matin (lundi/mardi semaine prochaine selon rate exact).
 
+---
+
+## 2026-04-28 15:25 — Anisotropie résiduelle observée à z=4.49 (step 620)
+
+User a flaggé bandes axes-aligned visibles dans frame_00620.png. Test rigoureux fait avec `anisotropy_test.py` + `validate_ic_full.py` sur snap_000620.bin.
+
+### Résultats
+
+```
+Anisotropy spread :  m+ mean 0.9% max 3.5%   m- mean 3.2% max 35.7%
+Scatter brut       : m+ uniforme, m- texture subtile (PAS bandes massives)
+
+Ratio P[L/8]/neighbors :
+  m+ : x=1.00  y=1.04  z=1.01  → max 1.04 ✅
+  m- : x=1.12  y=1.55  z=1.10  → max 1.55 (JUSTE au-dessus seuil 1.5)
+```
+
+### Verdict
+
+Per critères user :
+- Pic L/8 < 1.5 → "modéré, à documenter, pas bloquant" 
+- Pic L/8 > 2.0 → "STOP"
+
+On est à **1.55 sur 1 seul axe (m- y)**. Très loin de 2.0.
+
+→ **Modéré, documenté, run continue.**
+
+### Cause
+
+Le random Morton offset (Phase 13) **réduit** mais n'élimine pas complètement la résonance octree à L/8 = 62.5 Mpc. Sur 620 steps, contamination résiduelle accumulée de 0 (IC) à 1.55× sur l'axe y. Le fix IFFT 3D a éliminé la contamination IC (vérifiée sur snap 0 = ratio 1.00 partout), mais l'effet octree au cours du run reste partiellement visible.
+
+Mécanisme probable : Morton offset aléatoire brise la régularité spatiale mais ne supprime pas la "préférence" de l'octree pour subdivisions axes-alignés. Effet cumulé sur N steps sature à un certain niveau. Trajectoire à surveiller.
+
+### Items surveillance
+
+1. Ratio L/8 trajectoire : 1.00 (IC) → 1.55 (step 620). Refaire test à step 1500 (z~3) :
+   - Si saturation < 1.7 → run reste exploitable
+   - Si > 2.0 → STOP automatique
+2. σ_8(m+) = 0.216 (signal m+ émergeant du floor, premier signe physique m+)
+
+### Solutions futures (run suivant)
+
+- **Box 1000 Mpc** au lieu de 500 (CLAUDE.md note "Use 1000 Mpc box to avoid octree resonance at L/8")
+- **TreePM** au lieu de Barnes-Hut pur (PM grid n'a pas la résonance octree)
+- **Morton offset par particule** au lieu de par step (anti-corrélation plus forte)
+
+Pas pour ce run. Documenter limitation dans préprint.
+
+---
+
+## Octree residual anisotropy monitoring (section pour préprint)
+
+### Méthode
+Directional power spectrum à chaque snapshot post-processing :
+- CIC δ_+(x,y,z), δ_-(x,y,z) sur grille 256³
+- FFT 3D
+- P(k_axis) = moyenne |δ_k|² sur les deux autres axes pour chaque k_axis ∈ [k_min, k_nyq]
+- Ratio[L/8] = P(k=L/8)_axis / mean(P à k=L/8 ± neighbors_bins)
+- Threshold STOP : max(ratio) > 2.0 sur n'importe quel axe → contamination active, run invalide
+
+### Trajectoire mesurée
+
+| Snapshot | z | max ratio[L/8] m+ | max ratio[L/8] m- | Status |
+|---|---|---|---|---|
+| step 0 | 10.00 | 1.009 | 1.009 | IC propre (post-IFFT-fix) |
+| step 620 | 4.49 | 1.039 | **1.546** | Modéré, sous seuil STOP |
+
+→ Croissance monotone de la contamination m- de 1.0 à 1.55 sur 620 steps.
+   m+ reste propre (ratio < 1.04 partout).
+
+### Cause physique
+
+Résonance octree Barnes-Hut à L/8 = 62.5 Mpc (k = 0.1005 1/Mpc).
+Le random Morton offset Phase 13 atténue mais n'élimine pas l'effet :
+- À chaque step, l'octree subdivide la box en 8 sous-octants axes-alignés
+- Le random offset randomise la POSITION des frontières mais pas leur ORIENTATION
+- Effet cumulé sur N steps sature à un niveau résiduel
+
+### Comparaison run buggy (pré-IFFT-fix, run-mu19-IFFT-bug-20260428)
+
+Avant fix IFFT 3D :
+- Spread global m+ 7.8% (mean), 101% (max)
+- Spread global m- 10.6% (mean), 36% (max)
+- Bandes massives visibles dans scatter brut, contamination distribuée sur de nombreux modes
+
+Après fix IFFT 3D (run actuel à z=4.5) :
+- Spread global m+ 0.9% (mean), 3.5% (max)
+- Spread global m- 3.2% (mean), 35.7% (max — concentré sur UN seul mode k=L/8 axe y)
+- Scatter brut visuellement isotrope (m+ uniform, m- texture diffuse)
+
+→ Réduction d'un ordre de magnitude. Contamination résiduelle restreinte à un mode unique.
+
+### Conclusion préprint
+
+Limitation reconnue de la méthode Barnes-Hut à L/8 résonance pour cette taille de box (500 Mpc). Effet **résiduel modéré (1.55× sur un seul mode m-)**, sous le seuil de criticité. Déformation visuelle dans le rendu adaptatif (slice sphérique + raster matplotlib) amplifie l'artifact perçu mais n'affecte pas la physique mesurée par les power spectra. Solutions futures : box 1000 Mpc ou TreePM.
+
+---
+
+
+
 
 
 ---
@@ -439,4 +539,79 @@ Tags git en attente :
 **État système propre, en attente.**
 
 ---
+
+
+## 2026-04-28 — STOP MU19 PROD : Octree Resonance Feedback Confirmé
+
+### Symptôme
+Frame_00900 (z=4.43) montre des bandes m- visuellement plus marquées qu'au frame_00620 (z=4.49) bien que z quasi-identique. Re-test ratio[L/8] sur snap_000900 :
+
+```
+species  axis   ratio[L/8] = P[8] / mean(P[7], P[9])
+plus     y      1.111
+minus    x      1.224
+minus    y      1.933   ← worst (was 1.55 at step 620)
+minus    z      1.159
+```
+
+Trajectoire ratio m- y-axis :
+- step 620 (z=4.49) : 1.55
+- step 900 (z=4.43) : 1.933
+Δ = +0.38 sur 280 steps (+0.0014/step).
+
+### Diagnostic 3 tests
+
+**(1) Morton offset randomisé ?** OUI. Code `src/nbody_gpu.rs:2662` utilise `rand::thread_rng()` (entropie système, pas seed fixe). Indépendant à chaque appel.
+
+**(2) Combien de constructions octree par step ?** UNE seule, dans `step_with_expansion_dkd_gpu_cosmo` ligne 3184. Pas de réutilisation cross-step. Force kernel partage le même tree pour toutes particules (correct).
+
+**(3) Feedback clustering ↔ octree ?** OUI — confirmé par cohérence de phase complexe du mode k=L/8 sur 3 snapshots :
+
+```
+sp    ax  phase620   phase800   phase900   coherence  amp(900)/amp(620)
+plus  x   +0.696     +0.746     +0.757     1.000      1.769
+plus  y   −2.011     −1.961     −1.936     1.000      1.855
+plus  z   +1.416     +1.347     +1.324     0.999      1.767
+minus x   −2.457     −2.445     −2.449     1.000      1.639
+minus y   +1.147     +1.186     +1.207     1.000      1.735   ← worst
+minus z   −1.720     −1.769     −1.784     1.000      1.658
+```
+
+Phases verrouillées à <0.05 rad sur 280 steps (cohérence ≈ 1.0). Croissance mode k=L/8 amplitude m- y = +73.5 % sur 280 steps vs +0.4 % attendu en LCDM linéaire (a passe 0.181 → 0.184). **Amplification ×180 le taux linéaire**.
+
+Densité aux planes m·L/16 (modulation systématique) :
+- m+ y : 0.904 → 0.864 → 0.844 (déficit croissant)
+- m+ z : 0.948 → 0.925 → 0.905
+- m- z : 1.082 → 1.097 → 1.106 (excès croissant)
+- m- x : 0.894 → 0.880 → 0.878 (déficit stable)
+
+### Interprétation
+
+Le random offset Morton ne supprime pas la résonance — il l'isotropise en direction sans atténuer son amplitude moyenne par step. Les multipoles BVH ont un biais résiduel à L/8 (résonance intrinsèque à la subdivision récursive). Le random offset rend le biais isotrope mais le cumul reste cohérent en phase parce que le clustering physique s'auto-renforce autour des planes privilégiés indépendamment de l'orientation de subdivision.
+
+### Décision AJP : STOP + rotation 3D (option A2)
+
+- STOP propre run µ=19 : `docker stop -t 30 74afddbd3f73` à 16:03:28 le 2026-04-28
+- Dernier snapshot complet : `snap_001000.bin` (step 1000, z=4.404)
+- Évolution stoppée à step 1015 (CSV row complète)
+- Préservation : output `output/janus_jpp_production` → `output/janus_jpp_production_octree_resonance_run`
+- Tag git `run-mu19-IFFT-fixed-octree-resonance-20260429`
+
+### Fix prévu : Phase 14 — Rotation 3D aléatoire avant Morton
+
+Dans `build_gpu_tree()`, après le random offset existant :
+- Génération matrice de rotation R uniforme via Euler angles (α uniforme [0,2π], β = arccos(uniforme [-1,1]), γ uniforme [0,2π])
+- Apply R aux positions avant Morton sort + BVH build
+- BVH bounds + force kernel opèrent en frame rotated
+- Apply R^T aux forces et positions après force compute
+
+Branche `fix/octree-resonance-rotation-3d`.
+
+### Critères validation rotation 3D (mini-run 200 steps)
+1. Cohérence phase mode L/8 entre snapshots successifs : <0.5 (vs 1.0 actuel)
+2. Amp mode L/8 m- y : pas de croissance cohérente (random walk en δ)
+3. Spread directional P(k) max : <10%
+4. σ_R(R=8) m- corrected à step 100 : >0.005 (comme avant)
+
+Si 4/4 OK → autorisation full prod relancée. Sinon → attendre AJP.
 

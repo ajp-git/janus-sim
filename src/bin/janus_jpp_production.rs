@@ -232,18 +232,53 @@ fn generate_zeldovich_ics(n_grid: usize, l_box: f64, z_init: f64, h0: f64, mu: f
         }
     }
 
-    // IFFT
+    // IFFT 3D (full): apply 1D inverse FFT successively along x, y, z axes.
+    // Previous version only applied the x-axis pass — leaving the field hybrid
+    // k_y/k_z and producing axis-aligned anisotropy in the displacement field.
     let mut planner = FftPlanner::new();
     let ifft = planner.plan_fft_inverse(n_fft);
 
-    for iz in 0..n_fft {
+    // Helper: apply 1D inverse FFT along the chosen axis on a 3D array stored as
+    // psi[iz*n²+iy*n+ix].
+    fn ifft3d_inplace(psi: &mut Vec<Complex<f64>>, n_fft: usize,
+                      ifft: &std::sync::Arc<dyn rustfft::Fft<f64>>) {
+        // x-axis (contiguous, stride 1): rows of length n_fft
+        for iz in 0..n_fft {
+            for iy in 0..n_fft {
+                let start = iz * n_fft * n_fft + iy * n_fft;
+                ifft.process(&mut psi[start..start+n_fft]);
+            }
+        }
+        // y-axis (stride n_fft): copy column, FFT, copy back
+        let mut col = vec![Complex::new(0.0, 0.0); n_fft];
+        for iz in 0..n_fft {
+            for ix in 0..n_fft {
+                for iy in 0..n_fft {
+                    col[iy] = psi[iz * n_fft * n_fft + iy * n_fft + ix];
+                }
+                ifft.process(&mut col);
+                for iy in 0..n_fft {
+                    psi[iz * n_fft * n_fft + iy * n_fft + ix] = col[iy];
+                }
+            }
+        }
+        // z-axis (stride n_fft²)
         for iy in 0..n_fft {
-            let start = iz * n_fft * n_fft + iy * n_fft;
-            ifft.process(&mut psi_x[start..start+n_fft]);
-            ifft.process(&mut psi_y[start..start+n_fft]);
-            ifft.process(&mut psi_z[start..start+n_fft]);
+            for ix in 0..n_fft {
+                for iz in 0..n_fft {
+                    col[iz] = psi[iz * n_fft * n_fft + iy * n_fft + ix];
+                }
+                ifft.process(&mut col);
+                for iz in 0..n_fft {
+                    psi[iz * n_fft * n_fft + iy * n_fft + ix] = col[iz];
+                }
+            }
         }
     }
+
+    ifft3d_inplace(&mut psi_x, n_fft, &ifft);
+    ifft3d_inplace(&mut psi_y, n_fft, &ifft);
+    ifft3d_inplace(&mut psi_z, n_fft, &ifft);
 
     // Find max displacement for scaling
     let mut max_disp = 0.0f64;

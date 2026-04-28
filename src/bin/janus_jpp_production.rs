@@ -47,7 +47,7 @@ const EPS_MINUS: f64 = 0.10;// Softening m- [Mpc]
 
 // Output intervals
 const METRIC_INTERVAL: usize = 5;
-const SNAPSHOT_INTERVAL: usize = 10;
+const SNAPSHOT_INTERVAL: usize = 20;
 const FRAME_INTERVAL: usize = 5;
 
 // Zel'dovich ICs
@@ -548,24 +548,28 @@ fn compute_void_fraction(delta_plus: &[f64], delta_minus: &[f64]) -> f64 {
     void_count as f64 / n as f64
 }
 
-/// Estimate σ8 from power spectrum (simplified: use grid variance scaled to 8 Mpc/h)
-/// Full computation would require FFT - this is an approximation
-fn compute_sigma8_approx(delta_plus: &[f64], l_box: f64, h: f64) -> f64 {
-    // σ8 is the RMS of δ in 8 Mpc/h spheres
-    // Approximation: scale grid variance by (8 Mpc/h / cell_size)
+/// Compute RMS of grid-cell δ⁺ field, scaled by ~ (cell_size/R_8)^(3/2).
+///
+/// THIS IS NOT σ_8.  Specifically:
+///  - Uses NGP (not CIC) → aliasing
+///  - No top-hat smoothing kernel (just naive variance/n_cells_in_R_8)
+///  - Only m+ fluid (ignores m-)
+///  - Shot-noise dominated until ⟨N+_per_cell⟩·δ² >> 1, i.e. roughly z<5
+///    For prod (N+=500k, n_grid=64): Poisson floor ≈ 1/√1.9/√3.14 ≈ 0.41
+///    matches the observed ~0.42 floor at IC.
+///
+/// Use as monotone proxy for structure growth at z<5 only.
+/// For real σ_8 publication, use scripts/postprocess_sigma8.py (CIC 256³ + top-hat FFT).
+fn compute_delta_grid_rms_plus(delta_plus: &[f64], l_box: f64, h: f64) -> f64 {
     let n_grid = (delta_plus.len() as f64).powf(1.0/3.0) as usize;
     let cell_size = l_box / n_grid as f64;  // Mpc
     let r8 = 8.0 / h;  // 8 Mpc/h in Mpc
 
-    // Variance of δ⁺
     let mean: f64 = delta_plus.iter().sum::<f64>() / delta_plus.len() as f64;
     let var: f64 = delta_plus.iter().map(|&d| (d - mean).powi(2)).sum::<f64>() / delta_plus.len() as f64;
 
-    // Scale factor for smoothing (approximate)
     let n_cells_in_r8 = (r8 / cell_size).powi(3);
-    let sigma8 = (var / n_cells_in_r8.max(1.0)).sqrt();
-
-    sigma8
+    (var / n_cells_in_r8.max(1.0)).sqrt()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -653,7 +657,7 @@ fn main() {
     // CSV output
     let csv_path = format!("{}/evolution_phase2.csv", out_dir);
     let mut csv = BufWriter::new(File::create(&csv_path).unwrap());
-    writeln!(csv, "step,z,t_Gyr,a_plus,a_minus,c_bar,rho_max_plus,rho_max_minus,v_rms_plus,v_rms_minus,ratio_v,phi,E_naive,E_plus,E_minus,E_naive_drift_pct,S_VSL,E_VSL,E_VSL_drift_pct,corr_delta,void_frac,sigma8_approx,N_stars,SFR").unwrap();
+    writeln!(csv, "step,z,t_Gyr,a_plus,a_minus,c_bar,rho_max_plus,rho_max_minus,v_rms_plus,v_rms_minus,ratio_v,phi,E_naive,E_plus,E_minus,E_naive_drift_pct,S_VSL,E_VSL,E_VSL_drift_pct,corr_delta,void_frac,delta_grid_rms_plus,N_stars,SFR").unwrap();
 
     // Run log
     let log_path = format!("{}/run.log", out_dir);
@@ -776,7 +780,7 @@ fn main() {
                 let (delta_plus, delta_minus) = compute_overdensity_grids(&pos, &signs_gpu, 64, L_BOX);
                 let corr_delta = compute_delta_correlation(&delta_plus, &delta_minus);
                 let void_frac = compute_void_fraction(&delta_plus, &delta_minus);
-                let sigma8_approx = compute_sigma8_approx(&delta_plus, L_BOX, H0 / 100.0);
+                let delta_grid_rms_plus = compute_delta_grid_rms_plus(&delta_plus, L_BOX, H0 / 100.0);
 
                 writeln!(csv, "{},{:.6},{:.6},{:.8},{:.8},{:.8},{:.4e},{:.4e},{:.2},{:.2},{:.4},{:.8},{:.6e},{:.6e},{:.6e},{:.6},{:.6e},{:.6e},{:.6},{:.6},{:.6},{:.6},{},{:.4e}",
                     step, z, t_gyr, a, a_minus, c_bar,
@@ -784,7 +788,7 @@ fn main() {
                     v_rms_plus, v_rms_minus, ratio_v,
                     phi, e_naive, e_plus, e_minus, e_naive_drift,
                     s_vsl, e_vsl, e_vsl_drift,
-                    corr_delta, void_frac, sigma8_approx,
+                    corr_delta, void_frac, delta_grid_rms_plus,
                     n_stars, sfr
                 ).unwrap();
 

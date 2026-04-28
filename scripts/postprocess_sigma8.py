@@ -20,9 +20,10 @@ import sys
 import time
 import numpy as np
 
-DEFAULT_SNAPDIR = "/mnt/T2/janus-sim/output/janus_jpp_production/snapshots"
-DEFAULT_OUT_SIGMA = "/mnt/T2/janus-sim/output/sigma_postprocess_sigma_R.csv"
-DEFAULT_OUT_CROSS = "/mnt/T2/janus-sim/output/sigma_postprocess_cross_pk.csv"
+DEFAULT_RUNDIR = "/mnt/T2/janus-sim/output/janus_jpp_production"
+DEFAULT_SNAPDIR = f"{DEFAULT_RUNDIR}/snapshots"
+DEFAULT_OUT_SIGMA = f"{DEFAULT_RUNDIR}/postprocess/sigma_postprocess_sigma_R.csv"
+DEFAULT_OUT_CROSS = f"{DEFAULT_RUNDIR}/postprocess/sigma_postprocess_cross_pk.csv"
 
 N_GRID = 256
 HUBBLE_LITTLE_H = 0.699

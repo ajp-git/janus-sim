@@ -28,15 +28,16 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 
-DEFAULT_SNAPDIR = "/mnt/T2/janus-sim/output/janus_jpp_production/snapshots"
-DEFAULT_OUT_CSV = "/mnt/T2/janus-sim/output/sigma_postprocess_lambda_debye.csv"
-DEFAULT_OUT_PLOT_VS_Z = "/mnt/T2/janus-sim/output/lambda_debye_vs_z.png"
-DEFAULT_OUT_PLOT_POWER = "/mnt/T2/janus-sim/output/lambda_debye_power_law.png"
-DEFAULT_OUT_PLOT_RKZ = "/mnt/T2/janus-sim/output/cross_correlation_r_k_z.png"
-DEFAULT_OUT_PLOT_XIR_MULTIZ = "/mnt/T2/janus-sim/output/xi_pm_r_multi_z.png"
-DEFAULT_OUT_BOOTSTRAP = "/mnt/T2/janus-sim/output/lambda_debye_bootstrap_z5.txt"
-DEFAULT_CROSS_PK_CSV = "/mnt/T2/janus-sim/output/sigma_postprocess_cross_pk.csv"
-DEFAULT_XIR_CACHE = "/mnt/T2/janus-sim/output/lambda_debye_xir_cache.npz"
+DEFAULT_RUNDIR = "/mnt/T2/janus-sim/output/janus_jpp_production"
+DEFAULT_SNAPDIR = f"{DEFAULT_RUNDIR}/snapshots"
+DEFAULT_OUT_CSV = f"{DEFAULT_RUNDIR}/postprocess/sigma_postprocess_lambda_debye.csv"
+DEFAULT_OUT_PLOT_VS_Z = f"{DEFAULT_RUNDIR}/postprocess/lambda_debye_vs_z.png"
+DEFAULT_OUT_PLOT_POWER = f"{DEFAULT_RUNDIR}/postprocess/lambda_debye_power_law.png"
+DEFAULT_OUT_PLOT_RKZ = f"{DEFAULT_RUNDIR}/postprocess/cross_correlation_r_k_z.png"
+DEFAULT_OUT_PLOT_XIR_MULTIZ = f"{DEFAULT_RUNDIR}/postprocess/xi_pm_r_multi_z.png"
+DEFAULT_OUT_BOOTSTRAP = f"{DEFAULT_RUNDIR}/postprocess/lambda_debye_bootstrap_z5.txt"
+DEFAULT_CROSS_PK_CSV = f"{DEFAULT_RUNDIR}/postprocess/sigma_postprocess_cross_pk.csv"
+DEFAULT_XIR_CACHE = f"{DEFAULT_RUNDIR}/postprocess/lambda_debye_xir_cache.npz"
 
 # Physical constants (code units)
 G_CODE = 4.499e-15            # Mpc³/(M_sun·Gyr²)

@@ -982,6 +982,11 @@ path = "src/bin/test_phase10_a5a_ewald.rs"
 required-features = ["cuda", "cufft"]
 
 [[bin]]
+name = "janus_minirun_treepm_15k"
+path = "src/bin/janus_minirun_treepm_15k.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
 name = "test_phase105_decomp"
 path = "src/bin/test_phase105_decomp.rs"
 required-features = ["cuda", "cufft"]

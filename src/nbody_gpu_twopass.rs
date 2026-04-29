@@ -4791,6 +4791,130 @@ impl GpuNBodyTwoPass {
         Ok(self.device.dtoh_sync_copy(&self.acc)?)
     }
 
+    /// Phase 10.5: PM-only force computation (no Tree, no kick/drift).
+    /// Acc reset, PM scatter+solve+gather_janus, no tree contribution.
+    /// Used for diagnostic decomposition.
+    #[cfg(feature = "cufft")]
+    pub fn compute_pm_only_janus(
+        &mut self,
+        r_s: f64,
+        phi: f64,
+        c_ratio_sq: f64,
+        repulsion_scale: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let n = self.n_particles;
+        let grid = self.pm_grid_size;
+        let grid_cells = grid * grid * grid;
+        let box_half = (self.box_size / 2.0) as f32;
+        let cell_size = (self.box_size / grid as f64) as f32;
+        let inv_cell_size = (grid as f64 / self.box_size) as f32;
+        let cell_vol = (self.box_size / grid as f64).powi(3);
+        let g_constant = self.mass_factor / cell_vol;
+
+        let cross_minus_plus = (c_ratio_sq * (1.0 / phi) * repulsion_scale) as f32;
+        let cross_plus_minus = (phi * repulsion_scale) as f32;
+
+        let blocks = (n + 255) / 256;
+        let grid_blocks = (grid_cells + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let grid_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (grid_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Reset acc
+        let reset_f32_k = self.device.get_func("twopass", "reset_f32")
+            .ok_or("reset_f32 not found")?;
+        let acc_blocks = (n * 3 + 255) / 256;
+        let acc_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (acc_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            reset_f32_k.launch(acc_cfg, (&mut self.acc, (n * 3) as i32))?;
+        }
+        self.device.synchronize()?;
+
+        // CIC scatter + Poisson + gather_janus → pm_forces
+        let reset_grid_k = self.device.get_func("twopass", "reset_f64_grid")
+            .ok_or("reset_f64_grid not found")?;
+        unsafe {
+            reset_grid_k.clone().launch(grid_cfg, (&mut self.rho_plus, grid_cells as i32))?;
+            reset_grid_k.launch(grid_cfg, (&mut self.rho_minus, grid_cells as i32))?;
+        }
+        self.device.synchronize()?;
+
+        let scatter_k = self.device.get_func("twopass", "cic_scatter")
+            .ok_or("cic_scatter not found")?;
+        unsafe {
+            scatter_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.rho_plus, &mut self.rho_minus,
+                n as i32, grid as i32, box_half, inv_cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        let rho_plus_ptr = get_device_ptr(&self.rho_plus) as *mut f64;
+        let rho_minus_ptr = get_device_ptr(&self.rho_minus) as *mut f64;
+        let phi_plus_ptr = get_device_ptr(&self.phi_plus) as *mut f64;
+        let phi_minus_ptr = get_device_ptr(&self.phi_minus) as *mut f64;
+        unsafe {
+            crate::treepm::cufft_ffi::solve_device(
+                rho_plus_ptr, phi_plus_ptr,
+                grid, self.box_size, g_constant, r_s,
+            )?;
+            crate::treepm::cufft_ffi::solve_device(
+                rho_minus_ptr, phi_minus_ptr,
+                grid, self.box_size, g_constant, r_s,
+            )?;
+        }
+
+        let gather_k = self.device.get_func("twopass", "cic_gather_janus")
+            .ok_or("cic_gather_janus not found")?;
+        unsafe {
+            gather_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &self.phi_plus, &self.phi_minus,
+                &mut self.pm_forces,
+                n as i32, grid as i32, box_half, inv_cell_size, cell_size,
+                cross_minus_plus, cross_plus_minus,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // Acc = pm_forces (no tree contribution)
+        let add_pm_k = self.device.get_func("twopass", "add_pm_forces")
+            .ok_or("add_pm_forces not found")?;
+        unsafe {
+            add_pm_k.launch(cfg, (
+                &mut self.acc, &self.pm_forces, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+        Ok(())
+    }
+
+    /// Phase 10.5: Tree-only force (no PM). Acc = compute_short_range_forces_janus.
+    pub fn compute_tree_only_janus(
+        &mut self,
+        r_cut: f64,
+        phi: f64,
+        c_ratio_sq: f64,
+        repulsion_scale: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cross_minus_plus = (c_ratio_sq * (1.0 / phi) * repulsion_scale) as f32;
+        let cross_plus_minus = (phi * repulsion_scale) as f32;
+        // compute_short_range_forces_janus already resets acc and applies tree
+        self.compute_short_range_forces_janus(r_cut, cross_minus_plus, cross_plus_minus)
+    }
+
     pub fn get_acc_mut(&mut self) -> &mut CudaSlice<f32> {
         &mut self.acc
     }

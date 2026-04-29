@@ -975,3 +975,8 @@ required-features = ["cuda", "cufft"]
 name = "test_phase10_a5a"
 path = "src/bin/test_phase10_a5a.rs"
 required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "test_phase105_decomp"
+path = "src/bin/test_phase105_decomp.rs"
+required-features = ["cuda", "cufft"]

@@ -37,6 +37,9 @@ pub mod integrated_step;
 // Phase 8 benchmarks
 pub mod benchmarks;
 
+// Precision check (Phase 9.5): TreePM CPU vs PP-direct reference
+pub mod pp_reference;
+
 /// GPU cuFFT Poisson solver (requires cuda feature + libcufft_wrapper.so)
 #[cfg(feature = "cufft")]
 pub mod cufft_ffi;

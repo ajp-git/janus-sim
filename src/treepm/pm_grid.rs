@@ -230,9 +230,9 @@ impl PmGrid {
                                 green *= (-k2 * rs2).exp();
                             }
 
-                            // Apply Green's function and CIC deconvolution (×2
-                            // for scatter+gather).
-                            // Reference: Sefusatti+ 2016, GrGadget §3.3.1.
+                            // Apply Green's function and CIC deconvolution.
+                            // cic_inv = inv_sinc² per dim per pass; ×2 for
+                            // scatter+gather (Sefusatti+ 2016, GrGadget §3.3.1).
                             data[idx] *= green * cic_inv * cic_inv;
                         } else {
                             data[idx] = Complex64::new(0.0, 0.0);

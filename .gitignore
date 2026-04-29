@@ -37,3 +37,7 @@ venv/
 # Data observationnelles (télécharger séparément)
 data/*.csv
 data/*.dat
+
+# Archive snapshots (large binaries) - keep README and PNGs only
+archive/**/*.bin
+archive/**/*.h5

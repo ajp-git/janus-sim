@@ -615,3 +615,151 @@ Branche `fix/octree-resonance-rotation-3d`.
 
 Si 4/4 OK → autorisation full prod relancée. Sinon → attendre AJP.
 
+
+## 2026-04-29 06:25 — TreePM pivot decision evening
+
+### Confirmation visuelle vs mesure : la mesure d'AJP a primé
+
+Frame_01700 (z=4.117) montre des bandes verticales ET horizontales formant un **quadrillage régulier** spacing ~30 Mpc, visible sur m+, m-, densité totale, ségrégation, à zoom 200 Mpc et 50 Mpc, en scatter brut et densité projetée. Confirmation visuelle indéniable d'une résonance octree.
+
+### Confession méthodologique : P(k) sur axes purs vs P(k) 3D radial
+
+Mes tests directionnels précédents (snap 180, 1680) sur les 7 axes (x,y,z + diagonales face xy,xz,yz + body xyz) avec ratio[L/16] max = 1.42 m- z m'avaient suggéré "pas de résonance". Critère AJP strict (>2) NON atteint sur axes.
+
+**Erreur méthodologique** : le ratio sur **axes purs** rate les modes diagonaux 3D où l'énergie de la grille octree est concentrée. Mesure refaite avec **P(|k|) 3D radial bin** (toutes orientations, ~3338 modes au bin |k|=16) :
+
+| k | λ (Mpc) | ratio_4nbr m- | ratio total | Verdict |
+|---|---|---|---|---|
+| 4 | 125.0 | 24.81 | 24.67 | Clustering large échelle (cosmologique) |
+| **8** | **62.5** | **2.10** | **2.11** | **L/8 (level-3 octree) PRESENT** |
+| 12 | 41.7 | 1.46 | 1.44 | bruit |
+| **16** | **31.2** | **5.31** | **5.18** | **L/16 (level-4 octree) DOMINANTE** |
+| 32 | 15.6 | 1.76 | 1.71 | émergence L/32 (level-5) |
+
+**Critère AJP strict largement dépassé** : ratio[L/16]=5.18 (>>2), ratio[L/8]=2.11 (>2).
+
+### Action irréversible : run squared killed et archivé
+
+- 2026-04-29 06:25 : `tmux kill-session -t janus_prod_squared` + `docker stop -t 30 4db07cff264f`
+- Run final : step 1730, z=4.102, t=1.730 Gyr, 87 snapshots
+- Tag git annoté : `run-mu19-bmax-squared-octree-L16-grid-confirmed-20260429` (sur 4d6f797)
+- Archive : `output/janus_jpp_production_bmax_squared_octree_L16/` (23 GB, 87 snaps)
+- Préservation pour section méthodologique préprint : preuve par contraste "BMAX squared, frame_01700, octree L/16 visible"
+
+### TreePM : audit signature actuelle vs besoins JPP
+
+**Signature actuelle** `step_treepm_gpu(dt, r_cut, hubble, dtau_per_dt)` :
+- Single `hubble` (pas de h_plus/h_minus)
+- Single scale factor implicite (pas de a_plus/a_minus)
+- Pas de couplage Janus (φ, c̄², repulsion_scale)
+
+**Kernels CUDA actuels** :
+- `drift_f32` : `pos += vel*dt` (pas de /a)
+- `kick_f32` : `vel += (acc + friction)*dt`, friction = -hubble·v·dtau_per_dt (single hubble)
+- `cic_scatter` : assigne masses sur grilles ρ_+ et ρ_- séparément ✅ (bonne base)
+- `cic_gather` : F = -∇φ_attract + ∇φ_repel — **structure attract/repel OK mais scaling 1.0 partout** (pas de couplage Janus)
+- `forces_treepm_short_range` : MAC + r_cut + erfc splitting — manque cross_minus_plus, cross_plus_minus
+
+**Besoins JPP (extraits de step_with_expansion_dkd_gpu_cosmo)** :
+- Per-particle a/H selected by sign : `a_eff = (sign>0) ? a_plus : a_minus`
+- Drift `pos += vel*dt/a_eff`
+- Kick `vel += (acc/a_eff² - h_eff·vel)*dt`
+- Force m- ← m+ : factor `cross_minus_plus = c̄²·φ⁻¹·repulsion_scale`
+- Force m+ ← m- : factor `cross_plus_minus = φ·repulsion_scale`
+
+### Plan port TreePM
+
+Branche `feat/treepm-jpp-port` (créée à 06:25 depuis main b45b282).
+
+**Phase 1 (jour 1, audit fait)** :
+- Audit signatures complet : ✅ (ci-dessus)
+- Extraction des constantes Janus depuis CoupledFriedmann
+- Identification des 4 kernels à modifier : drift_f32, kick_f32, cic_gather, forces_treepm_short_range
+
+**Phase 2 (jours 2-4, port physique)** :
+- `drift_f32_cosmo` : new kernel avec per-particle 1/a_eff
+- `kick_f32_cosmo` : new kernel avec per-particle 1/a_eff² et h_eff
+- `cic_gather_janus` : modify F = -∇φ_+ + factor_repel·∇φ_- où factor_repel = (sign>0) ? cross_plus_minus : cross_minus_plus
+- `forces_treepm_short_range_janus` : passer cross_minus_plus, cross_plus_minus
+- `step_treepm_gpu_cosmo` : orchestrer DKD avec drift_cosmo, scatter, FFT Poisson (inchangé), gather_janus, BH short-range_janus, kick_cosmo, drift_cosmo
+- Wrapper depuis `janus_jpp_production` : utiliser GpuNBodyTwoPass.step_treepm_gpu_cosmo au lieu de GpuNBodySimulation.step_with_expansion_dkd_gpu_cosmo
+- Validation IC : confirmer que `generate_zeldovich_ics` produit la même IC dans le pipeline TwoPass (signs encoding i8 vs u1)
+
+**Phase 3 (jour 5, validation)** :
+- Mini-run 500 steps mêmes IC
+- Critère : **P(|k|) 3D radial sans pic isolé** à |k|=4, 8, 12, 16, 24, 32 (tous ratio_4nbr < 1.5 sauf k=4 cosmo)
+- Frame snap_500 visuel sans grille
+- Métriques v_rms±, ratio_v, σ_R cohérents avec ancien run pré-résonance
+
+**Phase 4 (jours 6-8, full prod si Phase 3 OK)** :
+- Full prod µ=19 sur ~50-65h selon rate TreePM
+- ETA total : pivot+port+validation+prod ≈ **~1 semaine** (29 avril → 6 mai)
+
+### Documentation préprint
+
+Section "Méthodologie : impact de la subdivision octree" avec :
+- Mise en évidence résonance L/8 (run pré-IFFT-fix preserved)
+- Tentative BMAX MAC (élimine L/8 mais déplace vers L/16)
+- BMAX squared : optimisation marginale +12%, identique BMAX
+- Pivot vers TreePM : isolation gravité long-range via PM (isotrope par construction), reste à BH avec cutoff r_cut
+
+
+## 2026-04-29 06:30 — Mock pareidolia test : la grille est réelle
+
+### Procédure
+
+Mock généré : N=10M particules (496918 m+ + 9441457 m-, mêmes counts que run réel) tirage uniforme Poisson dans box 500 Mpc, format V3 binary identique. Rendu avec script render_publication.py (CIC 256³ + Gaussian σ=1 cell + slab projection ±25 Mpc).
+
+### Vérification statistique du mock
+
+P(k) 3D radial sur le mock :
+| k | λ Mpc | ratio_4nbr m+ | ratio_4nbr m- |
+|---|---|---|---|
+| 4 | 125.0 | 1.001 | 1.017 |
+| 8 | 62.5 | 1.100 | 1.184 |
+| 12 | 41.7 | 1.016 | 1.026 |
+| 16 | 31.2 | 1.014 | 1.013 |
+| 20 | 25.0 | 1.017 | 1.030 |
+| 24 | 20.8 | 0.988 | 0.995 |
+| 32 | 15.6 | 0.994 | 0.981 |
+
+Tous ratios dans [0.98, 1.18] : **mock confirmé uniforme Poisson**, pas de structure préférentielle.
+
+### Comparaison visuelle
+
+- **Mock segregation map** (`mock_render/snap_mock_uniform_pub_segregation.png`) : speckle aléatoire ±0.7, pas de structure organisée, pas de bandes, isotrope visuellement
+- **Real snap_001700** : bandes verticales nettes (x ≈ −150, 0, +50, +150 Mpc, spacing 30-40 Mpc), structures filamentaires, échelle ±3.0 (4× le shot noise)
+
+**Conclusion : la grille observée dans frame_01700 est réelle (numérique octree L/16), pas un artefact de rendu/pareidolia.** Le pipeline render_publication.py traitant uniformément un mock random ne produit pas de grille — donc la grille du run réel n'est pas un effet du rendu.
+
+### Phase 3 — Kill et archivage : déjà effectués
+
+- `tmux kill-session -t janus_prod_squared` (tmux supprimé, container 4db07cff264f stoppé via docker stop -t 30)
+- 4 daemons postproc et render_publication killed (SIGTERM)
+- `mv output/janus_jpp_production → output/janus_jpp_production_bmax_squared_octree_L16` : 23 GB préservés, 87 snapshots
+- Tag : `run-mu19-bmax-squared-octree-L16-grid-confirmed-20260429`
+- Note utilisateur : utilise `screen` au lieu de `tmux` pour les futures sessions persistantes
+
+### Phase 4 — Audit TreePM port (résumé pour planification)
+
+Audit complet ci-dessus (section "TreePM pivot decision evening"). Plan en 4 phases déjà présenté.
+
+**État actuel** :
+- Branche `feat/treepm-jpp-port` créée (depuis main b45b282)
+- Audit signature `step_treepm_gpu(dt, r_cut, hubble, dtau_per_dt)` vs besoins JPP : insuffisant pour Janus
+- 4 kernels CUDA à modifier (drift_f32, kick_f32, cic_gather, forces_treepm_short_range)
+- Plan d'implémentation détaillé : Phase 2 port physique (2-3 jours), Phase 3 validation (1 jour), Phase 4 full prod (50-65h)
+
+**Pas de modification de code sans accord AJP supplémentaire** — le plan est documenté, l'audit est fait, prêt à coder dès autorisation.
+
+### Roadmap globale révisée
+
+| Date | Étape |
+|---|---|
+| 2026-04-29 | Pivot TreePM (audit + plan) |
+| 2026-04-30 → 2026-05-02 | Port physique JPP dans pipeline TwoPass |
+| 2026-05-03 | Validation mini-run 500 steps (P(k) 3D radial sans pic isolé) |
+| 2026-05-04 → 2026-05-07 | Full prod µ=19 TreePM (50-65h) |
+| 2026-05-08 → 2026-05-12 | Post-traitement + rédaction préprint MPLA |
+| ~2026-05-15 | Soumission préprint |
+

@@ -136,6 +136,7 @@ pub fn pp_direct_forces_newton_ewald(
         }
     }
 
+    let half_l = box_size * 0.5;
     (0..n)
         .into_par_iter()
         .map(|i| {
@@ -147,12 +148,31 @@ pub fn pp_direct_forces_newton_ewald(
                     continue;
                 }
                 let (xj, yj, zj) = pos[j];
-                let dx_base = xj - xi;
-                let dy_base = yj - yi;
-                let dz_base = zj - zi;
+                // Pre-wrap dx_base to MIC range so that n=0 IS the closest image
+                let mut dx_base = xj - xi;
+                let mut dy_base = yj - yi;
+                let mut dz_base = zj - zi;
+                if dx_base > half_l {
+                    dx_base -= box_size;
+                }
+                if dx_base < -half_l {
+                    dx_base += box_size;
+                }
+                if dy_base > half_l {
+                    dy_base -= box_size;
+                }
+                if dy_base < -half_l {
+                    dy_base += box_size;
+                }
+                if dz_base > half_l {
+                    dz_base -= box_size;
+                }
+                if dz_base < -half_l {
+                    dz_base += box_size;
+                }
                 let m_j = mass[j];
 
-                // Real-space sum over images n
+                // Real-space sum over images n (n=0 is now the closest image)
                 for nx in -n_real_max..=n_real_max {
                     for ny in -n_real_max..=n_real_max {
                         for nz in -n_real_max..=n_real_max {
@@ -160,17 +180,15 @@ pub fn pp_direct_forces_newton_ewald(
                             let dy = dy_base + (ny as f64) * box_size;
                             let dz = dz_base + (nz as f64) * box_size;
                             let r2_raw = dx * dx + dy * dy + dz * dz;
-                            let is_direct = nx == 0 && ny == 0 && nz == 0;
-                            let r2 = if is_direct { r2_raw + eps2 } else { r2_raw };
+                            let is_closest = nx == 0 && ny == 0 && nz == 0;
+                            let r2 = if is_closest { r2_raw + eps2 } else { r2_raw };
                             if r2 < 1e-30 {
                                 continue;
                             }
                             let r = r2.sqrt();
                             let alpha_r = alpha * r;
-                            // erfc(αr)/r³
                             let erfc_term = crate::treepm::truncation_table::erfc_approx(alpha_r)
                                 / (r * r2);
-                            // (2α/√π)·exp(-α²r²)/r²
                             let exp_term = (2.0 * alpha * inv_sqrt_pi)
                                 * (-alpha_r * alpha_r).exp()
                                 / r2;
@@ -183,8 +201,6 @@ pub fn pp_direct_forces_newton_ewald(
                 }
 
                 // Fourier-space sum over modes k
-                // F_Fourier = -(4πG·m_j/V) · Σ_k k̂·sin(k·r)·exp(-k²/4α²)/|k|²
-                //           = -(4πG·m_j/V) · Σ_k k·sin(k·r)·weight  where weight = exp(-k²/4α²)/k²
                 for &(kx, ky, kz, weight) in &fourier_modes {
                     let k_dot_r = kx * dx_base + ky * dy_base + kz * dz_base;
                     let factor = -four_pi_over_v * g_phys * m_j * weight * k_dot_r.sin();
@@ -252,6 +268,7 @@ pub fn pp_direct_forces_janus_ewald(
         }
     }
 
+    let half_l = box_size * 0.5;
     (0..n)
         .into_par_iter()
         .map(|i| {
@@ -266,9 +283,15 @@ pub fn pp_direct_forces_janus_ewald(
                 }
                 let (xj, yj, zj) = pos[j];
                 let s_j = sign[j];
-                let dx_base = xj - xi;
-                let dy_base = yj - yi;
-                let dz_base = zj - zi;
+                let mut dx_base = xj - xi;
+                let mut dy_base = yj - yi;
+                let mut dz_base = zj - zi;
+                if dx_base > half_l { dx_base -= box_size; }
+                if dx_base < -half_l { dx_base += box_size; }
+                if dy_base > half_l { dy_base -= box_size; }
+                if dy_base < -half_l { dy_base += box_size; }
+                if dz_base > half_l { dz_base -= box_size; }
+                if dz_base < -half_l { dz_base += box_size; }
                 let m_j = mass[j];
 
                 // Janus sign factor (matches GPU kernel and pp_direct_janus convention)
@@ -280,7 +303,7 @@ pub fn pp_direct_forces_janus_ewald(
                     -cross_minus_plus
                 };
 
-                // Real-space sum
+                // Real-space sum (n=0 is closest image post-MIC wrap)
                 for nx in -n_real_max..=n_real_max {
                     for ny in -n_real_max..=n_real_max {
                         for nz in -n_real_max..=n_real_max {
@@ -288,8 +311,8 @@ pub fn pp_direct_forces_janus_ewald(
                             let dy = dy_base + (ny as f64) * box_size;
                             let dz = dz_base + (nz as f64) * box_size;
                             let r2_raw = dx * dx + dy * dy + dz * dz;
-                            let is_direct = nx == 0 && ny == 0 && nz == 0;
-                            let r2 = if is_direct { r2_raw + eps2_i } else { r2_raw };
+                            let is_closest = nx == 0 && ny == 0 && nz == 0;
+                            let r2 = if is_closest { r2_raw + eps2_i } else { r2_raw };
                             if r2 < 1e-30 {
                                 continue;
                             }

@@ -960,3 +960,8 @@ required-features = ["cuda"]
 [[bin]]
 name = "test_growth_factor"
 path = "src/bin/test_growth_factor.rs"
+
+[[bin]]
+name = "test_phase10_gpu"
+path = "src/bin/test_phase10_gpu.rs"
+required-features = ["cuda", "cufft"]

@@ -1864,22 +1864,21 @@ extern "C" __global__ void forces_treepm_short_range(
     const int* __restrict__ right,
     const int* __restrict__ node_types,
     float* __restrict__ acc,
-    int n_all_signed, float theta_soft_packed, float rcut_boxhalf_packed
+    int n_all_signed, float theta_soft_rs_packed, float rcut_boxhalf_packed
 ) {
-    // Unpack theta and softening (same packing as forces_twopass_warpcoherent)
-    int packed_ts = __float_as_int(theta_soft_packed);
-    float theta = (float)((packed_ts >> 16) & 0xFFFF) / 1000.0f;
-    float softening = (float)(packed_ts & 0xFFFF) / 1000.0f;
+    // Phase 10.7 Fix 1: unpack theta_soft_rs_packed (8+8+16 layout)
+    //   upper 16 bits: r_s × 1000  (max 65.535 Mpc)
+    //   bits 15-8:    theta × 100  (max 2.55)
+    //   bits 7-0:     softening × 1000 (max 0.255 Mpc)
+    int packed_tsr = __float_as_int(theta_soft_rs_packed);
+    float r_s = (float)((packed_tsr >> 16) & 0xFFFF) / 1000.0f;
+    float theta = (float)((packed_tsr >> 8) & 0xFF) / 100.0f;
+    float softening = (float)(packed_tsr & 0xFF) / 1000.0f;
 
     // Unpack r_cut and box_half (r_cut in upper 16 bits, box_half in lower 16)
     int packed_rb = __float_as_int(rcut_boxhalf_packed);
     float r_cut = (float)((packed_rb >> 16) & 0xFFFF);
     float box_half = (float)(packed_rb & 0xFFFF);
-
-    // r_s = splitting scale for TreePM = r_cut/3 (standard relation)
-    // F_short = F_total × erfc(r/(2×r_s))
-    // At r = r_cut: erfc(r_cut/(2×r_cut/3)) = erfc(1.5) ≈ 0.034 (smooth cutoff)
-    float r_s = r_cut / 3.0f;
     int n_all = (n_all_signed > 0) ? n_all_signed : -n_all_signed;
     int tree_sign = (n_all_signed > 0) ? 1 : -1;
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2019,7 +2018,7 @@ extern "C" __global__ void forces_treepm_short_range_janus(
     const int* __restrict__ node_types,
     float* __restrict__ acc,
     int n_all_signed,
-    float theta_soft_packed,
+    float theta_soft_rs_packed,
     float rcut_boxhalf_packed,
     float cross_packed  // upper 16 bits: cross_minus_plus×1000, lower 16: cross_plus_minus×1000
 ) {
@@ -2027,15 +2026,19 @@ extern "C" __global__ void forces_treepm_short_range_janus(
     int packed_cross = __float_as_int(cross_packed);
     float cross_minus_plus = (float)((packed_cross >> 16) & 0xFFFF) / 1000.0f;
     float cross_plus_minus = (float)(packed_cross & 0xFFFF) / 1000.0f;
-    int packed_ts = __float_as_int(theta_soft_packed);
-    float theta = (float)((packed_ts >> 16) & 0xFFFF) / 1000.0f;
-    float softening = (float)(packed_ts & 0xFFFF) / 1000.0f;
+
+    // Phase 10.7 Fix 1: unpack theta_soft_rs_packed (8+8+16 layout)
+    //   upper 16 bits: r_s × 1000  (max 65.535 Mpc)
+    //   bits 15-8:    theta × 100  (max 2.55)
+    //   bits 7-0:     softening × 1000 (max 0.255 Mpc)
+    int packed_tsr = __float_as_int(theta_soft_rs_packed);
+    float r_s = (float)((packed_tsr >> 16) & 0xFFFF) / 1000.0f;
+    float theta = (float)((packed_tsr >> 8) & 0xFF) / 100.0f;
+    float softening = (float)(packed_tsr & 0xFF) / 1000.0f;
 
     int packed_rb = __float_as_int(rcut_boxhalf_packed);
     float r_cut = (float)((packed_rb >> 16) & 0xFFFF);
     float box_half = (float)(packed_rb & 0xFFFF);
-
-    float r_s = r_cut / 3.0f;
     int n_all = (n_all_signed > 0) ? n_all_signed : -n_all_signed;
     int tree_sign = (n_all_signed > 0) ? 1 : -1;
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2275,6 +2278,18 @@ fn pack_rcut_boxhalf(r_cut: f64, box_half: f64) -> f32 {
     let rcut_int = (r_cut as u32).min(0xFFFF);
     let boxhalf_int = (box_half as u32).min(0xFFFF);
     let packed = (rcut_int << 16) | boxhalf_int;
+    f32::from_bits(packed)
+}
+
+/// Phase 10.7 Fix 1: pack theta + softening + r_s for TreePM kernels (12-arg cudarc limit)
+/// Layout (32 bits): r_s × 1000 (16) | theta × 100 (8) | softening × 1000 (8)
+/// Limits: r_s ≤ 65.535 Mpc, theta ≤ 2.55, softening ≤ 0.255 Mpc
+#[cfg(feature = "cuda")]
+fn pack_theta_soft_rs(theta: f64, softening: f64, r_s: f64) -> f32 {
+    let r_s_int = ((r_s * 1000.0).round() as u32).min(0xFFFF);
+    let theta_int = ((theta * 100.0).round() as u32).min(0xFF);
+    let soft_int = ((softening * 1000.0).round() as u32).min(0xFF);
+    let packed = (r_s_int << 16) | (theta_int << 8) | soft_int;
     f32::from_bits(packed)
 }
 
@@ -4306,7 +4321,7 @@ impl GpuNBodyTwoPass {
     ///
     /// r_cut: cutoff distance for short-range forces
     /// r_s = r_cut/3 computed inside kernel (standard TreePM relation)
-    pub fn compute_short_range_forces(&mut self, r_cut: f64) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn compute_short_range_forces(&mut self, r_cut: f64, r_s: f64) -> Result<(), Box<dyn std::error::Error>> {
         let box_half = (self.box_size / 2.0) as f32;
         let inv_cell_size = (2097152.0 / self.box_size) as f32;
         let n = self.n_particles;
@@ -4419,14 +4434,12 @@ impl GpuNBodyTwoPass {
             }
             self.device.synchronize()?;
         } else {
-            // TreePM short-range kernel with erfc splitting
+            // TreePM short-range kernel with Springel T(x) splitting
             let forces_treepm_k = self.device.get_func("twopass", "forces_treepm_short_range")
                 .ok_or("forces_treepm_short_range not found")?;
 
-            // Pack theta+softening and r_cut+box_half for 12-param limit
-            let theta_int = ((self.theta * 1000.0) as u32).min(0xFFFF);
-            let soft_int = ((self.softening * 1000.0) as u32).min(0xFFFF);
-            let theta_soft_packed: f32 = f32::from_bits((theta_int << 16) | soft_int);
+            // Phase 10.7 Fix 1: pack theta+softening+r_s using 8+8+16 layout
+            let theta_soft_rs_packed: f32 = pack_theta_soft_rs(self.theta, self.softening, r_s);
             let rcut_boxhalf_packed: f32 = pack_rcut_boxhalf(r_cut, self.box_size / 2.0);
 
             // PASS 1: Positive particles tree
@@ -4450,7 +4463,7 @@ impl GpuNBodyTwoPass {
                     &self.bvh_node_pos, &self.bvh_node_mass,
                     &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                     &mut self.acc,
-                    n as i32, theta_soft_packed, rcut_boxhalf_packed,
+                    n as i32, theta_soft_rs_packed, rcut_boxhalf_packed,
                 ))?;
             }
             self.device.synchronize()?;
@@ -4476,7 +4489,7 @@ impl GpuNBodyTwoPass {
                     &self.bvh_node_pos, &self.bvh_node_mass,
                     &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                     &mut self.acc,
-                    -(n as i32), theta_soft_packed, rcut_boxhalf_packed,
+                    -(n as i32), theta_soft_rs_packed, rcut_boxhalf_packed,
                 ))?;
             }
             self.device.synchronize()?;
@@ -4494,6 +4507,7 @@ impl GpuNBodyTwoPass {
     pub fn compute_short_range_forces_janus(
         &mut self,
         r_cut: f64,
+        r_s: f64,
         cross_minus_plus: f32,
         cross_plus_minus: f32,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4537,9 +4551,8 @@ impl GpuNBodyTwoPass {
         let forces_janus_k = self.device.get_func("twopass", "forces_treepm_short_range_janus")
             .ok_or("forces_treepm_short_range_janus not found")?;
 
-        let theta_int = ((self.theta * 1000.0) as u32).min(0xFFFF);
-        let soft_int = ((self.softening * 1000.0) as u32).min(0xFFFF);
-        let theta_soft_packed: f32 = f32::from_bits((theta_int << 16) | soft_int);
+        // Phase 10.7 Fix 1: pack theta+softening+r_s using 8+8+16 layout
+        let theta_soft_rs_packed: f32 = pack_theta_soft_rs(self.theta, self.softening, r_s);
         let rcut_boxhalf_packed: f32 = pack_rcut_boxhalf(r_cut, self.box_size / 2.0);
 
         // PASS 1: m+ tree, sign_factor uses cross_plus_minus for opposite-sign
@@ -4563,7 +4576,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                 &mut self.acc,
-                n as i32, theta_soft_packed, rcut_boxhalf_packed,
+                n as i32, theta_soft_rs_packed, rcut_boxhalf_packed,
                 cross_packed,
             ))?;
         }
@@ -4590,7 +4603,7 @@ impl GpuNBodyTwoPass {
                 &self.bvh_node_pos, &self.bvh_node_mass,
                 &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
                 &mut self.acc,
-                -(n as i32), theta_soft_packed, rcut_boxhalf_packed,
+                -(n as i32), theta_soft_rs_packed, rcut_boxhalf_packed,
                 cross_packed,
             ))?;
         }
@@ -4905,6 +4918,7 @@ impl GpuNBodyTwoPass {
     pub fn compute_tree_only_janus(
         &mut self,
         r_cut: f64,
+        r_s: f64,
         phi: f64,
         c_ratio_sq: f64,
         repulsion_scale: f64,
@@ -4912,7 +4926,7 @@ impl GpuNBodyTwoPass {
         let cross_minus_plus = (c_ratio_sq * (1.0 / phi) * repulsion_scale) as f32;
         let cross_plus_minus = (phi * repulsion_scale) as f32;
         // compute_short_range_forces_janus already resets acc and applies tree
-        self.compute_short_range_forces_janus(r_cut, cross_minus_plus, cross_plus_minus)
+        self.compute_short_range_forces_janus(r_cut, r_s, cross_minus_plus, cross_plus_minus)
     }
 
     pub fn get_acc_mut(&mut self) -> &mut CudaSlice<f32> {
@@ -5015,9 +5029,9 @@ impl GpuNBodyTwoPass {
 
         let pm_ms = t_pm.elapsed().as_millis();
 
-        // ===== GPU BH SHORT-RANGE with erfc splitting =====
+        // ===== GPU BH SHORT-RANGE with Springel T(x) splitting =====
         let t_bh = Instant::now();
-        self.compute_short_range_forces(r_cut)?;
+        self.compute_short_range_forces(r_cut, r_s)?;
         let bh_ms = t_bh.elapsed().as_millis();
 
         // ===== ADD PM FORCES TO ACC =====
@@ -5191,9 +5205,9 @@ impl GpuNBodyTwoPass {
         self.device.synchronize()?;
         let pm_ms = t_pm.elapsed().as_millis();
 
-        // ===== GPU BH SHORT-RANGE with erfc splitting =====
+        // ===== GPU BH SHORT-RANGE with Springel T(x) splitting =====
         let t_bh = Instant::now();
-        self.compute_short_range_forces(r_cut)?;
+        self.compute_short_range_forces(r_cut, r_s)?;
         let bh_ms = t_bh.elapsed().as_millis();
 
         // Add PM long-range forces (r > r_cut)
@@ -5379,7 +5393,7 @@ impl GpuNBodyTwoPass {
         // (cross_minus_plus, cross_plus_minus) for opposite-sign pairs, while
         // keeping sign_factor = +1 for same-sign self-attraction.
         let t_bh = Instant::now();
-        self.compute_short_range_forces_janus(r_cut, cross_minus_plus, cross_plus_minus)?;
+        self.compute_short_range_forces_janus(r_cut, r_s, cross_minus_plus, cross_plus_minus)?;
         let bh_ms = t_bh.elapsed().as_millis();
 
         // Add PM forces
@@ -5798,9 +5812,9 @@ impl GpuNBodyTwoPass {
         self.device.synchronize()?;
         let pm_ms = t_pm.elapsed().as_millis();
 
-        // ===== GPU BH SHORT-RANGE with erfc splitting =====
+        // ===== GPU BH SHORT-RANGE with Springel T(x) splitting =====
         let t_bh = Instant::now();
-        self.compute_short_range_forces(r_cut)?;
+        self.compute_short_range_forces(r_cut, r_s)?;
         let bh_ms = t_bh.elapsed().as_millis();
 
         // Add PM long-range forces

@@ -107,7 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sim.set_mass_factor(1.0);
         sim.set_softening(softening);
         sim.set_theta(theta);
-        sim.compute_tree_only_janus(r_cut, phi, c_ratio_sq, repulsion_scale)?;
+        sim.compute_tree_only_janus(r_cut, r_s, phi, c_ratio_sq, repulsion_scale)?;
         let acc_tree = sim.get_acc()?;
         let f_tree_x = acc_tree[0];
 

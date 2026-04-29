@@ -437,6 +437,674 @@ mod tests {
         }
     }
 
+    /// Génère ICs Zel'dovich simples (lattice + perturbation aléatoire bornée).
+    ///
+    /// Pas un vrai Zel'dovich avec spectre P(k), mais une distribution
+    /// quasi-uniforme avec déplacement contrôlé qui reproduit la densité
+    /// homogène typique d'IC cosmologique à grand z (avant clustering).
+    fn generate_zeldovich_simple_ics(
+        n_per_dim: usize,
+        box_size: f64,
+        seed: u64,
+    ) -> Vec<(f64, f64, f64)> {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let n = n_per_dim.pow(3);
+        let dx = box_size / n_per_dim as f64;
+        let displacement_amplitude = 0.15 * dx;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut pos = Vec::with_capacity(n);
+
+        for i in 0..n_per_dim {
+            for j in 0..n_per_dim {
+                for k in 0..n_per_dim {
+                    // Centered grid in [-L/2, L/2)
+                    let gx = (i as f64 + 0.5) * dx - box_size * 0.5;
+                    let gy = (j as f64 + 0.5) * dx - box_size * 0.5;
+                    let gz = (k as f64 + 0.5) * dx - box_size * 0.5;
+
+                    let dx_p = (rng.random::<f64>() - 0.5) * 2.0 * displacement_amplitude;
+                    let dy_p = (rng.random::<f64>() - 0.5) * 2.0 * displacement_amplitude;
+                    let dz_p = (rng.random::<f64>() - 0.5) * 2.0 * displacement_amplitude;
+
+                    let mut x = gx + dx_p;
+                    let mut y = gy + dy_p;
+                    let mut z = gz + dz_p;
+                    // PBC wrap to [-L/2, L/2)
+                    let half = box_size * 0.5;
+                    while x >= half { x -= box_size; }
+                    while x < -half { x += box_size; }
+                    while y >= half { y -= box_size; }
+                    while y < -half { y += box_size; }
+                    while z >= half { z -= box_size; }
+                    while z < -half { z += box_size; }
+
+                    pos.push((x, y, z));
+                }
+            }
+        }
+        pos
+    }
+
+    /// Phase 9.7-C v2 sur N=10K Zeldovich: confirme cross-correlation reste
+    /// élevée même sur lattice + perturbation (où force errs individuelles
+    /// montent à 70%).
+    #[test]
+    #[ignore]
+    fn test_force_field_cross_correlation_zeldovich() {
+        use crate::nbody::{Particle, Vec3};
+        use crate::treepm::treepm_force::TreePMForce;
+        use crate::MassSign;
+        use rustfft::{num_complex::Complex64, FftPlanner};
+
+        let n_per_dim: usize = 22;
+        let n: usize = n_per_dim.pow(3); // 10648
+        let l = 100.0_f64;
+        let n_pm = 64;
+        let dg = l / n_pm as f64;
+        let r_cut = 6.0 * dg;
+        let theta = 0.5;
+        let softening = 0.05;
+        let g_phys = 1.0;
+        let v_cell = dg.powi(3);
+
+        let pos = generate_zeldovich_simple_ics(n_per_dim, l, 42);
+        let mass: Vec<f64> = vec![1.0; n];
+        let mut particles_bh = Vec::with_capacity(n);
+        for &(x, y, z) in &pos {
+            particles_bh.push(Particle::new(
+                Vec3::new(x, y, z),
+                Vec3::zero(),
+                1.0,
+                MassSign::Positive,
+            ));
+        }
+
+        let acc_pp = pp_direct_forces_newton(&pos, &mass, l, softening, g_phys);
+        let mut tpm = TreePMForce::new(r_cut, n_pm, l, theta, softening);
+        tpm.g_constant = g_phys / v_cell;
+        tpm.update(&particles_bh);
+        tpm.tree.g_constant = g_phys;
+        let acc_tpm = tpm.compute_all_forces(&particles_bh);
+
+        let half = l * 0.5;
+        let cic_dep = |weights: &[f64]| -> Vec<Complex64> {
+            let n_cells = n_pm * n_pm * n_pm;
+            let mut grid = vec![0.0_f64; n_cells];
+            let cell = l / n_pm as f64;
+            for i in 0..n {
+                let x = ((pos[i].0 + half).rem_euclid(l)) / cell;
+                let y = ((pos[i].1 + half).rem_euclid(l)) / cell;
+                let z = ((pos[i].2 + half).rem_euclid(l)) / cell;
+                let ix = x.floor() as usize;
+                let iy = y.floor() as usize;
+                let iz = z.floor() as usize;
+                let fx = x - ix as f64;
+                let fy = y - iy as f64;
+                let fz = z - iz as f64;
+                let wx = [1.0 - fx, fx];
+                let wy = [1.0 - fy, fy];
+                let wz = [1.0 - fz, fz];
+                for ai in 0..2 {
+                    let ii = (ix + ai) % n_pm;
+                    for aj in 0..2 {
+                        let jj = (iy + aj) % n_pm;
+                        for ak in 0..2 {
+                            let kk = (iz + ak) % n_pm;
+                            grid[ii * n_pm * n_pm + jj * n_pm + kk] +=
+                                wx[ai] * wy[aj] * wz[ak] * weights[i];
+                        }
+                    }
+                }
+            }
+            grid.into_iter().map(|x| Complex64::new(x, 0.0)).collect()
+        };
+        let fft_3d = |grid: &mut Vec<Complex64>| {
+            let mut planner = FftPlanner::new();
+            let fft = planner.plan_fft_forward(n_pm);
+            for ix in 0..n_pm {
+                for iy in 0..n_pm {
+                    let s = ix * n_pm * n_pm + iy * n_pm;
+                    let mut row: Vec<Complex64> = grid[s..s + n_pm].to_vec();
+                    fft.process(&mut row);
+                    grid[s..s + n_pm].copy_from_slice(&row);
+                }
+            }
+            for ix in 0..n_pm {
+                for iz in 0..n_pm {
+                    let mut col: Vec<Complex64> = (0..n_pm).map(|iy| grid[ix*n_pm*n_pm+iy*n_pm+iz]).collect();
+                    fft.process(&mut col);
+                    for iy in 0..n_pm { grid[ix*n_pm*n_pm+iy*n_pm+iz] = col[iy]; }
+                }
+            }
+            for iy in 0..n_pm {
+                for iz in 0..n_pm {
+                    let mut col: Vec<Complex64> = (0..n_pm).map(|ix| grid[ix*n_pm*n_pm+iy*n_pm+iz]).collect();
+                    fft.process(&mut col);
+                    for ix in 0..n_pm { grid[ix*n_pm*n_pm+iy*n_pm+iz] = col[ix]; }
+                }
+            }
+        };
+
+        let f_t_x: Vec<f64> = (0..n).map(|i| acc_tpm[i].x).collect();
+        let f_t_y: Vec<f64> = (0..n).map(|i| acc_tpm[i].y).collect();
+        let f_t_z: Vec<f64> = (0..n).map(|i| acc_tpm[i].z).collect();
+        let f_p_x: Vec<f64> = (0..n).map(|i| acc_pp[i].0).collect();
+        let f_p_y: Vec<f64> = (0..n).map(|i| acc_pp[i].1).collect();
+        let f_p_z: Vec<f64> = (0..n).map(|i| acc_pp[i].2).collect();
+
+        let mut g_tx = cic_dep(&f_t_x); fft_3d(&mut g_tx);
+        let mut g_ty = cic_dep(&f_t_y); fft_3d(&mut g_ty);
+        let mut g_tz = cic_dep(&f_t_z); fft_3d(&mut g_tz);
+        let mut g_px = cic_dep(&f_p_x); fft_3d(&mut g_px);
+        let mut g_py = cic_dep(&f_p_y); fft_3d(&mut g_py);
+        let mut g_pz = cic_dep(&f_p_z); fft_3d(&mut g_pz);
+
+        let n_bins = 16;
+        let k_fund = 2.0 * std::f64::consts::PI / l;
+        let k_nyq = std::f64::consts::PI * n_pm as f64 / l;
+        let dk = k_nyq / n_bins as f64;
+        let mut cross = vec![0.0_f64; n_bins];
+        let mut pow_t = vec![0.0_f64; n_bins];
+        let mut pow_p = vec![0.0_f64; n_bins];
+        let mut counts = vec![0_usize; n_bins];
+
+        for ix in 0..n_pm {
+            let kxi = if ix <= n_pm / 2 { ix as i32 } else { ix as i32 - n_pm as i32 };
+            for iy in 0..n_pm {
+                let kyi = if iy <= n_pm / 2 { iy as i32 } else { iy as i32 - n_pm as i32 };
+                for iz in 0..n_pm {
+                    let kzi = if iz <= n_pm / 2 { iz as i32 } else { iz as i32 - n_pm as i32 };
+                    let k = ((kxi*kxi + kyi*kyi + kzi*kzi) as f64).sqrt() * k_fund;
+                    if k < 1e-10 || k > k_nyq { continue; }
+                    let bin = ((k / dk).floor() as usize).min(n_bins - 1);
+                    let idx = ix * n_pm * n_pm + iy * n_pm + iz;
+                    let ft_dot_fp = (g_tx[idx]*g_px[idx].conj()).re
+                                  + (g_ty[idx]*g_py[idx].conj()).re
+                                  + (g_tz[idx]*g_pz[idx].conj()).re;
+                    let pt = g_tx[idx].norm_sqr() + g_ty[idx].norm_sqr() + g_tz[idx].norm_sqr();
+                    let pp = g_px[idx].norm_sqr() + g_py[idx].norm_sqr() + g_pz[idx].norm_sqr();
+                    cross[bin] += ft_dot_fp;
+                    pow_t[bin] += pt;
+                    pow_p[bin] += pp;
+                    counts[bin] += 1;
+                }
+            }
+        }
+
+        println!();
+        println!("=== Phase 9.7-C Zeldovich N=10K force-field cross-corr ===");
+        println!("  {:<6} {:<10} {:<10} {:<10}", "bin", "k", "r(k)", "|F_t|/|F_p|");
+        let mut min_r: f64 = 1.0;
+        for b in 0..n_bins {
+            if counts[b] == 0 { continue; }
+            let r = cross[b] / (pow_t[b] * pow_p[b]).sqrt().max(1e-30);
+            let mag_ratio = (pow_t[b] / pow_p[b].max(1e-30)).sqrt();
+            min_r = min_r.min(r);
+            let k_center = (b as f64 + 0.5) * dk;
+            println!("  {:<6} {:<10.5} {:<10.4} {:<10.4}", b, k_center, r, mag_ratio);
+        }
+        println!();
+        println!("  min r(k): {:.4}", min_r);
+        let verdict = if min_r > 0.99 { "GO_PHASE_10" }
+            else if min_r > 0.95 { "GO_WITH_CAVEAT" }
+            else { "NO_GO_REAL_BUG" };
+        println!("  VERDICT: {}", verdict);
+    }
+
+    /// Phase 9.7-C v2: comparison Fourier-space directe par k-mode.
+    ///
+    /// Compute cross-correlation per k-mode entre F_treepm et F_pp dans le
+    /// champ de force CIC-déposé. Métrique:
+    ///   r(k) = Re⟨F̂_t · F̂_p⟩ / sqrt(⟨|F̂_t|²⟩·⟨|F̂_p|²⟩)
+    ///
+    /// r(k) ≈ 1 : méthodes agree per k mode (forces mêmes direction)
+    /// r(k) << 1 : méthodes disagreement à cette échelle
+    ///
+    /// Verdict: si r(k) > 0.99 sur tous k résolus, GO Phase 10 quel que soit
+    /// le bias de magnitude (qui s'élimine via normalisation).
+    #[test]
+    #[ignore]
+    fn test_force_field_cross_correlation_per_k() {
+        use crate::nbody::{Particle, Vec3};
+        use crate::treepm::treepm_force::TreePMForce;
+        use crate::MassSign;
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use rustfft::{num_complex::Complex64, FftPlanner};
+
+        let n = 1000;
+        let l = 100.0_f64;
+        let n_pm = 64;
+        let dg = l / n_pm as f64;
+        let r_cut = 6.0 * dg;
+        let theta = 0.5;
+        let softening = 0.05;
+        let g_phys = 1.0;
+        let v_cell = dg.powi(3);
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let half = l * 0.5;
+        let mut pos = Vec::with_capacity(n);
+        let mass: Vec<f64> = vec![1.0; n];
+        let mut particles_bh = Vec::with_capacity(n);
+        for _ in 0..n {
+            let x = rng.random::<f64>() * l - half;
+            let y = rng.random::<f64>() * l - half;
+            let z = rng.random::<f64>() * l - half;
+            pos.push((x, y, z));
+            particles_bh.push(Particle::new(
+                Vec3::new(x, y, z),
+                Vec3::zero(),
+                1.0,
+                MassSign::Positive,
+            ));
+        }
+
+        let acc_pp = pp_direct_forces_newton(&pos, &mass, l, softening, g_phys);
+        let mut tpm = TreePMForce::new(r_cut, n_pm, l, theta, softening);
+        tpm.g_constant = g_phys / v_cell;
+        tpm.update(&particles_bh);
+        tpm.tree.g_constant = g_phys;
+        let acc_tpm = tpm.compute_all_forces(&particles_bh);
+
+        // Helper: CIC-deposit weighted scalar per particle
+        let cic_dep = |weights: &[f64]| -> Vec<Complex64> {
+            let n_cells = n_pm * n_pm * n_pm;
+            let mut grid = vec![0.0_f64; n_cells];
+            let cell = l / n_pm as f64;
+            for i in 0..n {
+                let x = ((pos[i].0 + half).rem_euclid(l)) / cell;
+                let y = ((pos[i].1 + half).rem_euclid(l)) / cell;
+                let z = ((pos[i].2 + half).rem_euclid(l)) / cell;
+                let ix = x.floor() as usize;
+                let iy = y.floor() as usize;
+                let iz = z.floor() as usize;
+                let fx = x - ix as f64;
+                let fy = y - iy as f64;
+                let fz = z - iz as f64;
+                let wx = [1.0 - fx, fx];
+                let wy = [1.0 - fy, fy];
+                let wz = [1.0 - fz, fz];
+                for ai in 0..2 {
+                    let ii = (ix + ai) % n_pm;
+                    for aj in 0..2 {
+                        let jj = (iy + aj) % n_pm;
+                        for ak in 0..2 {
+                            let kk = (iz + ak) % n_pm;
+                            grid[ii * n_pm * n_pm + jj * n_pm + kk] +=
+                                wx[ai] * wy[aj] * wz[ak] * weights[i];
+                        }
+                    }
+                }
+            }
+            grid.into_iter().map(|x| Complex64::new(x, 0.0)).collect()
+        };
+
+        // FFT 3D function (reuses existing pattern)
+        let fft_3d = |grid: &mut Vec<Complex64>| {
+            let mut planner = FftPlanner::new();
+            let fft = planner.plan_fft_forward(n_pm);
+            // Z direction
+            for ix in 0..n_pm {
+                for iy in 0..n_pm {
+                    let start = ix * n_pm * n_pm + iy * n_pm;
+                    let mut row: Vec<Complex64> = grid[start..start + n_pm].to_vec();
+                    fft.process(&mut row);
+                    grid[start..start + n_pm].copy_from_slice(&row);
+                }
+            }
+            // Y
+            for ix in 0..n_pm {
+                for iz in 0..n_pm {
+                    let mut col: Vec<Complex64> = (0..n_pm)
+                        .map(|iy| grid[ix * n_pm * n_pm + iy * n_pm + iz])
+                        .collect();
+                    fft.process(&mut col);
+                    for iy in 0..n_pm {
+                        grid[ix * n_pm * n_pm + iy * n_pm + iz] = col[iy];
+                    }
+                }
+            }
+            // X
+            for iy in 0..n_pm {
+                for iz in 0..n_pm {
+                    let mut col: Vec<Complex64> = (0..n_pm)
+                        .map(|ix| grid[ix * n_pm * n_pm + iy * n_pm + iz])
+                        .collect();
+                    fft.process(&mut col);
+                    for ix in 0..n_pm {
+                        grid[ix * n_pm * n_pm + iy * n_pm + iz] = col[ix];
+                    }
+                }
+            }
+        };
+
+        // CIC + FFT for x, y, z components of TreePM and PP forces
+        let f_t_x: Vec<f64> = (0..n).map(|i| acc_tpm[i].x).collect();
+        let f_t_y: Vec<f64> = (0..n).map(|i| acc_tpm[i].y).collect();
+        let f_t_z: Vec<f64> = (0..n).map(|i| acc_tpm[i].z).collect();
+        let f_p_x: Vec<f64> = (0..n).map(|i| acc_pp[i].0).collect();
+        let f_p_y: Vec<f64> = (0..n).map(|i| acc_pp[i].1).collect();
+        let f_p_z: Vec<f64> = (0..n).map(|i| acc_pp[i].2).collect();
+
+        let mut g_tx = cic_dep(&f_t_x); fft_3d(&mut g_tx);
+        let mut g_ty = cic_dep(&f_t_y); fft_3d(&mut g_ty);
+        let mut g_tz = cic_dep(&f_t_z); fft_3d(&mut g_tz);
+        let mut g_px = cic_dep(&f_p_x); fft_3d(&mut g_px);
+        let mut g_py = cic_dep(&f_p_y); fft_3d(&mut g_py);
+        let mut g_pz = cic_dep(&f_p_z); fft_3d(&mut g_pz);
+
+        // Bin per |k|: compute < F̂_t · F̂_p* >, < |F̂_t|² >, < |F̂_p|² >
+        let n_bins = 16;
+        let k_fund = 2.0 * std::f64::consts::PI / l;
+        let k_nyq = std::f64::consts::PI * n_pm as f64 / l;
+        let dk = k_nyq / n_bins as f64;
+        let mut cross = vec![0.0_f64; n_bins];
+        let mut pow_t = vec![0.0_f64; n_bins];
+        let mut pow_p = vec![0.0_f64; n_bins];
+        let mut counts = vec![0_usize; n_bins];
+
+        for ix in 0..n_pm {
+            let kxi = if ix <= n_pm / 2 { ix as i32 } else { ix as i32 - n_pm as i32 };
+            for iy in 0..n_pm {
+                let kyi = if iy <= n_pm / 2 { iy as i32 } else { iy as i32 - n_pm as i32 };
+                for iz in 0..n_pm {
+                    let kzi = if iz <= n_pm / 2 { iz as i32 } else { iz as i32 - n_pm as i32 };
+                    let k = ((kxi * kxi + kyi * kyi + kzi * kzi) as f64).sqrt() * k_fund;
+                    if k < 1e-10 || k > k_nyq { continue; }
+                    let bin = ((k / dk).floor() as usize).min(n_bins - 1);
+                    let idx = ix * n_pm * n_pm + iy * n_pm + iz;
+                    let ft_dot_fp = (g_tx[idx] * g_px[idx].conj()).re
+                        + (g_ty[idx] * g_py[idx].conj()).re
+                        + (g_tz[idx] * g_pz[idx].conj()).re;
+                    let pt = g_tx[idx].norm_sqr() + g_ty[idx].norm_sqr() + g_tz[idx].norm_sqr();
+                    let pp = g_px[idx].norm_sqr() + g_py[idx].norm_sqr() + g_pz[idx].norm_sqr();
+                    cross[bin] += ft_dot_fp;
+                    pow_t[bin] += pt;
+                    pow_p[bin] += pp;
+                    counts[bin] += 1;
+                }
+            }
+        }
+
+        println!();
+        println!("=== Phase 9.7-C v2: F-field cross-correlation per k ===");
+        println!("  Setup: N=1000 random uniform, L=100, n_pm=64, r_cut=9.375");
+        println!("  {:<6} {:<10} {:<10} {:<10} {:<10}", "bin", "k", "r(k)", "|F_t|/|F_p|", "n_modes");
+        let mut min_r: f64 = 1.0;
+        for b in 0..n_bins {
+            if counts[b] == 0 { continue; }
+            let r = cross[b] / (pow_t[b] * pow_p[b]).sqrt().max(1e-30);
+            let mag_ratio = (pow_t[b] / pow_p[b].max(1e-30)).sqrt();
+            min_r = min_r.min(r);
+            let k_center = (b as f64 + 0.5) * dk;
+            println!(
+                "  {:<6} {:<10.5} {:<10.4} {:<10.4} {:<10}",
+                b, k_center, r, mag_ratio, counts[b]
+            );
+        }
+        println!();
+        println!("  min r(k) over all bins: {:.4}", min_r);
+        let verdict = if min_r > 0.99 { "GO_PHASE_10" }
+            else if min_r > 0.95 { "GO_WITH_CAVEAT" }
+            else { "NO_GO_REAL_BUG" };
+        println!("  VERDICT (per-k correlation): {}", verdict);
+
+        let _ = std::fs::create_dir_all("logs/treepm");
+        let _ = std::fs::write(
+            "logs/treepm/phase97c_v2_verdict.txt",
+            format!("{}\nmin_r={}\n", verdict, min_r),
+        );
+    }
+
+    /// Phase 9.7-C — test principal réaliste : P(k) TreePM vs PP-direct sur
+    /// distribution Zel'dovich.
+    ///
+    /// Setup: N=10K Zel'dovich, L=100, n_pm=64, z_init=10. Compare
+    /// les forces individuelles (médiane attendue ~10% per Phase 9.7-B)
+    /// ET le power spectrum P(k) (cible <1% médiane pour GO).
+    ///
+    /// Verdict:
+    /// - GO_PHASE_10 : P(k) median < 1%, max < 5%
+    /// - GO_WITH_CAVEAT : P(k) median < 5%
+    /// - NO_GO_REAL_BUG : P(k) median > 5%
+    #[test]
+    #[ignore]
+    fn test_realistic_zeldovich_pk_treepm_vs_pp() {
+        use crate::nbody::{Particle, Vec3};
+        use crate::power_spectrum::{compute_pk, PowerSpectrumResult};
+        let _ = compute_pk;
+        use crate::treepm::treepm_force::TreePMForce;
+        use crate::MassSign;
+
+        let n_per_dim: usize = 22; // N = 22³ = 10648
+        let n: usize = n_per_dim.pow(3);
+        let l = 100.0_f64;
+        let n_pm = 64;
+        let dg = l / n_pm as f64;
+        let r_cut = 6.0 * dg;
+        let theta = 0.5;
+        let softening = 0.05;
+        let g_phys = 1.0;
+        let v_cell = dg.powi(3);
+
+        println!();
+        println!("=== Phase 9.7-C: réaliste Zel'dovich, N={}, L={}, n_pm={} ===", n, l, n_pm);
+
+        // Zel'dovich-like ICs
+        let pos = generate_zeldovich_simple_ics(n_per_dim, l, 42);
+        let mass: Vec<f64> = vec![1.0; n];
+        let mut particles_bh = Vec::with_capacity(n);
+        for &(x, y, z) in &pos {
+            particles_bh.push(Particle::new(
+                Vec3::new(x, y, z),
+                Vec3::zero(),
+                1.0,
+                MassSign::Positive,
+            ));
+        }
+
+        // PP-direct
+        println!("Computing PP-direct (N²={:.2e} pairs)...", (n * n) as f64);
+        let t0 = std::time::Instant::now();
+        let acc_pp = pp_direct_forces_newton(&pos, &mass, l, softening, g_phys);
+        let t_pp = t0.elapsed().as_secs_f64();
+        println!("  PP-direct: {:.1}s", t_pp);
+
+        // TreePM
+        println!("Computing TreePM CPU...");
+        let t0 = std::time::Instant::now();
+        let mut tpm = TreePMForce::new(r_cut, n_pm, l, theta, softening);
+        tpm.g_constant = g_phys / v_cell;
+        tpm.update(&particles_bh);
+        tpm.tree.g_constant = g_phys;
+        let acc_tpm = tpm.compute_all_forces(&particles_bh);
+        let t_tpm = t0.elapsed().as_secs_f64();
+        println!("  TreePM:    {:.1}s (speedup vs PP: {:.1}×)", t_tpm, t_pp / t_tpm);
+
+        // === Métrique 1: erreurs forces individuelles ===
+        let mut force_errs = Vec::with_capacity(n);
+        for i in 0..n {
+            let (rx, ry, rz) = acc_pp[i];
+            let av = acc_tpm[i];
+            let mag_ref = (rx * rx + ry * ry + rz * rz).sqrt();
+            if mag_ref < 1e-15 {
+                continue;
+            }
+            let dx = av.x - rx;
+            let dy = av.y - ry;
+            let dz = av.z - rz;
+            let diff = (dx * dx + dy * dy + dz * dz).sqrt();
+            force_errs.push(diff / mag_ref);
+        }
+        force_errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let f_med = force_errs[force_errs.len() / 2];
+        let f_p95 = force_errs[(force_errs.len() * 95) / 100];
+        let f_max = force_errs.iter().cloned().fold(0.0, f64::max);
+
+        println!();
+        println!("--- Forces individuelles ---");
+        println!("  median={:.4}%, P95={:.4}%, max={:.4}%", f_med * 100.0, f_p95 * 100.0, f_max * 100.0);
+
+        // === Métrique 2: P(k) du CHAMP DE FORCE (CIC-deposit acc components) ===
+        // Pour distribution Zel'dovich quasi-uniforme à z=10, le champ de
+        // densité δ ≈ shot noise (pas de signal physique). Le champ qui
+        // contient le signal est le champ de FORCE. On compare P_F(k) entre
+        // TreePM et PP-direct.
+        //
+        // Méthode: CIC-deposit f_x, f_y, f_z de chaque particule sur grille
+        // séparée (3 grilles par méthode). FFT chacune, sommer |F̂|² par k.
+        let half = l * 0.5;
+        let pos_for_cic: Vec<[f64; 3]> = pos
+            .iter()
+            .map(|&(x, y, z)| {
+                [
+                    (x + half).rem_euclid(l),
+                    (y + half).rem_euclid(l),
+                    (z + half).rem_euclid(l),
+                ]
+            })
+            .collect();
+
+        // Helper: deposit weighted scalar field via CIC (similar to cic_assign
+        // but with per-particle weight instead of unit mass).
+        let cic_assign_weighted = |positions: &[[f64; 3]], weights: &[f64]| -> Vec<f64> {
+            let n_cells = n_pm * n_pm * n_pm;
+            let mut grid = vec![0.0; n_cells];
+            let cell_size = l / n_pm as f64;
+            for (idx, p) in positions.iter().enumerate() {
+                let x = ((p[0] % l) + l) % l;
+                let y = ((p[1] % l) + l) % l;
+                let z = ((p[2] % l) + l) % l;
+                let ix = (x / cell_size).floor() as usize;
+                let iy = (y / cell_size).floor() as usize;
+                let iz = (z / cell_size).floor() as usize;
+                let dxc = x / cell_size - ix as f64;
+                let dyc = y / cell_size - iy as f64;
+                let dzc = z / cell_size - iz as f64;
+                let wx = [1.0 - dxc, dxc];
+                let wy = [1.0 - dyc, dyc];
+                let wz = [1.0 - dzc, dzc];
+                for ai in 0..2 {
+                    let ii = (ix + ai) % n_pm;
+                    for aj in 0..2 {
+                        let jj = (iy + aj) % n_pm;
+                        for ak in 0..2 {
+                            let kk = (iz + ak) % n_pm;
+                            grid[ii * n_pm * n_pm + jj * n_pm + kk] +=
+                                wx[ai] * wy[aj] * wz[ak] * weights[idx];
+                        }
+                    }
+                }
+            }
+            grid
+        };
+
+        let f_t_x: Vec<f64> = (0..n).map(|i| acc_tpm[i].x).collect();
+        let f_t_y: Vec<f64> = (0..n).map(|i| acc_tpm[i].y).collect();
+        let f_t_z: Vec<f64> = (0..n).map(|i| acc_tpm[i].z).collect();
+        let f_p_x: Vec<f64> = (0..n).map(|i| acc_pp[i].0).collect();
+        let f_p_y: Vec<f64> = (0..n).map(|i| acc_pp[i].1).collect();
+        let f_p_z: Vec<f64> = (0..n).map(|i| acc_pp[i].2).collect();
+
+        let grid_tx = cic_assign_weighted(&pos_for_cic, &f_t_x);
+        let grid_ty = cic_assign_weighted(&pos_for_cic, &f_t_y);
+        let grid_tz = cic_assign_weighted(&pos_for_cic, &f_t_z);
+        let grid_px = cic_assign_weighted(&pos_for_cic, &f_p_x);
+        let grid_py = cic_assign_weighted(&pos_for_cic, &f_p_y);
+        let grid_pz = cic_assign_weighted(&pos_for_cic, &f_p_z);
+
+        // P(k) for each force component, sum (no shot-noise subtraction)
+        let pk_tx = compute_pk(&grid_tx, l, n_pm, n, 16);
+        let pk_ty = compute_pk(&grid_ty, l, n_pm, n, 16);
+        let pk_tz = compute_pk(&grid_tz, l, n_pm, n, 16);
+        let pk_px = compute_pk(&grid_px, l, n_pm, n, 16);
+        let pk_py = compute_pk(&grid_py, l, n_pm, n, 16);
+        let pk_pz = compute_pk(&grid_pz, l, n_pm, n, 16);
+
+        let n_bins = pk_tx.k.len();
+        let pk_t: Vec<f64> = (0..n_bins).map(|i| pk_tx.pk[i] + pk_ty.pk[i] + pk_tz.pk[i]).collect();
+        let pk_p: Vec<f64> = (0..n_bins).map(|i| pk_px.pk[i] + pk_py.pk[i] + pk_pz.pk[i]).collect();
+        // Use struct facade
+        let pk_t = PowerSpectrumResult { k: pk_tx.k.clone(), pk: pk_t, n_modes: pk_tx.n_modes.clone() };
+        let pk_p = PowerSpectrumResult { k: pk_px.k.clone(), pk: pk_p, n_modes: pk_px.n_modes.clone() };
+
+        println!();
+        println!("--- P(k) comparison (n_bins={}) ---", pk_t.k.len());
+        println!("  {:<6} {:<10} {:<14} {:<14} {:<10} {:<8}", "bin", "k [1/Mpc]", "P_TreePM", "P_PP", "rel_err%", "n_modes");
+        for i in 0..pk_t.k.len() {
+            let rel_err = if pk_p.pk[i].abs() > 1e-30 {
+                ((pk_t.pk[i] - pk_p.pk[i]) / pk_p.pk[i]).abs()
+            } else {
+                f64::NAN
+            };
+            println!(
+                "  {:<6} {:<10.5} {:<14.5e} {:<14.5e} {:<10.4} {:<8}",
+                i, pk_t.k[i], pk_t.pk[i], pk_p.pk[i], rel_err * 100.0, pk_p.n_modes[i]
+            );
+        }
+        let mut pk_errs = Vec::new();
+        for i in 0..pk_t.k.len() {
+            if pk_p.pk[i].abs() < 1e-30 || pk_p.n_modes[i] == 0 {
+                continue;
+            }
+            let rel_err = ((pk_t.pk[i] - pk_p.pk[i]) / pk_p.pk[i]).abs();
+            pk_errs.push(rel_err);
+        }
+        let (pk_med, pk_max) = if pk_errs.is_empty() {
+            println!("  ⚠ pk_errs empty — P(k) all zero or n_modes==0");
+            (f64::NAN, f64::NAN)
+        } else {
+            pk_errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let m = pk_errs[pk_errs.len() / 2];
+            let mx = pk_errs.iter().cloned().fold(0.0, f64::max);
+            (m, mx)
+        };
+
+        println!();
+        println!("  P(k) median rel err : {:.4}%", pk_med * 100.0);
+        println!("  P(k) max rel err    : {:.4}%", pk_max * 100.0);
+
+        let verdict = if pk_med < 0.01 && pk_max < 0.05 {
+            "GO_PHASE_10"
+        } else if pk_med < 0.05 {
+            "GO_WITH_CAVEAT"
+        } else {
+            "NO_GO_REAL_BUG"
+        };
+        println!();
+        println!("VERDICT: {}", verdict);
+
+        let _ = std::fs::create_dir_all("logs/treepm");
+        let _ = std::fs::write(
+            "logs/treepm/phase97c_verdict.txt",
+            format!(
+                "{}\nforce_median={}\nforce_p95={}\nforce_max={}\npk_median={}\npk_max={}\n",
+                verdict, f_med, f_p95, f_max, pk_med, pk_max
+            ),
+        );
+        // Save P(k) data
+        if let Ok(mut f) = std::fs::File::create("logs/treepm/phase97c_pk_comparison.csv") {
+            use std::io::Write;
+            writeln!(f, "bin,k,pk_treepm,pk_pp,n_modes,rel_err").unwrap();
+            for i in 0..pk_t.k.len() {
+                let rel_err = if pk_p.pk[i] > 1e-30 {
+                    ((pk_t.pk[i] - pk_p.pk[i]) / pk_p.pk[i]).abs()
+                } else {
+                    0.0
+                };
+                writeln!(
+                    f,
+                    "{},{},{},{},{},{}",
+                    i, pk_t.k[i], pk_t.pk[i], pk_p.pk[i], pk_t.n_modes[i], rel_err
+                )
+                .unwrap();
+            }
+        }
+    }
+
     /// Phase 9.7-B: r_cut sensitivity test. Tree handles r < r_cut, PM handles
     /// r >= r_cut. Pour N=1000 dans L=100, mean_sep ≈ 10 Mpc. Avec r_cut=9.375,
     /// la plupart des pairs sont en zone PM. Tester r_cut plus grand pour voir

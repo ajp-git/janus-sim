@@ -437,6 +437,87 @@ mod tests {
         }
     }
 
+    /// Diagnostic 4d: PM convergence in N_pm.
+    /// Si l'erreur DÉCROÎT vers 0 avec N_pm croissant : précision PM intrinsèque
+    /// (à augmenter pour résultats finaux).
+    /// Si l'erreur PLATEAU à valeur non-nulle : bug systémique.
+    #[test]
+    #[ignore]
+    fn diagnostic_pm_convergence_in_n_pm() {
+        use crate::nbody::{Particle, Vec3};
+        use crate::treepm::treepm_force::TreePMForce;
+        use crate::MassSign;
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let n = 500;
+        let l = 100.0_f64;
+        let mut rng = StdRng::seed_from_u64(42);
+        let half = l * 0.5;
+        let mut pos = Vec::with_capacity(n);
+        let mass: Vec<f64> = vec![1.0_f64; n];
+        let mut particles_bh = Vec::with_capacity(n);
+        for _ in 0..n {
+            let x = rng.random::<f64>() * l - half;
+            let y = rng.random::<f64>() * l - half;
+            let z = rng.random::<f64>() * l - half;
+            pos.push((x, y, z));
+            particles_bh.push(Particle::new(
+                Vec3::new(x, y, z),
+                Vec3::zero(),
+                1.0,
+                MassSign::Positive,
+            ));
+        }
+
+        let g_phys = 1.0_f64;
+        let softening = 0.05_f64;
+        let acc_pp = pp_direct_forces_newton(&pos, &mass, l, softening, g_phys);
+
+        println!();
+        println!("=== Diagnostic 4d: PM convergence in N_pm ===");
+        for &n_pm in &[32, 64, 128, 256] {
+            let dg = l / n_pm as f64;
+            let r_cut = 6.0 * dg;
+            let theta = 0.5;
+            let v_cell = dg.powi(3);
+
+            let mut tpm = TreePMForce::new(r_cut, n_pm, l, theta, softening);
+            tpm.g_constant = g_phys / v_cell;
+            tpm.update(&particles_bh);
+            tpm.tree.g_constant = g_phys;
+            let acc_tpm = tpm.compute_all_forces(&particles_bh);
+
+            let mut errs = Vec::new();
+            for i in 0..n {
+                let (rx, ry, rz) = acc_pp[i];
+                let av = acc_tpm[i];
+                let mag_ref = (rx * rx + ry * ry + rz * rz).sqrt();
+                if mag_ref < 1e-15 {
+                    continue;
+                }
+                let dx = av.x - rx;
+                let dy = av.y - ry;
+                let dz = av.z - rz;
+                let diff = (dx * dx + dy * dy + dz * dz).sqrt();
+                errs.push(diff / mag_ref);
+            }
+            errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med = errs[errs.len() / 2];
+            let p95 = errs[(errs.len() * 95) / 100];
+            let max = errs.iter().cloned().fold(0.0_f64, f64::max);
+            println!(
+                "  N_pm={:<4} (dg={:.3}, r_cut={:.3}): median={:.2}%, P95={:.2}%, max={:.2}%",
+                n_pm,
+                dg,
+                r_cut,
+                med * 100.0,
+                p95 * 100.0,
+                max * 100.0
+            );
+        }
+    }
+
     /// Diagnostic 4b: linearity in G.
     #[test]
     #[ignore]

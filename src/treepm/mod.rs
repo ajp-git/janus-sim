@@ -28,6 +28,9 @@ pub mod truncation_table;
 // Phase 4 canonical parameters (PhotoNs-GPU + GreeM)
 pub mod parameters;
 
+// Phase 5 Janus extension
+pub mod janus;
+
 /// GPU cuFFT Poisson solver (requires cuda feature + libcufft_wrapper.so)
 #[cfg(feature = "cufft")]
 pub mod cufft_ffi;

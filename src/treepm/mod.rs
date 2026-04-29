@@ -20,6 +20,11 @@ pub mod gradient;
 pub mod cic_correction;
 pub mod laplacian;
 
+// Phase 3 GPU optimizations (PhotoNs-GPU)
+pub mod gpu_layout;
+pub mod task_list;
+pub mod truncation_table;
+
 /// GPU cuFFT Poisson solver (requires cuda feature + libcufft_wrapper.so)
 #[cfg(feature = "cufft")]
 pub mod cufft_ffi;

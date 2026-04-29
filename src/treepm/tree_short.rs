@@ -10,43 +10,62 @@
 
 use crate::MassSign;
 use crate::nbody::{Vec3, Particle, BoundingBox, OctreeNode};
+use super::splitting::splitting_tree_springel;
 
-/// Splitting function: weight for PM (long-range) component
-/// Uses smooth polynomial transition: W_pm = (r/r_cut)^4 for smooth derivative
-/// Returns 0 at r=0, approaches 1 as r→r_cut, exactly 1 for r>=r_cut
+/// **DEPRECATED** Polynomial PM weight (Bagla 2002), inconsistent with
+/// Gaussian PM. Kept for backward compat. Use Springel via tree force computation.
 pub fn splitting_pm_weight(r: f64, r_cut: f64) -> f64 {
     if r >= r_cut {
         1.0
     } else {
         let x = r / r_cut;
         let x2 = x * x;
-        x2 * x2  // x^4 for smooth transition
+        x2 * x2 // x^4 for smooth transition
     }
 }
 
-/// Splitting function: weight for Tree (short-range) component
-/// Tree weight = 1 - PM weight
+/// **DEPRECATED** Polynomial Tree weight (Bagla 2002).
 pub fn splitting_tree_weight(r: f64, r_cut: f64) -> f64 {
     1.0 - splitting_pm_weight(r, r_cut)
 }
 
-/// Barnes-Hut tree with TreePM splitting
+/// Barnes-Hut tree with TreePM splitting (Phase 9.6: Springel convention).
+///
+/// Uses `splitting_tree_springel(r, r_s)` to apply T(x) = erfc(x) + (2x/√π)·exp(-x²)
+/// for compatibility with PM Gaussian damping `exp(-k²·r_s²)`.
+///
+/// `r_cut` is the neighbor search radius (cells beyond this are pruned).
+/// `r_s` is the split scale used for the Springel function.
+/// Convention PhotoNs canonical: `r_cut = 5·r_s` (so cutoff at x = r_cut/(2·r_s) = 2.5,
+/// where T(2.5) ≈ 6e-3, near zero). Springel hard cutoff inside the function at x ≥ 3.
 pub struct TreePMTree {
     pub theta: f64,
     pub r_cut: f64,
-    pub g_constant: f64,  // Gravitational constant
+    pub r_s: f64,         // Phase 9.6: split scale for Springel splitting
+    pub g_constant: f64,
     pub root: OctreeNode,
     pub bounds: BoundingBox,
 }
 
 impl TreePMTree {
-    /// Build tree from particles
+    /// Build tree from particles. Default r_s = r_cut / 5 (PhotoNs canonical).
     pub fn build(particles: &[Particle], theta: f64, r_cut: f64) -> Self {
         Self::build_with_g(particles, theta, r_cut, 1.0)
     }
 
-    /// Build tree with custom G constant
+    /// Build tree with custom G constant. Default r_s = r_cut / 5.
     pub fn build_with_g(particles: &[Particle], theta: f64, r_cut: f64, g_constant: f64) -> Self {
+        Self::build_with_rs_and_g(particles, theta, r_cut, r_cut / 5.0, g_constant)
+    }
+
+    /// Build tree with explicit r_s and G constant (Phase 9.6 API).
+    pub fn build_with_rs_and_g(
+        particles: &[Particle],
+        theta: f64,
+        r_cut: f64,
+        r_s: f64,
+        g_constant: f64,
+    ) -> Self {
         // Compute bounding box
         let mut min = Vec3::new(f64::MAX, f64::MAX, f64::MAX);
         let mut max = Vec3::new(f64::MIN, f64::MIN, f64::MIN);
@@ -81,7 +100,7 @@ impl TreePMTree {
         let indices: Vec<usize> = (0..particles.len()).collect();
         let root = Self::build_node(&indices, particles, &bounds);
 
-        Self { theta, r_cut, g_constant, root, bounds }
+        Self { theta, r_cut, r_s, g_constant, root, bounds }
     }
 
     fn build_node(indices: &[usize], particles: &[Particle], bounds: &BoundingBox) -> OctreeNode {
@@ -180,7 +199,10 @@ impl TreePMTree {
                     return Vec3::zero();
                 }
                 let p = &particles[*particle_idx];
-                Self::pairwise_acc_with_split(pos, sign, p.pos, p.mass, p.sign, softening, self.r_cut, self.g_constant)
+                Self::pairwise_acc_with_split(
+                    pos, sign, p.pos, p.mass, p.sign, softening,
+                    self.r_cut, self.r_s, self.g_constant,
+                )
             }
             OctreeNode::Internal { children, com_plus, mass_plus, com_minus, mass_minus } => {
                 // Distance to cell center
@@ -188,25 +210,30 @@ impl TreePMTree {
                 let cell_size = bounds.size();
 
                 // If entire cell is beyond r_cut, skip (PM handles it)
-                let min_dist_to_cell = (r_to_cell - cell_size * 0.866).max(0.0);  // 0.866 ≈ sqrt(3)/2
+                let min_dist_to_cell = (r_to_cell - cell_size * 0.866).max(0.0); // 0.866 ≈ sqrt(3)/2
                 if min_dist_to_cell >= self.r_cut {
                     return Vec3::zero();
                 }
 
                 // θ criterion: use cell approximation if s/r < θ AND r is small enough
                 if cell_size / r_to_cell < self.theta && r_to_cell < self.r_cut {
-                    // Far enough for approximation, but still within r_cut
                     let acc_from_plus = Self::pairwise_acc_with_split(
-                        pos, sign, *com_plus, *mass_plus, MassSign::Positive, softening, self.r_cut, self.g_constant);
+                        pos, sign, *com_plus, *mass_plus, MassSign::Positive, softening,
+                        self.r_cut, self.r_s, self.g_constant,
+                    );
                     let acc_from_minus = Self::pairwise_acc_with_split(
-                        pos, sign, *com_minus, *mass_minus, MassSign::Negative, softening, self.r_cut, self.g_constant);
+                        pos, sign, *com_minus, *mass_minus, MassSign::Negative, softening,
+                        self.r_cut, self.r_s, self.g_constant,
+                    );
                     acc_from_plus + acc_from_minus
                 } else {
                     // Too close or crossing r_cut boundary: recurse into children
                     let mut acc = Vec3::zero();
                     for (i, child) in children.iter().enumerate() {
-                        acc += self.acc_recursive(child, pos, sign, particles,
-                            &bounds.child_box(i), softening, exclude_idx);
+                        acc += self.acc_recursive(
+                            child, pos, sign, particles, &bounds.child_box(i),
+                            softening, exclude_idx,
+                        );
                     }
                     acc
                 }
@@ -214,35 +241,54 @@ impl TreePMTree {
         }
     }
 
-    /// Pairwise acceleration with TreePM splitting
-    /// F_tree = F_full * (1 - W_pm(r))
-    fn pairwise_acc_with_split(pos_i: Vec3, sign_i: MassSign, pos_j: Vec3, mass_j: f64,
-        sign_j: MassSign, softening: f64, r_cut: f64, g_constant: f64) -> Vec3
-    {
-        if mass_j == 0.0 { return Vec3::zero(); }
+    /// Pairwise acceleration with TreePM Springel splitting (Phase 9.6).
+    ///
+    /// `F_tree(r) = -(G·m·r̂/r²) × T(r/(2·r_s))`
+    ///
+    /// where `T(x) = erfc(x) + (2x/√π)·exp(-x²)` (Springel 2005).
+    /// Compatible with PM Gaussian damping `exp(-k²·r_s²)`.
+    ///
+    /// Hard cutoff at `r >= r_cut` for neighbor pruning. Soft cutoff via
+    /// `splitting_tree_springel` at `r ≥ 6·r_s` (where T ≈ 0).
+    fn pairwise_acc_with_split(
+        pos_i: Vec3,
+        sign_i: MassSign,
+        pos_j: Vec3,
+        mass_j: f64,
+        sign_j: MassSign,
+        softening: f64,
+        r_cut: f64,
+        r_s: f64,
+        g_constant: f64,
+    ) -> Vec3 {
+        if mass_j == 0.0 {
+            return Vec3::zero();
+        }
 
         let r_vec = pos_j - pos_i;
         let r2 = r_vec.length_sq();
         let r = r2.sqrt();
 
-        // Skip if beyond r_cut (PM handles this)
+        // Skip if beyond r_cut (PM handles this; Springel T ≈ 0 there too)
         if r >= r_cut {
             return Vec3::zero();
         }
 
         // Plummer softening
         let r2_soft = r2 + softening * softening;
-        if r2_soft < 1e-20 { return Vec3::zero(); }
+        if r2_soft < 1e-20 {
+            return Vec3::zero();
+        }
 
-        // Janus interaction
+        // Janus interaction sign
         let interaction = if sign_i == sign_j { 1.0 } else { -1.0 } * g_constant;
 
-        // Full force magnitude
+        // Full Newton force magnitude
         let inv_r3_soft = 1.0 / (r2_soft * r2_soft.sqrt());
         let acc_full = r_vec * (interaction * mass_j * inv_r3_soft);
 
-        // Apply Tree splitting weight (1 - W_pm)
-        let tree_weight = splitting_tree_weight(r, r_cut);
+        // Apply Springel Tree splitting (replaces polynomial 1 - (r/r_cut)^4)
+        let tree_weight = splitting_tree_springel(r, r_s);
         acc_full * tree_weight
     }
 }
@@ -250,6 +296,42 @@ impl TreePMTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 9.6: vérifier que Tree utilise bien Springel splitting (pas polynomial).
+    /// 2 particules à r = 2·r_s, mass=1, G=1, softening=0.
+    /// F_tree = (1/r²) × T(1) avec T(1) ≈ 0.5724.
+    /// → F_tree ≈ (1/4) × 0.5724 = 0.1431.
+    #[test]
+    fn test_tree_uses_springel_splitting() {
+        let r_s = 1.0_f64;
+        let r_cut = 5.0 * r_s; // PhotoNs canonical
+        let particles = vec![
+            Particle::new(Vec3::new(0.0, 0.0, 0.0), Vec3::zero(), 1.0, MassSign::Positive),
+            Particle::new(Vec3::new(2.0, 0.0, 0.0), Vec3::zero(), 1.0, MassSign::Positive),
+        ];
+        let tree = TreePMTree::build_with_rs_and_g(&particles, 0.5, r_cut, r_s, 1.0);
+        let f = tree.compute_short_range_acc_excluding(
+            Vec3::new(0.0, 0.0, 0.0),
+            MassSign::Positive,
+            &particles,
+            0.0,
+            Some(0),
+        );
+
+        // Expected: F = G·m·r̂/r² × T(r/(2·r_s)) = 1·1·(+1)/4 × T(1)
+        // T(1) ≈ 0.5724; F_x ≈ +0.1431 (attractive toward +x)
+        let expected = 0.1431_f64;
+        // Tolerance 1e-3 (Abramowitz erfc approximation)
+        assert!(
+            (f.x - expected).abs() < 1e-3,
+            "F_x = {}, expected {} (Springel T(1)≈0.5724)",
+            f.x,
+            expected
+        );
+        // y, z components should be 0
+        assert!(f.y.abs() < 1e-12);
+        assert!(f.z.abs() < 1e-12);
+    }
 
     #[test]
     fn test_splitting_weights() {

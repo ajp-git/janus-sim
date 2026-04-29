@@ -33,18 +33,20 @@ impl TreePMForce {
     /// theta: Barnes-Hut opening angle
     /// softening: Plummer softening length
     pub fn new(r_cut: f64, grid_size: usize, box_size: f64, theta: f64, softening: f64) -> Self {
-        let r_s = r_cut / 3.0;  // Standard choice for Gaussian splitting
+        // Phase 9.6: r_s = r_cut/5 (PhotoNs canonical, Springel-compatible).
+        // Previously was r_cut/3 (mismatched with polynomial Tree splitting).
+        let r_s = r_cut / 5.0;
 
-        let g_constant = 1.0;  // Default G=1 in simulation units
+        let g_constant = 1.0;
 
         Self {
             pm: PmGrid::new(grid_size, box_size),
-            tree: TreePMTree::build_with_g(&[], theta, r_cut, g_constant),  // Empty tree, will be rebuilt
+            tree: TreePMTree::build_with_rs_and_g(&[], theta, r_cut, r_s, g_constant),
             r_cut,
             r_s,
             softening,
             g_constant,
-            pm_only: false,  // Default: full TreePM
+            pm_only: false,
         }
     }
 
@@ -82,7 +84,13 @@ impl TreePMForce {
         } else {
             self.pm.solve_poisson_with_splitting(self.g_constant, Some(self.r_s));
             // Rebuild Tree for short-range (with same G constant)
-            self.tree = TreePMTree::build_with_g(particles, self.tree.theta, self.r_cut, self.g_constant);
+            self.tree = TreePMTree::build_with_rs_and_g(
+                particles,
+                self.tree.theta,
+                self.r_cut,
+                self.r_s,
+                self.g_constant,
+            );
         }
     }
 

@@ -1956,19 +1956,19 @@ extern "C" __global__ void forces_treepm_short_range(
                 if (ddz < -box_half) ddz += 2.0f * box_half;
                 float rp2 = ddx*ddx + ddy*ddy + ddz*ddz + eps2;
 
-                // TreePM short-range force with erfc splitting
-                // F_short = F_total × erfc(r/(2×r_s))
-                // This complements PM: F_long = F_total × erf(r/(2×r_s))
-                // So F_short + F_long = F_total exactly
+                // Phase 10.7 Fix 2: Springel 2005 GADGET-2 Eq. 17 splitting
+                // F_short = F_total × T(r/(2·r_s))
+                // T(x) = erfc(x) + (2x/√π)·exp(-x²)
+                // Complementary to PM Gaussian damping exp(-k²·r_s²) so that
+                // F_short + F_long = F_total exactly. 1/√π ≈ 0.5641895835477563.
                 float rp = sqrtf(rp2);
                 float erfc_arg = rp / (2.0f * r_s);
-                float erfc_factor = erfcf(erfc_arg);
+                float exp_mx2 = expf(-erfc_arg * erfc_arg);
+                float t_factor = erfcf(erfc_arg) + (2.0f * 0.5641895835477563f * erfc_arg) * exp_mx2;
 
-                // Only compute if erfc_factor is significant (> 1e-6)
-                // This provides natural smooth cutoff without discontinuity
-                if (erfc_factor > 1e-6f) {
+                if (t_factor > 1e-6f) {
                     float irp3 = 1.0f / (rp * rp2);  // 1/r³
-                    float f = sign_factor * m * irp3 * erfc_factor;
+                    float f = sign_factor * m * irp3 * t_factor;
                     ax += f*ddx; ay += f*ddy; az += f*ddz;
                 }
             }
@@ -2120,13 +2120,15 @@ extern "C" __global__ void forces_treepm_short_range_janus(
                 if (ddz < -box_half) ddz += 2.0f * box_half;
                 float rp2 = ddx*ddx + ddy*ddy + ddz*ddz + eps2;
 
+                // Phase 10.7 Fix 2: Springel T(x) = erfc(x) + (2x/√π)·exp(-x²)
                 float rp = sqrtf(rp2);
                 float erfc_arg = rp / (2.0f * r_s);
-                float erfc_factor = erfcf(erfc_arg);
+                float exp_mx2 = expf(-erfc_arg * erfc_arg);
+                float t_factor = erfcf(erfc_arg) + (2.0f * 0.5641895835477563f * erfc_arg) * exp_mx2;
 
-                if (erfc_factor > 1e-6f) {
+                if (t_factor > 1e-6f) {
                     float irp3 = 1.0f / (rp * rp2);
-                    float f = sign_factor * m * irp3 * erfc_factor;
+                    float f = sign_factor * m * irp3 * t_factor;
                     ax += f*ddx; ay += f*ddy; az += f*ddz;
                 }
             }

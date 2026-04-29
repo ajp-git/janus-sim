@@ -78,6 +78,252 @@ pub fn pp_direct_forces_newton(
     acc
 }
 
+/// Phase 10.8: Direct N² gravitational force with full Ewald summation.
+///
+/// Sums contributions from all periodic images using Hernquist & Bouchet 1991
+/// decomposition into rapidly converging real-space and Fourier-space parts.
+/// This is the rigorous reference for comparing TreePM forces in a periodic box,
+/// since plain MIC misses contributions from images at distance ≥ L/2.
+///
+/// Convention (matches `pp_direct_forces_newton`):
+///   F_i = +G · Σ_{j≠i} m_j × Σ_n (r_j + nL - r_i) / |r_j + nL - r_i|³_Ewald
+///
+/// Splitting (with α = 2/L, well-conditioned for cubic boxes):
+///   real-space term : (r̂/r²)·[erfc(αr) + (2αr/√π)·exp(-α²r²)/r] over n ∈ [-N_real..N_real]³
+///   Fourier term    : -(4πG·m/V)·Σ_{k≠0} k̂·sin(k·r)·exp(-k²/4α²)/k² over m ∈ [-N_fourier..N_fourier]³
+///
+/// Softening (Plummer ε²) is applied ONLY to the direct pair (n=0). Periodic
+/// images are not softened — they are at distances ≥ L/2 ≫ ε.
+///
+/// Reference: Hernquist & Bouchet 1991 ApJS 75 231; Springel 2005 GADGET-2 §3.1.
+///
+/// Complexity: O(N² × ((2N_real+1)³ + (2N_fourier+1)³)). Parallelized over i.
+pub fn pp_direct_forces_newton_ewald(
+    pos: &[(f64, f64, f64)],
+    mass: &[f64],
+    box_size: f64,
+    softening: f64,
+    g_phys: f64,
+    n_real_max: i32,
+    n_fourier_max: i32,
+) -> Vec<(f64, f64, f64)> {
+    use rayon::prelude::*;
+    let n = pos.len();
+    assert_eq!(n, mass.len());
+
+    let alpha = 2.0 / box_size;
+    let alpha2 = alpha * alpha;
+    let inv_sqrt_pi = 1.0 / std::f64::consts::PI.sqrt();
+    let two_pi_over_l = 2.0 * std::f64::consts::PI / box_size;
+    let four_pi_over_v = 4.0 * std::f64::consts::PI / box_size.powi(3);
+    let eps2 = softening * softening;
+
+    // Pre-compute Fourier modes (k != 0): (kx, ky, kz, weight = exp(-k²/4α²)/k²)
+    let mut fourier_modes: Vec<(f64, f64, f64, f64)> = Vec::new();
+    for mx in -n_fourier_max..=n_fourier_max {
+        for my in -n_fourier_max..=n_fourier_max {
+            for mz in -n_fourier_max..=n_fourier_max {
+                if mx == 0 && my == 0 && mz == 0 {
+                    continue;
+                }
+                let kx = mx as f64 * two_pi_over_l;
+                let ky = my as f64 * two_pi_over_l;
+                let kz = mz as f64 * two_pi_over_l;
+                let k2 = kx * kx + ky * ky + kz * kz;
+                let weight = (-k2 / (4.0 * alpha2)).exp() / k2;
+                fourier_modes.push((kx, ky, kz, weight));
+            }
+        }
+    }
+
+    (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let (xi, yi, zi) = pos[i];
+            let (mut ax, mut ay, mut az) = (0.0_f64, 0.0_f64, 0.0_f64);
+
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let (xj, yj, zj) = pos[j];
+                let dx_base = xj - xi;
+                let dy_base = yj - yi;
+                let dz_base = zj - zi;
+                let m_j = mass[j];
+
+                // Real-space sum over images n
+                for nx in -n_real_max..=n_real_max {
+                    for ny in -n_real_max..=n_real_max {
+                        for nz in -n_real_max..=n_real_max {
+                            let dx = dx_base + (nx as f64) * box_size;
+                            let dy = dy_base + (ny as f64) * box_size;
+                            let dz = dz_base + (nz as f64) * box_size;
+                            let r2_raw = dx * dx + dy * dy + dz * dz;
+                            let is_direct = nx == 0 && ny == 0 && nz == 0;
+                            let r2 = if is_direct { r2_raw + eps2 } else { r2_raw };
+                            if r2 < 1e-30 {
+                                continue;
+                            }
+                            let r = r2.sqrt();
+                            let alpha_r = alpha * r;
+                            // erfc(αr)/r³
+                            let erfc_term = crate::treepm::truncation_table::erfc_approx(alpha_r)
+                                / (r * r2);
+                            // (2α/√π)·exp(-α²r²)/r²
+                            let exp_term = (2.0 * alpha * inv_sqrt_pi)
+                                * (-alpha_r * alpha_r).exp()
+                                / r2;
+                            let coeff = g_phys * m_j * (erfc_term + exp_term);
+                            ax += coeff * dx;
+                            ay += coeff * dy;
+                            az += coeff * dz;
+                        }
+                    }
+                }
+
+                // Fourier-space sum over modes k
+                // F_Fourier = -(4πG·m_j/V) · Σ_k k̂·sin(k·r)·exp(-k²/4α²)/|k|²
+                //           = -(4πG·m_j/V) · Σ_k k·sin(k·r)·weight  where weight = exp(-k²/4α²)/k²
+                for &(kx, ky, kz, weight) in &fourier_modes {
+                    let k_dot_r = kx * dx_base + ky * dy_base + kz * dz_base;
+                    let factor = -four_pi_over_v * g_phys * m_j * weight * k_dot_r.sin();
+                    ax += factor * kx;
+                    ay += factor * ky;
+                    az += factor * kz;
+                }
+            }
+
+            (ax, ay, az)
+        })
+        .collect()
+}
+
+/// Phase 10.8: Direct N² Janus force with full Ewald summation.
+///
+/// Same as `pp_direct_forces_newton_ewald` but applies Janus sign factors:
+///   sign_i == sign_j        : factor = +1            (Newton self-attraction)
+///   sign_i > 0, opposite    : factor = -coupling.cross_plus_minus()
+///   sign_i < 0, opposite    : factor = -coupling.cross_minus_plus()
+///
+/// Softening per sign (`softening_plus` for m+, `softening_minus` for m-) is
+/// applied only on the direct pair (n=0).
+pub fn pp_direct_forces_janus_ewald(
+    pos: &[(f64, f64, f64)],
+    mass: &[f64],
+    sign: &[i32],
+    box_size: f64,
+    softening_plus: f64,
+    softening_minus: f64,
+    g_phys: f64,
+    coupling: &super::janus::JanusCoupling,
+    n_real_max: i32,
+    n_fourier_max: i32,
+) -> Vec<(f64, f64, f64)> {
+    use rayon::prelude::*;
+    let n = pos.len();
+    assert_eq!(n, mass.len());
+    assert_eq!(n, sign.len());
+
+    let alpha = 2.0 / box_size;
+    let alpha2 = alpha * alpha;
+    let inv_sqrt_pi = 1.0 / std::f64::consts::PI.sqrt();
+    let two_pi_over_l = 2.0 * std::f64::consts::PI / box_size;
+    let four_pi_over_v = 4.0 * std::f64::consts::PI / box_size.powi(3);
+    let eps_plus_sq = softening_plus * softening_plus;
+    let eps_minus_sq = softening_minus * softening_minus;
+    let cross_plus_minus = coupling.cross_plus_minus();
+    let cross_minus_plus = coupling.cross_minus_plus();
+
+    let mut fourier_modes: Vec<(f64, f64, f64, f64)> = Vec::new();
+    for mx in -n_fourier_max..=n_fourier_max {
+        for my in -n_fourier_max..=n_fourier_max {
+            for mz in -n_fourier_max..=n_fourier_max {
+                if mx == 0 && my == 0 && mz == 0 {
+                    continue;
+                }
+                let kx = mx as f64 * two_pi_over_l;
+                let ky = my as f64 * two_pi_over_l;
+                let kz = mz as f64 * two_pi_over_l;
+                let k2 = kx * kx + ky * ky + kz * kz;
+                let weight = (-k2 / (4.0 * alpha2)).exp() / k2;
+                fourier_modes.push((kx, ky, kz, weight));
+            }
+        }
+    }
+
+    (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let (xi, yi, zi) = pos[i];
+            let s_i = sign[i];
+            let eps2_i = if s_i > 0 { eps_plus_sq } else { eps_minus_sq };
+            let (mut ax, mut ay, mut az) = (0.0_f64, 0.0_f64, 0.0_f64);
+
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let (xj, yj, zj) = pos[j];
+                let s_j = sign[j];
+                let dx_base = xj - xi;
+                let dy_base = yj - yi;
+                let dz_base = zj - zi;
+                let m_j = mass[j];
+
+                // Janus sign factor (matches GPU kernel and pp_direct_janus convention)
+                let sign_factor = if s_i == s_j {
+                    1.0
+                } else if s_i > 0 {
+                    -cross_plus_minus
+                } else {
+                    -cross_minus_plus
+                };
+
+                // Real-space sum
+                for nx in -n_real_max..=n_real_max {
+                    for ny in -n_real_max..=n_real_max {
+                        for nz in -n_real_max..=n_real_max {
+                            let dx = dx_base + (nx as f64) * box_size;
+                            let dy = dy_base + (ny as f64) * box_size;
+                            let dz = dz_base + (nz as f64) * box_size;
+                            let r2_raw = dx * dx + dy * dy + dz * dz;
+                            let is_direct = nx == 0 && ny == 0 && nz == 0;
+                            let r2 = if is_direct { r2_raw + eps2_i } else { r2_raw };
+                            if r2 < 1e-30 {
+                                continue;
+                            }
+                            let r = r2.sqrt();
+                            let alpha_r = alpha * r;
+                            let erfc_term = crate::treepm::truncation_table::erfc_approx(alpha_r)
+                                / (r * r2);
+                            let exp_term = (2.0 * alpha * inv_sqrt_pi)
+                                * (-alpha_r * alpha_r).exp()
+                                / r2;
+                            let coeff = sign_factor * g_phys * m_j * (erfc_term + exp_term);
+                            ax += coeff * dx;
+                            ay += coeff * dy;
+                            az += coeff * dz;
+                        }
+                    }
+                }
+
+                // Fourier sum
+                for &(kx, ky, kz, weight) in &fourier_modes {
+                    let k_dot_r = kx * dx_base + ky * dy_base + kz * dz_base;
+                    let factor =
+                        -sign_factor * four_pi_over_v * g_phys * m_j * weight * k_dot_r.sin();
+                    ax += factor * kx;
+                    ay += factor * ky;
+                    az += factor * kz;
+                }
+            }
+
+            (ax, ay, az)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1833,6 +2079,108 @@ mod tests {
             "acc[0].x = {}, expected {}",
             acc[0].0,
             expected
+        );
+    }
+
+    // ============================================================
+    // Phase 10.8 — Ewald summation validation tests
+    // ============================================================
+
+    #[test]
+    #[ignore]
+    fn test_ewald_two_particles_close() {
+        // 2 particles separated by r = L/50 = 2 Mpc, softening 0.
+        // At this scale image contribs are O((r/L)²) ≈ 4e-4 relative,
+        // so Ewald ≈ Newton non-periodique to better than 1%.
+        let l = 100.0_f64;
+        let pos = vec![(49.0, 50.0, 50.0), (51.0, 50.0, 50.0)];
+        let mass = vec![1.0_f64, 1.0];
+
+        let acc = pp_direct_forces_newton_ewald(&pos, &mass, l, 0.0, 1.0, 4, 4);
+
+        // Newton non-periodique : F_x = G·m·dx/r³ = 2/8 = 0.25
+        let f_newton = 1.0 / (2.0 * 2.0);
+        let f_ewald_x = acc[0].0;
+        let rel_err = (f_ewald_x - f_newton).abs() / f_newton;
+        println!(
+            "Ewald 2-particles (r=L/50): F_x = {:.6e}, Newton = {:.6e}, rel err = {:.3}%",
+            f_ewald_x,
+            f_newton,
+            rel_err * 100.0
+        );
+        assert!(rel_err < 0.01, "Ewald close vs Newton: rel err = {}", rel_err);
+        // Sanity: y, z components ~zero (1D pair on x axis)
+        assert!(acc[0].1.abs() < 1e-6 * f_newton);
+        assert!(acc[0].2.abs() < 1e-6 * f_newton);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_ewald_convergence() {
+        // Convergence: Ewald(4,4) → Ewald(5,5) relative diff < 0.1%
+        let l = 100.0_f64;
+        let n = 10;
+        let pos: Vec<_> = (0..n)
+            .map(|i| ((i as f64) * 8.0 + 5.0, 50.0, 50.0))
+            .collect();
+        let mass = vec![1.0_f64; n];
+
+        let acc_44 = pp_direct_forces_newton_ewald(&pos, &mass, l, 0.05, 1.0, 4, 4);
+        let acc_55 = pp_direct_forces_newton_ewald(&pos, &mass, l, 0.05, 1.0, 5, 5);
+
+        let mut max_rel_diff = 0.0_f64;
+        for i in 0..n {
+            let dx = acc_44[i].0 - acc_55[i].0;
+            let dy = acc_44[i].1 - acc_55[i].1;
+            let dz = acc_44[i].2 - acc_55[i].2;
+            let diff = (dx * dx + dy * dy + dz * dz).sqrt();
+            let mag = (acc_55[i].0.powi(2)
+                + acc_55[i].1.powi(2)
+                + acc_55[i].2.powi(2))
+            .sqrt();
+            if mag > 1e-15 {
+                max_rel_diff = max_rel_diff.max(diff / mag);
+            }
+        }
+        println!(
+            "Ewald convergence (4,4) → (5,5): max rel diff = {:.5}%",
+            max_rel_diff * 100.0
+        );
+        assert!(
+            max_rel_diff < 0.001,
+            "Ewald not converged at (4,4): {} > 0.1%",
+            max_rel_diff
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn test_ewald_vs_mic_close_pair() {
+        // Pair at r = L/10 (close): MIC should give close to Ewald (< 5% diff)
+        let l = 100.0_f64;
+        let pos = vec![(45.0, 50.0, 50.0), (55.0, 50.0, 50.0)];
+        let mass = vec![1.0_f64, 1.0];
+
+        let acc_mic = pp_direct_forces_newton(&pos, &mass, l, 0.05, 1.0);
+        let acc_ewald = pp_direct_forces_newton_ewald(&pos, &mass, l, 0.05, 1.0, 4, 4);
+
+        let mag_mic = (acc_mic[0].0.powi(2) + acc_mic[0].1.powi(2) + acc_mic[0].2.powi(2)).sqrt();
+        let mag_ewald = (acc_ewald[0].0.powi(2) + acc_ewald[0].1.powi(2) + acc_ewald[0].2.powi(2))
+            .sqrt();
+
+        let rel_diff = (mag_ewald - mag_mic).abs() / mag_mic;
+        println!(
+            "Ewald vs MIC for close pair (r=L/10): mag_mic = {:.4e}, mag_ewald = {:.4e}, rel diff = {:.3}%",
+            mag_mic,
+            mag_ewald,
+            rel_diff * 100.0
+        );
+        // For r=L/10, image contributions are at r ≥ L (10× further),
+        // so Ewald correction should be < 5% over MIC.
+        assert!(
+            rel_diff < 0.05,
+            "Close pair Ewald vs MIC: rel diff = {}",
+            rel_diff
         );
     }
 }

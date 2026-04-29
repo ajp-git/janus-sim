@@ -31,6 +31,9 @@ pub mod parameters;
 // Phase 5 Janus extension
 pub mod janus;
 
+// Phase 7 integrated step (CPU-only, for small-N validation)
+pub mod integrated_step;
+
 /// GPU cuFFT Poisson solver (requires cuda feature + libcufft_wrapper.so)
 #[cfg(feature = "cufft")]
 pub mod cufft_ffi;

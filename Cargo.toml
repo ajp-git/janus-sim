@@ -965,3 +965,13 @@ path = "src/bin/test_growth_factor.rs"
 name = "test_phase10_gpu"
 path = "src/bin/test_phase10_gpu.rs"
 required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "test_phase10_a5c"
+path = "src/bin/test_phase10_a5c.rs"
+required-features = ["cuda", "cufft"]
+
+[[bin]]
+name = "test_phase10_a5a"
+path = "src/bin/test_phase10_a5a.rs"
+required-features = ["cuda", "cufft"]

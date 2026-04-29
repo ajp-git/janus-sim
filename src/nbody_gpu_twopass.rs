@@ -4786,6 +4786,11 @@ impl GpuNBodyTwoPass {
     }
 
     /// Get acceleration buffer for adding PM long-range forces
+    /// Phase 10A.5a: copy acc from GPU to host as flat Vec<f32>.
+    pub fn get_acc(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        Ok(self.device.dtoh_sync_copy(&self.acc)?)
+    }
+
     pub fn get_acc_mut(&mut self) -> &mut CudaSlice<f32> {
         &mut self.acc
     }

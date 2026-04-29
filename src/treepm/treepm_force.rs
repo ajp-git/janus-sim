@@ -22,6 +22,7 @@ pub struct TreePMForce {
     pub softening: f64,
     pub g_constant: f64,
     pub pm_only: bool,  // Skip Tree short-range for fast visual validation
+    pub box_size: f64,  // Phase 10A1: for MIC in tree rebuilds
 }
 
 impl TreePMForce {
@@ -34,19 +35,19 @@ impl TreePMForce {
     /// softening: Plummer softening length
     pub fn new(r_cut: f64, grid_size: usize, box_size: f64, theta: f64, softening: f64) -> Self {
         // Phase 9.6: r_s = r_cut/5 (PhotoNs canonical, Springel-compatible).
-        // Previously was r_cut/3 (mismatched with polynomial Tree splitting).
         let r_s = r_cut / 5.0;
-
         let g_constant = 1.0;
 
         Self {
             pm: PmGrid::new(grid_size, box_size),
-            tree: TreePMTree::build_with_rs_and_g(&[], theta, r_cut, r_s, g_constant),
+            // Phase 10A1: pass box_size for MIC in tree.
+            tree: TreePMTree::build_with_rs_g_box(&[], theta, r_cut, r_s, g_constant, box_size),
             r_cut,
             r_s,
             softening,
             g_constant,
             pm_only: false,
+            box_size,
         }
     }
 
@@ -60,6 +61,7 @@ impl TreePMForce {
             softening: 0.5,
             g_constant: 1.0,
             pm_only: true,
+            box_size,
         }
     }
 
@@ -83,13 +85,14 @@ impl TreePMForce {
             self.pm.solve_poisson(self.g_constant);
         } else {
             self.pm.solve_poisson_with_splitting(self.g_constant, Some(self.r_s));
-            // Rebuild Tree for short-range (with same G constant)
-            self.tree = TreePMTree::build_with_rs_and_g(
+            // Rebuild Tree for short-range, with MIC enabled (Phase 10A1).
+            self.tree = TreePMTree::build_with_rs_g_box(
                 particles,
                 self.tree.theta,
                 self.r_cut,
                 self.r_s,
                 self.g_constant,
+                self.box_size,
             );
         }
     }

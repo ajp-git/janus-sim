@@ -45,26 +45,43 @@ pub struct TreePMTree {
     pub g_constant: f64,
     pub root: OctreeNode,
     pub bounds: BoundingBox,
+    /// Phase 10A1: box size for periodic minimum image convention.
+    /// 0.0 means MIC disabled (legacy non-periodic).
+    pub box_size: f64,
 }
 
 impl TreePMTree {
-    /// Build tree from particles. Default r_s = r_cut / 5 (PhotoNs canonical).
+    /// Build tree from particles. Default r_s = r_cut / 5 (PhotoNs canonical),
+    /// box_size = 0 (MIC disabled, legacy).
     pub fn build(particles: &[Particle], theta: f64, r_cut: f64) -> Self {
         Self::build_with_g(particles, theta, r_cut, 1.0)
     }
 
-    /// Build tree with custom G constant. Default r_s = r_cut / 5.
+    /// Build tree with custom G constant. Default r_s = r_cut / 5, box_size=0.
     pub fn build_with_g(particles: &[Particle], theta: f64, r_cut: f64, g_constant: f64) -> Self {
         Self::build_with_rs_and_g(particles, theta, r_cut, r_cut / 5.0, g_constant)
     }
 
-    /// Build tree with explicit r_s and G constant (Phase 9.6 API).
+    /// Build tree with explicit r_s and G constant (Phase 9.6 API). MIC disabled.
     pub fn build_with_rs_and_g(
         particles: &[Particle],
         theta: f64,
         r_cut: f64,
         r_s: f64,
         g_constant: f64,
+    ) -> Self {
+        Self::build_with_rs_g_box(particles, theta, r_cut, r_s, g_constant, 0.0)
+    }
+
+    /// Build tree with full Phase 10A1 API including periodic box_size.
+    /// box_size > 0 enables minimum image convention; 0 disables it.
+    pub fn build_with_rs_g_box(
+        particles: &[Particle],
+        theta: f64,
+        r_cut: f64,
+        r_s: f64,
+        g_constant: f64,
+        box_size: f64,
     ) -> Self {
         // Compute bounding box
         let mut min = Vec3::new(f64::MAX, f64::MAX, f64::MAX);
@@ -100,7 +117,7 @@ impl TreePMTree {
         let indices: Vec<usize> = (0..particles.len()).collect();
         let root = Self::build_node(&indices, particles, &bounds);
 
-        Self { theta, r_cut, r_s, g_constant, root, bounds }
+        Self { theta, r_cut, r_s, g_constant, root, bounds, box_size }
     }
 
     fn build_node(indices: &[usize], particles: &[Particle], bounds: &BoundingBox) -> OctreeNode {
@@ -201,7 +218,7 @@ impl TreePMTree {
                 let p = &particles[*particle_idx];
                 Self::pairwise_acc_with_split(
                     pos, sign, p.pos, p.mass, p.sign, softening,
-                    self.r_cut, self.r_s, self.g_constant,
+                    self.r_cut, self.r_s, self.g_constant, self.box_size,
                 )
             }
             OctreeNode::Internal { children, com_plus, mass_plus, com_minus, mass_minus } => {
@@ -219,11 +236,11 @@ impl TreePMTree {
                 if cell_size / r_to_cell < self.theta && r_to_cell < self.r_cut {
                     let acc_from_plus = Self::pairwise_acc_with_split(
                         pos, sign, *com_plus, *mass_plus, MassSign::Positive, softening,
-                        self.r_cut, self.r_s, self.g_constant,
+                        self.r_cut, self.r_s, self.g_constant, self.box_size,
                     );
                     let acc_from_minus = Self::pairwise_acc_with_split(
                         pos, sign, *com_minus, *mass_minus, MassSign::Negative, softening,
-                        self.r_cut, self.r_s, self.g_constant,
+                        self.r_cut, self.r_s, self.g_constant, self.box_size,
                     );
                     acc_from_plus + acc_from_minus
                 } else {
@@ -260,12 +277,27 @@ impl TreePMTree {
         r_cut: f64,
         r_s: f64,
         g_constant: f64,
+        box_size: f64,
     ) -> Vec3 {
         if mass_j == 0.0 {
             return Vec3::zero();
         }
 
-        let r_vec = pos_j - pos_i;
+        // Phase 10A1: minimum image convention (MIC) for periodic BC.
+        // box_size = 0.0 disables MIC (legacy non-periodic).
+        let mut dx = pos_j.x - pos_i.x;
+        let mut dy = pos_j.y - pos_i.y;
+        let mut dz = pos_j.z - pos_i.z;
+        if box_size > 0.0 {
+            let half = box_size * 0.5;
+            if dx > half { dx -= box_size; }
+            if dx < -half { dx += box_size; }
+            if dy > half { dy -= box_size; }
+            if dy < -half { dy += box_size; }
+            if dz > half { dz -= box_size; }
+            if dz < -half { dz += box_size; }
+        }
+        let r_vec = Vec3::new(dx, dy, dz);
         let r2 = r_vec.length_sq();
         let r = r2.sqrt();
 
@@ -296,6 +328,69 @@ impl TreePMTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 10A1: vérifier que le Tree utilise MIC pour pairs cross-boundary.
+    /// 2 particules à (40, 0, 0) et (-40, 0, 0) dans L=100. Distance MIC = 20.
+    /// Tree avec MIC doit donner force vers +x sur particule 0 (image at +60).
+    #[test]
+    fn test_tree_pbc_minimum_image() {
+        let l = 100.0_f64;
+        let r_s = 1.0_f64;
+        let r_cut = 25.0_f64; // > MIC dist 20, < L/2 = 50
+        let particles = vec![
+            Particle::new(Vec3::new(40.0, 0.0, 0.0), Vec3::zero(), 1.0, MassSign::Positive),
+            Particle::new(Vec3::new(-40.0, 0.0, 0.0), Vec3::zero(), 1.0, MassSign::Positive),
+        ];
+        let tree = TreePMTree::build_with_rs_g_box(&particles, 0.5, r_cut, r_s, 1.0, l);
+        let acc = tree.compute_short_range_acc_excluding(
+            Vec3::new(40.0, 0.0, 0.0),
+            MassSign::Positive,
+            &particles,
+            0.05,
+            Some(0),
+        );
+
+        // MIC: la particule à -40 vue à +60 via boundary x=±50.
+        // Force sur particule 0 en (40, 0, 0) attractive vers +60 → +x.
+        // Mais splitting Springel atténue: T(20/(2·1)) = T(10) ≈ 0.
+        // Avec r_cut=25 et MIC dist=20 < r_cut, Tree compute la pair.
+        // Le splitting T(10) est essentiellement 0 → force tree ≈ 0.
+        // Test plus robuste: vérifier que Tree NE retourne PAS la force
+        // raw (à direct distance 80 = -x direction).
+        assert!(
+            acc.x.abs() < 1e-3,
+            "Tree should NOT compute force at raw direct dist 80; got acc.x = {}",
+            acc.x
+        );
+
+        // Test 2: r_s = 5 (Springel cutoff = 6·r_s = 30 > MIC=20)
+        let r_s2 = 5.0_f64;
+        let tree2 = TreePMTree::build_with_rs_g_box(&particles, 0.5, r_cut, r_s2, 1.0, l);
+        let acc2 = tree2.compute_short_range_acc_excluding(
+            Vec3::new(40.0, 0.0, 0.0),
+            MassSign::Positive,
+            &particles,
+            0.05,
+            Some(0),
+        );
+        // Now T(20/(2·5)) = T(2) ≈ 0.046, force ≈ G·m/r² · T(2) at MIC r=20.
+        // direction: vers +x (toward image at +60)
+        assert!(
+            acc2.x > 0.0,
+            "MIC: Tree should give force toward +x via image (PBC), got acc.x = {}",
+            acc2.x
+        );
+        let r_mic = 20.0;
+        let expected_mag = (1.0 / (r_mic * r_mic)) * 0.046; // T(2) ≈ 0.046
+        let mag = (acc2.x.powi(2) + acc2.y.powi(2) + acc2.z.powi(2)).sqrt();
+        // Tolerance loose because Springel approx + softening
+        assert!(
+            (mag - expected_mag).abs() / expected_mag < 0.5,
+            "Magnitude {} differs from expected {} (T(2)·1/r²)",
+            mag,
+            expected_mag
+        );
+    }
 
     /// Phase 9.6: vérifier que Tree utilise bien Springel splitting (pas polynomial).
     /// 2 particules à r = 2·r_s, mass=1, G=1, softening=0.

@@ -437,6 +437,418 @@ mod tests {
         }
     }
 
+    /// Phase 9.7-B: r_cut sensitivity test. Tree handles r < r_cut, PM handles
+    /// r >= r_cut. Pour N=1000 dans L=100, mean_sep ≈ 10 Mpc. Avec r_cut=9.375,
+    /// la plupart des pairs sont en zone PM. Tester r_cut plus grand pour voir
+    /// si l'erreur baisse (Tree corrige plus de pairs).
+    #[test]
+    #[ignore]
+    fn diagnostic_r_cut_sensitivity() {
+        use crate::nbody::{Particle, Vec3};
+        use crate::treepm::treepm_force::TreePMForce;
+        use crate::MassSign;
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let n = 1000;
+        let l = 100.0_f64;
+        let mut rng = StdRng::seed_from_u64(42);
+        let half = l * 0.5;
+        let mut pos = Vec::with_capacity(n);
+        let mass: Vec<f64> = vec![1.0_f64; n];
+        let mut particles_bh = Vec::with_capacity(n);
+        for _ in 0..n {
+            let x = rng.random::<f64>() * l - half;
+            let y = rng.random::<f64>() * l - half;
+            let z = rng.random::<f64>() * l - half;
+            pos.push((x, y, z));
+            particles_bh.push(Particle::new(
+                Vec3::new(x, y, z),
+                Vec3::zero(),
+                1.0,
+                MassSign::Positive,
+            ));
+        }
+
+        let g_phys = 1.0_f64;
+        let softening = 0.05_f64;
+        let n_pm = 64;
+        let dg = l / n_pm as f64;
+        let theta = 0.5;
+        let v_cell = dg.powi(3);
+
+        // mean separation ≈ L · N^(-1/3) = 10 Mpc
+        let mean_sep = l * (n as f64).powf(-1.0 / 3.0);
+        println!();
+        println!("=== r_cut sensitivity (N={}, mean_sep ≈ {:.2} Mpc) ===", n, mean_sep);
+        println!("  {:<12} {:<10} {:<10} {:<10}", "r_cut/Δg", "median", "P95", "max");
+
+        let acc_pp = pp_direct_forces_newton(&pos, &mass, l, softening, g_phys);
+
+        for &factor in &[3.0_f64, 6.0, 12.0, 18.0, 24.0] {
+            let r_cut = factor * dg;
+            // Skip if r_cut > L/2 (Tree raw distance limit)
+            if r_cut > l * 0.45 {
+                continue;
+            }
+            let mut tpm = TreePMForce::new(r_cut, n_pm, l, theta, softening);
+            tpm.g_constant = g_phys / v_cell;
+            tpm.update(&particles_bh);
+            tpm.tree.g_constant = g_phys;
+            let acc_tpm = tpm.compute_all_forces(&particles_bh);
+
+            let mut errs = Vec::new();
+            for i in 0..n {
+                let (rx, ry, rz) = acc_pp[i];
+                let av = acc_tpm[i];
+                let mag_ref = (rx * rx + ry * ry + rz * rz).sqrt();
+                if mag_ref < 1e-15 {
+                    continue;
+                }
+                let dx = av.x - rx;
+                let dy = av.y - ry;
+                let dz = av.z - rz;
+                let diff = (dx * dx + dy * dy + dz * dz).sqrt();
+                errs.push(diff / mag_ref);
+            }
+            errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med = errs[errs.len() / 2];
+            let p95 = errs[(errs.len() * 95) / 100];
+            let max = errs.iter().cloned().fold(0.0_f64, f64::max);
+            println!(
+                "  {:<12.2} {:<10.4} {:<10.4} {:<10.4} (r_cut={:.2})",
+                factor,
+                med,
+                p95,
+                max,
+                r_cut,
+            );
+        }
+    }
+
+    /// Phase 9.7-B Étape 4: PBC consistency test.
+    /// 2 particules à (10,50,50) et (90,50,50). Distance directe 80 Mpc.
+    /// Distance MIC: 20 Mpc (via boundary).
+    /// PP utilise MIC (20 Mpc), TreePM doit aussi via PM (FFT periodic) + Tree.
+    /// Si Tree n'utilise pas MIC raw distance, divergence garantie.
+    #[test]
+    #[ignore]
+    fn diagnostic_pbc_consistency() {
+        use crate::nbody::{Particle, Vec3};
+        use crate::treepm::treepm_force::TreePMForce;
+        use crate::MassSign;
+
+        let l = 100.0_f64;
+        let n_pm = 64;
+        let dg = l / n_pm as f64;
+        let r_cut = 6.0 * dg;
+        let r_s_default = r_cut / 5.0;
+        let theta = 0.5;
+        let softening = 0.05;
+        let g_phys = 1.0;
+        let v_cell = dg.powi(3);
+
+        // Two particles at opposite ends of x axis (boundary case)
+        let pos = vec![(40.0, 0.0, 0.0), (-40.0, 0.0, 0.0)];
+        let mass = vec![1.0_f64, 1.0];
+        let particles_bh = vec![
+            Particle::new(Vec3::new(40.0, 0.0, 0.0), Vec3::zero(), 1.0, MassSign::Positive),
+            Particle::new(Vec3::new(-40.0, 0.0, 0.0), Vec3::zero(), 1.0, MassSign::Positive),
+        ];
+        // Particule 0 at (40, 0, 0), 1 at (-40, 0, 0).
+        // Direct distance: 80. MIC distance: 100-80 = 20 (via boundary at x=±50).
+        // PP-direct uses MIC: r=20, F = G·m/r² = 1/400 = 2.5e-3, attractive
+        //   towards each other via MIC → particle 0 toward +x (image is at +60).
+        //   So acc_x[0] should be POSITIVE (toward image at x=+60).
+        // Tree without MIC: r=80 (raw direct), F = 1/6400 = 1.56e-4 (much smaller)
+        //   towards -x (toward direct partner at x=-40).
+
+        let acc_pp = pp_direct_forces_newton(&pos, &mass, l, softening, g_phys);
+        let mut tpm = TreePMForce::new(r_cut, n_pm, l, theta, softening);
+        tpm.g_constant = g_phys / v_cell;
+        tpm.update(&particles_bh);
+        tpm.tree.g_constant = g_phys;
+        let acc_tpm = tpm.compute_all_forces(&particles_bh);
+
+        println!();
+        println!("=== Phase 9.7-B Étape 4: PBC consistency ===");
+        println!("  2 particles at x=±40 in L=100 box");
+        println!("  Direct dist=80, MIC dist=20");
+        println!();
+        println!("  PP-direct (uses MIC):");
+        println!("    acc[0] = ({:.4e}, {:.4e}, {:.4e})", acc_pp[0].0, acc_pp[0].1, acc_pp[0].2);
+        println!("    acc[1] = ({:.4e}, {:.4e}, {:.4e})", acc_pp[1].0, acc_pp[1].1, acc_pp[1].2);
+        println!();
+        println!("  TreePM (PM+Tree):");
+        println!("    acc[0] = ({:.4e}, {:.4e}, {:.4e})", acc_tpm[0].x, acc_tpm[0].y, acc_tpm[0].z);
+        println!("    acc[1] = ({:.4e}, {:.4e}, {:.4e})", acc_tpm[1].x, acc_tpm[1].y, acc_tpm[1].z);
+        println!();
+        // F_PP at MIC r=20: G·m/r² = 1/400 = 2.5e-3, attract via MIC → particle 0
+        // sees source at MIC position (+60), so feels force toward +x (+2.5e-3)
+        println!("  Expected (Newton MIC, r=20): acc_x[0] = +2.5e-3");
+        println!("  Expected (Newton no-MIC, r=80): acc_x[0] = -1.56e-4 (toward direct partner -x)");
+        let _ = r_s_default; // silence unused warning
+    }
+
+    /// Phase 9.7-B Étape 3 (cas A.3): θ-sensitivity test.
+    /// Si l'erreur converge vers 0 avec θ → 0 : c'est l'opening criterion ou
+    /// le multipôle qui est imprécis. Si plateau : bug ailleurs.
+    #[test]
+    #[ignore]
+    fn diagnostic_theta_sensitivity() {
+        use crate::nbody::{Particle, Vec3};
+        use crate::treepm::treepm_force::TreePMForce;
+        use crate::MassSign;
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let n = 1000;
+        let l = 100.0_f64;
+        let mut rng = StdRng::seed_from_u64(42);
+        let half = l * 0.5;
+        let mut pos = Vec::with_capacity(n);
+        let mass: Vec<f64> = vec![1.0_f64; n];
+        let mut particles_bh = Vec::with_capacity(n);
+        for _ in 0..n {
+            let x = rng.random::<f64>() * l - half;
+            let y = rng.random::<f64>() * l - half;
+            let z = rng.random::<f64>() * l - half;
+            pos.push((x, y, z));
+            particles_bh.push(Particle::new(
+                Vec3::new(x, y, z),
+                Vec3::zero(),
+                1.0,
+                MassSign::Positive,
+            ));
+        }
+
+        let g_phys = 1.0_f64;
+        let softening = 0.05_f64;
+        let n_pm = 64;
+        let dg = l / n_pm as f64;
+        let r_cut = 6.0 * dg;
+        let v_cell = dg.powi(3);
+        let g_solver = g_phys / v_cell;
+
+        let acc_pp = pp_direct_forces_newton(&pos, &mass, l, softening, g_phys);
+
+        println!();
+        println!("=== θ sensitivity (TreePM vs PP, N=1000) ===");
+        println!("  {:<8} {:<10} {:<10} {:<10}", "θ", "median", "P95", "max");
+
+        for &theta in &[0.1_f64, 0.3, 0.5, 0.7] {
+            let mut tpm = TreePMForce::new(r_cut, n_pm, l, theta, softening);
+            tpm.g_constant = g_solver;
+            tpm.update(&particles_bh);
+            tpm.tree.g_constant = g_phys;
+            let acc_tpm = tpm.compute_all_forces(&particles_bh);
+
+            let mut errs = Vec::new();
+            for i in 0..n {
+                let (rx, ry, rz) = acc_pp[i];
+                let av = acc_tpm[i];
+                let mag_ref = (rx * rx + ry * ry + rz * rz).sqrt();
+                if mag_ref < 1e-15 {
+                    continue;
+                }
+                let dx = av.x - rx;
+                let dy = av.y - ry;
+                let dz = av.z - rz;
+                let diff = (dx * dx + dy * dy + dz * dz).sqrt();
+                errs.push(diff / mag_ref);
+            }
+            errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med = errs[errs.len() / 2];
+            let p95 = errs[(errs.len() * 95) / 100];
+            let max = errs.iter().cloned().fold(0.0_f64, f64::max);
+            println!(
+                "  {:<8.2} {:<10.4} {:<10.4} {:<10.4}",
+                theta,
+                med,
+                p95,
+                max
+            );
+        }
+    }
+
+    /// Phase 9.7-B Étape 2.1: Tree-only baseline (no splitting, r_cut très grand).
+    ///
+    /// Si Tree-only avec splitting=1 partout reproduit PP-direct à <1%,
+    /// le Tree est correct et le bug est dans le PM ou la combinaison.
+    /// Si Tree-only montre 11% médiane → bug dans le Tree (Barnes-Hut, COM, θ).
+    #[test]
+    #[ignore]
+    fn diagnostic_tree_only_no_splitting_vs_pp() {
+        use crate::nbody::{Particle, Vec3};
+        use crate::treepm::tree_short::TreePMTree;
+        use crate::MassSign;
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let n = 1000;
+        let l = 100.0_f64;
+        let mut rng = StdRng::seed_from_u64(42);
+        let half = l * 0.5;
+        let mut pos = Vec::with_capacity(n);
+        let mass: Vec<f64> = vec![1.0_f64; n];
+        let mut particles_bh = Vec::with_capacity(n);
+        for _ in 0..n {
+            let x = rng.random::<f64>() * l - half;
+            let y = rng.random::<f64>() * l - half;
+            let z = rng.random::<f64>() * l - half;
+            pos.push((x, y, z));
+            particles_bh.push(Particle::new(
+                Vec3::new(x, y, z),
+                Vec3::zero(),
+                1.0,
+                MassSign::Positive,
+            ));
+        }
+
+        let g_phys = 1.0_f64;
+        let softening = 0.05_f64;
+
+        // PP-direct référence
+        let acc_pp = pp_direct_forces_newton(&pos, &mass, l, softening, g_phys);
+
+        // Tree avec r_cut = L·√3 (couvre la diagonale, toutes paires inclues
+        // sans MIC) ET r_s très grand pour que splitting_tree_springel(r, r_s)
+        // ≈ T(r/(2·r_s)) → 1 (Tree donne toute la force, pas de damping).
+        // Note: Tree utilise distance BRUTE (pas MIC), donc r_cut doit couvrir
+        // la diagonale max de la boîte pour inclure toutes les paires.
+        let r_cut = l * 2.0; // > L·√3/2 ≈ 86.6, inclut tout
+        let r_s_huge = 1000.0 * l; // T(x≈0) ≈ 1, splitting ≈ 1 partout
+        let theta = 0.5_f64;
+
+        let tree = TreePMTree::build_with_rs_and_g(&particles_bh, theta, r_cut, r_s_huge, g_phys);
+
+        let acc_tree: Vec<Vec3> = (0..n)
+            .map(|i| {
+                tree.compute_short_range_acc_excluding(
+                    particles_bh[i].pos,
+                    particles_bh[i].sign,
+                    &particles_bh,
+                    softening,
+                    Some(i),
+                )
+            })
+            .collect();
+
+        let mut errs = Vec::new();
+        for i in 0..n {
+            let (rx, ry, rz) = acc_pp[i];
+            let av = acc_tree[i];
+            let mag_ref = (rx * rx + ry * ry + rz * rz).sqrt();
+            if mag_ref < 1e-15 {
+                continue;
+            }
+            let dx = av.x - rx;
+            let dy = av.y - ry;
+            let dz = av.z - rz;
+            let diff = (dx * dx + dy * dy + dz * dz).sqrt();
+            errs.push(diff / mag_ref);
+        }
+        errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = errs[errs.len() / 2];
+        let p95 = errs[(errs.len() * 95) / 100];
+        let max = errs.iter().cloned().fold(0.0_f64, f64::max);
+
+        println!();
+        println!("=== Tree-only (r_cut=L/2, splitting≈1, θ=0.5) vs PP-direct ===");
+        println!(
+            "  median={:.4}%, P95={:.4}%, max={:.4}%",
+            med * 100.0,
+            p95 * 100.0,
+            max * 100.0
+        );
+
+        if med < 0.01 {
+            println!("  ✅ Tree-only OK (<1%) → bug est dans PM ou combinaison");
+        } else if med > 0.05 {
+            println!("  ❌ Tree-only montre {}% → bug dans Barnes-Hut multipole/COM/θ", med * 100.0);
+        } else {
+            println!("  ⚠ Tree-only ~{:.1}% → précision intermédiaire (zone θ?)", med * 100.0);
+        }
+    }
+
+    /// Phase 9.7-B Étape 2.3: décomposition force 2-particules à différents r/r_s.
+    /// Pour chaque ratio r/r_s, mesurer l'erreur TreePM vs PP. Localise la zone
+    /// (courte/intermédiaire/longue portée) où le bug se manifeste.
+    #[test]
+    #[ignore]
+    fn diagnostic_two_particle_decomposition() {
+        use crate::nbody::{Particle, Vec3};
+        use crate::treepm::treepm_force::TreePMForce;
+        use crate::MassSign;
+
+        let l = 100.0_f64;
+        let n_pm = 64;
+        let dg = l / n_pm as f64;
+        let r_s = 1.2 * dg;
+        let r_cut = 6.0 * dg;
+        let theta = 0.5;
+        let softening = 0.05;
+        let g_phys = 1.0;
+        let v_cell = dg.powi(3);
+        let g_solver = g_phys / v_cell;
+
+        println!();
+        println!("=== Décomposition force 2-particules ===");
+        println!("  L={}, n_pm={}, r_s={:.3}, r_cut={:.3}", l, n_pm, r_s, r_cut);
+        println!(
+            "  {:<6} {:<10} {:<14} {:<14} {:<10} {:<10}",
+            "r/r_s", "r (Mpc)", "F_PP (m+/m+)", "F_TreePM", "rel_err", "T(x)"
+        );
+
+        for &factor in &[0.5_f64, 1.0, 2.0, 3.0, 5.0, 8.0] {
+            let r = factor * r_s;
+            // Skip r > r_cut: outside Tree range, only PM
+            // Mais on veut mesurer comment ça performe dans le raccord
+            let mass = vec![1.0_f64, 1.0];
+            let pos = vec![(-r * 0.5, 0.0, 0.0), (r * 0.5, 0.0, 0.0)];
+            let particles_bh = vec![
+                Particle::new(Vec3::new(pos[0].0, pos[0].1, pos[0].2), Vec3::zero(), 1.0, MassSign::Positive),
+                Particle::new(Vec3::new(pos[1].0, pos[1].1, pos[1].2), Vec3::zero(), 1.0, MassSign::Positive),
+            ];
+
+            let acc_pp = pp_direct_forces_newton(&pos, &mass, l, softening, g_phys);
+
+            let mut tpm = TreePMForce::new(r_cut, n_pm, l, theta, softening);
+            tpm.g_constant = g_solver;
+            tpm.update(&particles_bh);
+            tpm.tree.g_constant = g_phys;
+            let acc_tpm = tpm.compute_all_forces(&particles_bh);
+
+            let f_pp = acc_pp[0].0;
+            let f_tpm = acc_tpm[0].x;
+            let rel_err = if f_pp.abs() > 1e-15 {
+                ((f_tpm - f_pp) / f_pp).abs()
+            } else {
+                0.0
+            };
+
+            // T(x) à ce r
+            let x = r / (2.0 * r_s);
+            let exp_mx2 = (-x * x).exp();
+            // Direct erfc approximation
+            let p_a = 0.3275911_f64;
+            let t_a = 1.0 / (1.0 + p_a * x);
+            let erfc_x = (0.254829592 + (-0.284496736 + (1.421413741 + (-1.453152027 + 1.061405429 * t_a) * t_a) * t_a) * t_a) * t_a * (-x * x).exp();
+            let erfc_val = if x < 0.0 { 2.0 - erfc_x } else { erfc_x };
+            let t_x = if x >= 3.0 { 0.0 } else { erfc_val + (2.0 * x / std::f64::consts::PI.sqrt()) * exp_mx2 };
+
+            println!(
+                "  {:<6.2} {:<10.3} {:<14.5e} {:<14.5e} {:<10.4} {:<10.4}",
+                factor,
+                r,
+                f_pp,
+                f_tpm,
+                rel_err,
+                t_x
+            );
+        }
+    }
+
     /// Phase 9.7-A diagnostic : grad2 vs grad4 dans le PM gather.
     ///
     /// Setup identique à `test_treepm_combined_vs_pp_direct_precision`

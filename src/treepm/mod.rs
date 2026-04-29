@@ -15,6 +15,11 @@ pub mod splitting;
 pub mod tree_short;
 pub mod treepm_force;
 
+// Phase 2 numerical corrections (GrGadget)
+pub mod gradient;
+pub mod cic_correction;
+pub mod laplacian;
+
 /// GPU cuFFT Poisson solver (requires cuda feature + libcufft_wrapper.so)
 #[cfg(feature = "cufft")]
 pub mod cufft_ffi;

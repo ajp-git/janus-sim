@@ -77,6 +77,194 @@ extern "C" __global__ void add_pm_forces(
     acc[base + 2] += pm_forces[base + 2];
 }
 
+// =====================================================================
+// Phase 10A.4 Janus cosmo kernels
+// =====================================================================
+//
+// Convention Peebles peculiar (matches src/nbody_gpu.rs:3131-3138):
+//   pos[i]     : comoving Mpc, fixed box [-box_half, box_half]
+//   vel[i]     : peculiar proper velocity v_pec = a · dx_co/dt  [Mpc/Gyr]
+//   acc[i]     : bare comoving acc = G·m / r_co²  (no a-factor)
+//
+// EOM:
+//   dx_co/dt   = v_pec / a
+//   dv_pec/dt  = -H · v_pec  -  G·m / (a² · r_co²)  =  acc/a² - H·v_pec
+//
+// Per-particle a, H selected by sign (Janus dual scale factors).
+
+extern "C" __global__ void drift_janus_cosmo(
+    float* __restrict__ pos,
+    const float* __restrict__ vel,
+    const signed char* __restrict__ signs,
+    float a_plus, float a_minus,
+    float dt,
+    float box_half,
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    int base = tid * 3;
+    float a_eff = (signs[tid] > 0) ? a_plus : a_minus;
+    float dt_inv_a = dt / a_eff;
+    pos[base]     += vel[base]     * dt_inv_a;
+    pos[base + 1] += vel[base + 1] * dt_inv_a;
+    pos[base + 2] += vel[base + 2] * dt_inv_a;
+    // Robust periodic BC for arbitrary-size displacements
+    float box = 2.0f * box_half;
+    for (int i = 0; i < 3; i++) {
+        float p = pos[base + i] + box_half;
+        p = p - box * floorf(p / box);
+        pos[base + i] = p - box_half;
+    }
+}
+
+extern "C" __global__ void kick_janus_cosmo(
+    float* __restrict__ vel,
+    const float* __restrict__ acc,
+    const signed char* __restrict__ signs,
+    float a_plus, float a_minus,
+    float h_plus, float h_minus,
+    float dt,
+    int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    int base = tid * 3;
+    float a_eff = (signs[tid] > 0) ? a_plus : a_minus;
+    float h_eff = (signs[tid] > 0) ? h_plus : h_minus;
+    float inv_a2 = 1.0f / (a_eff * a_eff);
+    for (int d = 0; d < 3; d++) {
+        float v = vel[base + d];
+        float grav = acc[base + d] * inv_a2;
+        float friction = -h_eff * v;
+        vel[base + d] = v + (grav + friction) * dt;
+    }
+}
+
+// CIC gather Janus cross-coupling: applies Petit (φ, c̄²) factors.
+//
+// Convention (matches src/nbody_gpu.rs:982,1000 BH and src/treepm/janus.rs CPU):
+//   F on m+ from m+ contrib  : factor = +1.0 (Newton attractive)
+//   F on m+ from m- contrib  : factor = -cross_plus_minus = -φ·repulsion_scale
+//   F on m- from m+ contrib  : factor = -cross_minus_plus = -c̄²·φ⁻¹·repulsion_scale
+//   F on m- from m- contrib  : factor = +1.0
+//
+// In PM split-grid (φ_plus = potential of ρ_+ alone, φ_minus same for ρ_-):
+//   For sign_i = +1 (m+):
+//     F_self    = -∇φ_plus     × 1.0           (attract from m+)
+//     F_cross   = +∇φ_minus    × cross_plus_minus   (repel from m-)
+//   For sign_i = -1 (m-):
+//     F_self    = -∇φ_minus    × 1.0           (attract from m-)
+//     F_cross   = +∇φ_plus     × cross_minus_plus   (repel from m+)
+//
+// Total: F = sign_factor_self · ∇φ_self + sign_factor_cross · ∇φ_cross
+extern "C" __global__ void cic_gather_janus(
+    const float* __restrict__ pos,
+    const signed char* __restrict__ signs,
+    const double* __restrict__ phi_plus,
+    const double* __restrict__ phi_minus,
+    float* __restrict__ pm_forces,
+    int n,
+    int grid_size,
+    float box_half,
+    float inv_cell_size,
+    float cell_size,
+    float cross_minus_plus,  // factor m- ← m+ (= c̄²·φ⁻¹·repulsion_scale)
+    float cross_plus_minus   // factor m+ ← m- (= φ·repulsion_scale)
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    float px = pos[tid * 3];
+    float py = pos[tid * 3 + 1];
+    float pz = pos[tid * 3 + 2];
+    int my_sign = signs[tid];
+
+    float gx = (px + box_half) * inv_cell_size;
+    float gy = (py + box_half) * inv_cell_size;
+    float gz = (pz + box_half) * inv_cell_size;
+
+    gx = fmodf(gx + (float)grid_size, (float)grid_size);
+    gy = fmodf(gy + (float)grid_size, (float)grid_size);
+    gz = fmodf(gz + (float)grid_size, (float)grid_size);
+
+    int ix = (int)gx;
+    int iy = (int)gy;
+    int iz = (int)gz;
+
+    float fx = gx - (float)ix;
+    float fy = gy - (float)iy;
+    float fz = gz - (float)iz;
+
+    float wx[2] = {1.0f - fx, fx};
+    float wy[2] = {1.0f - fy, fy};
+    float wz[2] = {1.0f - fz, fz};
+
+    // Identify φ_self (attractive same-sign) and φ_cross (repulsive opposite-sign)
+    const double* phi_self  = (my_sign > 0) ? phi_plus  : phi_minus;
+    const double* phi_cross = (my_sign > 0) ? phi_minus : phi_plus;
+    // Cross-coupling factor: c on +← - or -← + depending on sign
+    float cross_factor = (my_sign > 0) ? cross_plus_minus : cross_minus_plus;
+
+    float force_x = 0.0f, force_y = 0.0f, force_z = 0.0f;
+    float h = cell_size;
+    float inv_2h = 0.5f / h;
+
+    for (int di = 0; di < 2; di++) {
+        for (int dj = 0; dj < 2; dj++) {
+            for (int dk = 0; dk < 2; dk++) {
+                int ci = (ix + di) % grid_size;
+                int cj = (iy + dj) % grid_size;
+                int ck = (iz + dk) % grid_size;
+                float weight = wx[di] * wy[dj] * wz[dk];
+
+                int ci_p = (ci + 1) % grid_size;
+                int ci_m = (ci + grid_size - 1) % grid_size;
+                int cj_p = (cj + 1) % grid_size;
+                int cj_m = (cj + grid_size - 1) % grid_size;
+                int ck_p = (ck + 1) % grid_size;
+                int ck_m = (ck + grid_size - 1) % grid_size;
+
+                #define IDX(i,j,k) ((i) + grid_size * ((j) + grid_size * (k)))
+
+                // Gradient of self potential (attractive)
+                float dphi_s_dx = (float)(phi_self[IDX(ci_p,cj,ck)] - phi_self[IDX(ci_m,cj,ck)]) * inv_2h;
+                float dphi_s_dy = (float)(phi_self[IDX(ci,cj_p,ck)] - phi_self[IDX(ci,cj_m,ck)]) * inv_2h;
+                float dphi_s_dz = (float)(phi_self[IDX(ci,cj,ck_p)] - phi_self[IDX(ci,cj,ck_m)]) * inv_2h;
+                // Gradient of cross potential
+                float dphi_c_dx = (float)(phi_cross[IDX(ci_p,cj,ck)] - phi_cross[IDX(ci_m,cj,ck)]) * inv_2h;
+                float dphi_c_dy = (float)(phi_cross[IDX(ci,cj_p,ck)] - phi_cross[IDX(ci,cj_m,ck)]) * inv_2h;
+                float dphi_c_dz = (float)(phi_cross[IDX(ci,cj,ck_p)] - phi_cross[IDX(ci,cj,ck_m)]) * inv_2h;
+
+                #undef IDX
+
+                // F = -∇φ_self + cross_factor · ∇φ_cross
+                // (cross_factor > 0 means same-direction-as-gradient → repulsive
+                //  for opposite sign source)
+                force_x += weight * (-dphi_s_dx + cross_factor * dphi_c_dx);
+                force_y += weight * (-dphi_s_dy + cross_factor * dphi_c_dy);
+                force_z += weight * (-dphi_s_dz + cross_factor * dphi_c_dz);
+            }
+        }
+    }
+
+    pm_forces[tid * 3]     = force_x;
+    pm_forces[tid * 3 + 1] = force_y;
+    pm_forces[tid * 3 + 2] = force_z;
+}
+
+// Tree cross-coupling for forces_treepm_short_range Janus extension.
+// Uses same MIC + erfc Springel structure but applies cross-coupling factors.
+// Phase 10A.4.5: ce kernel est appelé après le tree existant pour appliquer
+// la pondération cross-coupling. L'existant calcule sign_factor = ±1, puis
+// on multiplie acc par (1.0 si self, cross_factor si opposite sign).
+//
+// Plus simple: kernel séparé tree_short_janus qui prend cross_minus_plus +
+// cross_plus_minus. À étudier vs forces_treepm_short_range existant.
+//
+// [LAISSÉ POUR A.4.5 — implémentation ci-dessous via wrapper Rust qui
+//  modifie les forces existantes après calcul]
+
 // ============================================================================
 // CIC (Cloud-in-Cell) kernels for GPU TreePM
 // ============================================================================
@@ -1810,6 +1998,160 @@ extern "C" __global__ void forces_treepm_short_range(
     }
 }
 
+// =====================================================================
+// Phase 10A.4.5 — Tree short-range Janus with cross-coupling
+// =====================================================================
+//
+// Variant of forces_treepm_short_range that applies Janus cross-coupling
+// factors for opposite-sign pairs.
+//
+// Sign convention (matches src/nbody_gpu.rs:982,1000 BH and CPU):
+//   my_sign == tree_sign  : factor = +1.0  (Newton self-attraction)
+//   my_sign > 0, opposite : factor = -cross_plus_minus  (m+ feels m- repel)
+//   my_sign < 0, opposite : factor = -cross_minus_plus  (m- feels m+ repel)
+extern "C" __global__ void forces_treepm_short_range_janus(
+    const float* __restrict__ pos_all,
+    const signed char* __restrict__ signs_all,
+    const float* __restrict__ node_pos,
+    const float* __restrict__ node_mass,
+    const int* __restrict__ left,
+    const int* __restrict__ right,
+    const int* __restrict__ node_types,
+    float* __restrict__ acc,
+    int n_all_signed,
+    float theta_soft_packed,
+    float rcut_boxhalf_packed,
+    float cross_packed  // upper 16 bits: cross_minus_plus×1000, lower 16: cross_plus_minus×1000
+) {
+    // Unpack cross factors
+    int packed_cross = __float_as_int(cross_packed);
+    float cross_minus_plus = (float)((packed_cross >> 16) & 0xFFFF) / 1000.0f;
+    float cross_plus_minus = (float)(packed_cross & 0xFFFF) / 1000.0f;
+    int packed_ts = __float_as_int(theta_soft_packed);
+    float theta = (float)((packed_ts >> 16) & 0xFFFF) / 1000.0f;
+    float softening = (float)(packed_ts & 0xFFFF) / 1000.0f;
+
+    int packed_rb = __float_as_int(rcut_boxhalf_packed);
+    float r_cut = (float)((packed_rb >> 16) & 0xFFFF);
+    float box_half = (float)(packed_rb & 0xFFFF);
+
+    float r_s = r_cut / 3.0f;
+    int n_all = (n_all_signed > 0) ? n_all_signed : -n_all_signed;
+    int tree_sign = (n_all_signed > 0) ? 1 : -1;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    bool valid = (tid < n_all);
+    int accumulate = (tree_sign < 0) ? 1 : 0;
+
+    extern __shared__ int shared_stack[];
+    int warp_id_in_block = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int* stack = shared_stack + warp_id_in_block * 128;
+
+    int safe_tid = valid ? tid : 0;
+    float px = pos_all[safe_tid*3], py = pos_all[safe_tid*3+1], pz = pos_all[safe_tid*3+2];
+    int my_sign = signs_all[safe_tid];
+
+    // Janus cross-coupling sign factor
+    float sign_factor;
+    if (my_sign == tree_sign) {
+        sign_factor = 1.0f;
+    } else if (my_sign > 0) {
+        sign_factor = -cross_plus_minus;
+    } else {
+        sign_factor = -cross_minus_plus;
+    }
+
+    float ax=0, ay=0, az=0;
+    float eps2 = softening*softening;
+    float theta2 = theta*theta;
+
+    int sp = 0;
+    if (lane == 0) stack[sp++] = 0;
+    __syncwarp(0xFFFFFFFF);
+
+    while (true) {
+        int stack_empty = (lane == 0 && sp <= 0) ? 1 : 0;
+        stack_empty = __shfl_sync(0xFFFFFFFF, stack_empty, 0);
+        if (stack_empty) break;
+
+        int node;
+        if (lane == 0) node = stack[--sp];
+        node = __shfl_sync(0xFFFFFFFF, node, 0);
+
+        if (node < 0) continue;
+        int nt = node_types[node];
+        if (nt == 0) continue;
+
+        int pb = node * 7;
+        float cx = node_pos[pb], cy = node_pos[pb+1], cz = node_pos[pb+2];
+        float hs = node_pos[pb+3];
+        float comx = node_pos[pb+4], comy = node_pos[pb+5], comz = node_pos[pb+6];
+        float m = node_mass[node];
+
+        float dx = cx-px, dy = cy-py, dz = cz-pz;
+        if (dx > box_half) dx -= 2.0f * box_half;
+        if (dx < -box_half) dx += 2.0f * box_half;
+        if (dy > box_half) dy -= 2.0f * box_half;
+        if (dy < -box_half) dy += 2.0f * box_half;
+        if (dz > box_half) dz -= 2.0f * box_half;
+        if (dz < -box_half) dz += 2.0f * box_half;
+        float r2 = dx*dx + dy*dy + dz*dz + 1e-20f;
+        float r = sqrtf(r2);
+
+        float closest_dist = r - hs;
+        bool cell_beyond_rcut = (closest_dist > r_cut);
+        if (__all_sync(0xFFFFFFFF, cell_beyond_rcut)) continue;
+
+        bool should_approx = (nt == 1) || ((4.0f*hs*hs) < (theta2*r2));
+        bool all_approx = __all_sync(0xFFFFFFFF, should_approx);
+        bool all_descend = __all_sync(0xFFFFFFFF, !should_approx);
+
+        if (all_approx) {
+            if (valid) {
+                float ddx = comx-px, ddy = comy-py, ddz = comz-pz;
+                if (ddx > box_half) ddx -= 2.0f * box_half;
+                if (ddx < -box_half) ddx += 2.0f * box_half;
+                if (ddy > box_half) ddy -= 2.0f * box_half;
+                if (ddy < -box_half) ddy += 2.0f * box_half;
+                if (ddz > box_half) ddz -= 2.0f * box_half;
+                if (ddz < -box_half) ddz += 2.0f * box_half;
+                float rp2 = ddx*ddx + ddy*ddy + ddz*ddz + eps2;
+
+                float rp = sqrtf(rp2);
+                float erfc_arg = rp / (2.0f * r_s);
+                float erfc_factor = erfcf(erfc_arg);
+
+                if (erfc_factor > 1e-6f) {
+                    float irp3 = 1.0f / (rp * rp2);
+                    float f = sign_factor * m * irp3 * erfc_factor;
+                    ax += f*ddx; ay += f*ddy; az += f*ddz;
+                }
+            }
+        } else if (all_descend) {
+            if (lane == 0) {
+                int lc = left[node], rc = right[node];
+                if (rc >= 0 && sp < 127) stack[sp++] = rc;
+                if (lc >= 0 && sp < 127) stack[sp++] = lc;
+            }
+        } else {
+            if (lane == 0) {
+                int lc = left[node], rc = right[node];
+                if (rc >= 0 && sp < 127) stack[sp++] = rc;
+                if (lc >= 0 && sp < 127) stack[sp++] = lc;
+            }
+        }
+        __syncwarp();
+    }
+
+    if (valid) {
+        if (accumulate) {
+            acc[tid*3] += ax; acc[tid*3+1] += ay; acc[tid*3+2] += az;
+        } else {
+            acc[tid*3] = ax; acc[tid*3+1] = ay; acc[tid*3+2] = az;
+        }
+    }
+}
+
 "#;
 
 /// Two-pass GPU N-body simulation
@@ -1971,7 +2313,10 @@ impl GpuNBodyTwoPass {
             "radix_histogram", "radix_prefix_sum", "radix_scatter",
             "forces_treepm_short_range",  // TreePM short-range with r_cut
             "add_pm_forces",  // Add PM long-range forces to acc
-            "cic_scatter", "cic_gather", "reset_f64_grid"  // GPU CIC for TreePM
+            "cic_scatter", "cic_gather", "reset_f64_grid",  // GPU CIC for TreePM
+            // Phase 10A.4 Janus cosmo kernels
+            "drift_janus_cosmo", "kick_janus_cosmo",
+            "cic_gather_janus", "forces_treepm_short_range_janus"
         ])?;
         println!("         done ({:.2}s)", t0.elapsed().as_secs_f64());
 
@@ -2190,7 +2535,10 @@ impl GpuNBodyTwoPass {
             "radix_histogram", "radix_prefix_sum", "radix_scatter",
             "forces_treepm_short_range",
             "add_pm_forces",
-            "cic_scatter", "cic_gather", "reset_f64_grid"
+            "cic_scatter", "cic_gather", "reset_f64_grid",
+            // Phase 10A.4 Janus cosmo kernels
+            "drift_janus_cosmo", "kick_janus_cosmo",
+            "cic_gather_janus", "forces_treepm_short_range_janus"
         ])?;
 
         // Buffer sizes
@@ -4137,6 +4485,120 @@ impl GpuNBodyTwoPass {
         Ok(())
     }
 
+    /// **Phase 10A.4.5** — Tree short-range with Janus cross-coupling factors.
+    ///
+    /// Same two-pass structure as compute_short_range_forces (extract m+ tree,
+    /// force pass; extract m- tree, accumulate pass), but uses
+    /// forces_treepm_short_range_janus kernel which applies cross-coupling
+    /// factors instead of plain ±1.0 sign_factor.
+    pub fn compute_short_range_forces_janus(
+        &mut self,
+        r_cut: f64,
+        cross_minus_plus: f32,
+        cross_plus_minus: f32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Pack cross factors into single f32 (upper 16 bits ×1000 cmp, lower 16 ×1000 cpm)
+        let cmp_int = ((cross_minus_plus * 1000.0).round() as u32).min(0xFFFF);
+        let cpm_int = ((cross_plus_minus * 1000.0).round() as u32).min(0xFFFF);
+        let cross_packed: f32 = f32::from_bits((cmp_int << 16) | cpm_int);
+        let _box_half = (self.box_size / 2.0) as f32;
+        let n = self.n_particles;
+
+        let blocks = (n + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let warp_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 4096,
+        };
+
+        // Reset acc
+        let reset_f32_k = self.device.get_func("twopass", "reset_f32")
+            .ok_or("reset_f32 not found")?;
+        let acc_blocks = (n * 3 + 255) / 256;
+        let acc_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (acc_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            reset_f32_k.launch(acc_cfg, (&mut self.acc, (n * 3) as i32))?;
+        }
+        self.device.synchronize()?;
+
+        let reset_i32_k = self.device.get_func("twopass", "reset_i32")
+            .ok_or("reset_i32 not found")?;
+        let extract_k = self.device.get_func("twopass", "extract_by_sign")
+            .ok_or("extract_by_sign not found")?;
+        let forces_janus_k = self.device.get_func("twopass", "forces_treepm_short_range_janus")
+            .ok_or("forces_treepm_short_range_janus not found")?;
+
+        let theta_int = ((self.theta * 1000.0) as u32).min(0xFFFF);
+        let soft_int = ((self.softening * 1000.0) as u32).min(0xFFFF);
+        let theta_soft_packed: f32 = f32::from_bits((theta_int << 16) | soft_int);
+        let rcut_boxhalf_packed: f32 = pack_rcut_boxhalf(r_cut, self.box_size / 2.0);
+
+        // PASS 1: m+ tree, sign_factor uses cross_plus_minus for opposite-sign
+        unsafe {
+            reset_i32_k.clone().launch(
+                LaunchConfig { block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0 },
+                (&mut self.extract_count, 1),
+            )?;
+            extract_k.clone().launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.pos_sign, &mut self.idx_map,
+                n as i32, 1i32, &mut self.extract_count,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let _ = self.build_single_sign_tree(1, self.n_positive)?;
+
+        unsafe {
+            forces_janus_k.clone().launch(warp_cfg, (
+                &self.pos, &self.signs,
+                &self.bvh_node_pos, &self.bvh_node_mass,
+                &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                &mut self.acc,
+                n as i32, theta_soft_packed, rcut_boxhalf_packed,
+                cross_packed,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // PASS 2: m- tree, accumulate
+        unsafe {
+            reset_i32_k.launch(
+                LaunchConfig { block_dim: (1, 1, 1), grid_dim: (1, 1, 1), shared_mem_bytes: 0 },
+                (&mut self.extract_count, 1),
+            )?;
+            extract_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.pos_sign, &mut self.idx_map,
+                n as i32, -1i32, &mut self.extract_count,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let _ = self.build_single_sign_tree(-1, self.n_negative)?;
+
+        unsafe {
+            forces_janus_k.launch(warp_cfg, (
+                &self.pos, &self.signs,
+                &self.bvh_node_pos, &self.bvh_node_mass,
+                &self.bvh_left, &self.bvh_right, &self.bvh_node_types,
+                &mut self.acc,
+                -(n as i32), theta_soft_packed, rcut_boxhalf_packed,
+                cross_packed,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        Ok(())
+    }
+
     /// Compute short-range forces REUSING CACHED trees (no rebuild)
     /// Used for A/B testing tree rebuild frequency optimization
     /// REQUIRES: build_and_cache_trees() was called previously
@@ -4642,6 +5104,193 @@ impl GpuNBodyTwoPass {
         // Timing info
         if self.step_count <= 5 || self.step_count % 100 == 0 {
             eprintln!("  TreePM GPU step {}: PM {}ms + BH {}ms = {}ms",
+                      self.step_count, pm_ms, bh_ms, pm_ms + bh_ms);
+        }
+
+        Ok(())
+    }
+
+    /// **Phase 10A.4.6** — TreePM step with full Janus cosmology coupling.
+    ///
+    /// Drift uses peculiar Peebles convention with per-particle a (m+/m-).
+    /// Kick uses per-particle a² and Hubble (m+/m-).
+    /// PM solver uses cell-volume scaled g_constant (mass count → density).
+    /// PM gather applies Petit cross-coupling (φ, c̄²·φ⁻¹).
+    /// Tree short-range uses standard erfc Springel splitting (existing kernel).
+    /// Tree cross-coupling: factor applied via post-multiplication on m-/m+ pairs
+    /// (simpler than reimplementing the kernel).
+    ///
+    /// # Arguments
+    /// - `dt`: time step [Gyr]
+    /// - `r_cut`, `r_s`: TreePM splitting (canonical r_cut = 6·Δg, r_s = r_cut/5)
+    /// - `a_plus, a_minus`: dual scale factors (Janus bimétrique)
+    /// - `h_plus, h_minus`: dual Hubble parameters (Friedmann couplé)
+    /// - `phi`, `c_ratio_sq`: Janus coupling (= JanusCoupling.phi, c_ratio_sq)
+    /// - `repulsion_scale`: ramp factor (0.0 = no cross, 1.0 = full Janus)
+    #[cfg(feature = "cufft")]
+    pub fn step_treepm_gpu_cosmo(
+        &mut self,
+        dt: f64,
+        r_cut: f64,
+        r_s: f64,
+        a_plus: f64,
+        a_minus: f64,
+        h_plus: f64,
+        h_minus: f64,
+        phi: f64,
+        c_ratio_sq: f64,
+        repulsion_scale: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Instant;
+        let n = self.n_particles;
+        let grid = self.pm_grid_size;
+        let grid_cells = grid * grid * grid;
+        let box_half = (self.box_size / 2.0) as f32;
+        let half_dt = (dt / 2.0) as f32;
+        let cell_size = (self.box_size / grid as f64) as f32;
+        let inv_cell_size = (grid as f64 / self.box_size) as f32;
+        let cell_vol = (self.box_size / grid as f64).powi(3);
+        let g_constant = self.mass_factor / cell_vol;
+
+        // Janus cross-coupling factors (matches src/treepm/janus.rs::JanusCoupling)
+        let cross_minus_plus = (c_ratio_sq * (1.0 / phi) * repulsion_scale) as f32;
+        let cross_plus_minus = (phi * repulsion_scale) as f32;
+
+        let blocks = (n + 255) / 256;
+        let grid_blocks = (grid_cells + 255) / 256;
+        let cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let grid_cfg = LaunchConfig {
+            block_dim: (256, 1, 1),
+            grid_dim: (grid_blocks as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // ===== D1: Janus drift (dt/2), per-particle 1/a =====
+        let drift_k = self.device.get_func("twopass", "drift_janus_cosmo")
+            .ok_or("drift_janus_cosmo not found")?;
+        unsafe {
+            drift_k.clone().launch(cfg, (
+                &mut self.pos, &self.vel, &self.signs,
+                a_plus as f32, a_minus as f32,
+                half_dt, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== PM (CIC scatter, FFT Poisson, gather Janus) =====
+        let t_pm = Instant::now();
+        let reset_grid_k = self.device.get_func("twopass", "reset_f64_grid")
+            .ok_or("reset_f64_grid not found")?;
+        unsafe {
+            reset_grid_k.clone().launch(grid_cfg, (&mut self.rho_plus, grid_cells as i32))?;
+            reset_grid_k.launch(grid_cfg, (&mut self.rho_minus, grid_cells as i32))?;
+        }
+        self.device.synchronize()?;
+
+        let scatter_k = self.device.get_func("twopass", "cic_scatter")
+            .ok_or("cic_scatter not found")?;
+        unsafe {
+            scatter_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &mut self.rho_plus, &mut self.rho_minus,
+                n as i32, grid as i32, box_half, inv_cell_size,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // cuFFT Poisson with Gaussian splitting (r_s)
+        let rho_plus_ptr = get_device_ptr(&self.rho_plus) as *mut f64;
+        let rho_minus_ptr = get_device_ptr(&self.rho_minus) as *mut f64;
+        let phi_plus_ptr = get_device_ptr(&self.phi_plus) as *mut f64;
+        let phi_minus_ptr = get_device_ptr(&self.phi_minus) as *mut f64;
+        let k_min = self.pm_k_min;
+        unsafe {
+            if k_min > 0 {
+                crate::treepm::cufft_ffi::solve_device_filtered(
+                    rho_plus_ptr, phi_plus_ptr,
+                    grid, self.box_size, g_constant, r_s, k_min,
+                )?;
+                crate::treepm::cufft_ffi::solve_device_filtered(
+                    rho_minus_ptr, phi_minus_ptr,
+                    grid, self.box_size, g_constant, r_s, k_min,
+                )?;
+            } else {
+                crate::treepm::cufft_ffi::solve_device(
+                    rho_plus_ptr, phi_plus_ptr,
+                    grid, self.box_size, g_constant, r_s,
+                )?;
+                crate::treepm::cufft_ffi::solve_device(
+                    rho_minus_ptr, phi_minus_ptr,
+                    grid, self.box_size, g_constant, r_s,
+                )?;
+            }
+        }
+
+        // CIC gather Janus (with cross-coupling factors)
+        let gather_k = self.device.get_func("twopass", "cic_gather_janus")
+            .ok_or("cic_gather_janus not found")?;
+        unsafe {
+            gather_k.launch(cfg, (
+                &self.pos, &self.signs,
+                &self.phi_plus, &self.phi_minus,
+                &mut self.pm_forces,
+                n as i32, grid as i32, box_half, inv_cell_size, cell_size,
+                cross_minus_plus, cross_plus_minus,
+            ))?;
+        }
+        self.device.synchronize()?;
+        let pm_ms = t_pm.elapsed().as_millis();
+
+        // ===== Tree short-range Janus (Phase 10A.4.5) =====
+        // forces_treepm_short_range_janus applies cross-coupling Petit factors
+        // (cross_minus_plus, cross_plus_minus) for opposite-sign pairs, while
+        // keeping sign_factor = +1 for same-sign self-attraction.
+        let t_bh = Instant::now();
+        self.compute_short_range_forces_janus(r_cut, cross_minus_plus, cross_plus_minus)?;
+        let bh_ms = t_bh.elapsed().as_millis();
+
+        // Add PM forces
+        let add_pm_k = self.device.get_func("twopass", "add_pm_forces")
+            .ok_or("add_pm_forces not found")?;
+        unsafe {
+            add_pm_k.launch(cfg, (
+                &mut self.acc, &self.pm_forces, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== K: Janus kick (dt), per-particle a², h =====
+        let kick_k = self.device.get_func("twopass", "kick_janus_cosmo")
+            .ok_or("kick_janus_cosmo not found")?;
+        unsafe {
+            kick_k.launch(cfg, (
+                &mut self.vel, &self.acc, &self.signs,
+                a_plus as f32, a_minus as f32,
+                h_plus as f32, h_minus as f32,
+                dt as f32, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        // ===== D2: Janus drift (dt/2) =====
+        unsafe {
+            drift_k.launch(cfg, (
+                &mut self.pos, &self.vel, &self.signs,
+                a_plus as f32, a_minus as f32,
+                half_dt, box_half, n as i32,
+            ))?;
+        }
+        self.device.synchronize()?;
+
+        self.time += dt;
+        self.step_count += 1;
+
+        if self.step_count <= 5 || self.step_count % 100 == 0 {
+            eprintln!("  TreePM Janus GPU step {}: PM {}ms + BH {}ms = {}ms",
                       self.step_count, pm_ms, bh_ms, pm_ms + bh_ms);
         }
 

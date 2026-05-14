@@ -1,0 +1,45 @@
+cff-version: 1.2.0
+title: "janus-sim: N-body cosmological simulation of the Janus
+        Cosmological Model"
+message: "If you use this software, please cite both the
+          software and the associated paper."
+type: software
+authors:
+  - given-names: Alain Jean
+    family-names: Parès
+    email: ajp@p997.net
+    affiliation: "Independent researcher, Chaumes-en-Brie, France"
+repository-code: "https://github.com/ajp-git/janus-sim"
+abstract: >-
+  GPU-accelerated TreePM N-body simulator for the Janus
+  Cosmological Model with pure bimetric expansion. Implements
+  Petit & D'Agostini's bimetric framework in Rust/CUDA, follows
+  two species of opposite gravitational mass from z=99 to z=0
+  on a single GPU (RTX 3060). The reference run V-6 PROD covers
+  22 million particles in a 250 Mpc box and demonstrates the
+  universal m- cavity, anti-Newton peak, and large-scale
+  anti-correlation signatures of the Janus model.
+keywords:
+  - cosmology
+  - N-body simulation
+  - Janus model
+  - bimetric gravity
+  - negative mass
+  - TreePM
+  - Rust
+  - CUDA
+license: MIT
+version: 6.0
+date-released: "2026-05-14"
+preferred-citation:
+  type: article
+  title: "Première validation N-corps complète du modèle
+          cosmologique Janus avec expansion bimétrique :
+          ségrégation, cavité m⁻ universelle dans les halos
+          massifs et compatibilité observationnelle à 22
+          millions de particules"
+  authors:
+    - given-names: Alain Jean
+      family-names: Parès
+  year: 2026
+  status: "preprint in preparation"
